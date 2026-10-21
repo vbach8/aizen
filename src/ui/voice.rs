@@ -19,6 +19,7 @@
 //! - No startup cost: nothing warms up until the first key press, and a default build
 //!   (no `voice` feature) compiles none of this file at all.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,10 +38,12 @@ const EN_MODEL_DIR: &str = "sherpa-onnx-streaming-zipformer-en-2023-06-21";
 
 static LISTENING: AtomicBool = AtomicBool::new(false);
 
-/// One live hold-to-talk capture, or `None` while idle. Mutated by the keyboard thread
-/// (`toggle` on press, `finish` on release); `cpal::Stream` is `Send`, so the Mutex makes
-/// it safe to park between the two.
-static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+// One live hold-to-talk capture, or `None` while idle. The TUI input loop calls
+// `toggle` and `finish` on the same thread; `cpal::Stream` is not `Send` on macOS,
+// so the session stays on that thread instead of a global Mutex.
+thread_local! {
+    static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+}
 
 struct Session {
     /// Dropping the stream stops the capture (cpal contract).
@@ -156,7 +159,7 @@ pub fn finish() {
     if !LISTENING.swap(false, Ordering::Relaxed) {
         return;
     }
-    let Some(sess) = SESSION.lock().unwrap().take() else {
+    let Some(sess) = SESSION.with(|cell| cell.borrow_mut().take()) else {
         return;
     };
     drop(sess.stream); // stops the capture
@@ -287,7 +290,7 @@ pub fn finish() {
 
 /// Build and play the input stream on the default device; store the session.
 fn start_capture(engine: Engine) -> Result<(), String> {
-    if SESSION.lock().unwrap().is_some() {
+    if SESSION.with(|cell| cell.borrow().is_some()) {
         return Ok(()); // already capturing (repeat edge); release will finalize
     }
     let voice = cli_config::load().voice;
@@ -366,12 +369,14 @@ fn start_capture(engine: Engine) -> Result<(), String> {
         .play()
         .map_err(|e| format!("🎙 bắt đầu ghi thất bại: {e}"))?;
 
-    *SESSION.lock().unwrap() = Some(Session {
-        stream,
-        data,
-        rate,
-        err,
-        engine,
+    SESSION.with(|cell| {
+        *cell.borrow_mut() = Some(Session {
+            stream,
+            data,
+            rate,
+            err,
+            engine,
+        });
     });
     Ok(())
 }
