@@ -43,28 +43,93 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Install ALSA headers (Linux only — the `voice` feature links cpal/ALSA)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
       - name: Build
         run: cargo build --bin aizen
 
+      # The `voice` feature is OFF in the default build (and must stay that way — the two lines
+      # above are the gate). But a PR that breaks the voice code would sail through `cargo build`
+      # and only explode at release time, once the tag is cut. BUILD, not `check`: the Linux voice
+      # artifact links libasound, and only the link step proves the ALSA headers/dev package are
+      # enough. Runs on all three OSes (macOS CoreAudio, Linux ALSA, Windows WASAPI).
+      - name: Build voice feature (gated code compiles and links on all 3 OSes)
+        run: cargo build --features voice --bin aizen
+
+      # The installer's pure logic (asset matrix, checksum shapes, tar wrapper stripping, pack
+      # swap) needs no microphone and no network — run it here so `aizen voice install` cannot rot
+      # unnoticed.
+      - name: Voice installer unit tests
+        run: cargo test --features voice --bin aizen voice_install
+
       - name: Test
-        run: cargo test --bin aizen
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            # The approval integration tests share process-global state; run
+            # the Linux suite serially so they cannot race each other.
+            RUST_TEST_THREADS=1 cargo test --bin aizen
+          else
+            cargo test --bin aizen
+          fi
 
       # What the sandbox can actually enforce on THIS runner, in the job log — the per-platform
       # capability matrix in docs/SANDBOX.md is checked against these outputs at release time.
       - name: Sandbox capability probe
         run: cargo run --bin aizen -- sandbox doctor --json
 
+  bench:
+    name: loop + task suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # The scripted-model loop bench: loop discipline (steps, loop-stop, verified-done) with no
+      # network and no key.
+      - name: Loop bench
+        run: cargo run --bin aizen -- bench loop
+
+      # The task suite: real loop, real tools, real `cargo test` on the fixture crates, with the
+      # model's answers replayed from bench-tasks/<id>/tapes/. A task with no recorded tape is
+      # reported as skipped, so this gate only bites once tapes are committed (see
+      # bench-tasks/README.md); a recorded task that stops reaching Done, edits the wrong file, or
+      # needs more than 1.25× its baseline steps/tokens fails the job.
+      - name: Task suite
+        run: cargo run --bin aizen -- bench tasks --json
+
   lint:
-    name: fmt + clippy (advisory)
+    name: fmt (gating) + clippy (advisory)
     runs-on: ubuntu-latest
-    # Advisory only: the tree carries pre-existing warnings, so this surfaces fmt/clippy findings
-    # without gating merges. Contributors are asked to clear anything THEY introduce (see CONTRIBUTING).
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Components
         run: rustup component add rustfmt clippy
+      # Gating: the tree is rustfmt-clean (checked 2026-09-15), so a formatting diff is a
+      # regression, not a pre-existing condition.
       - name: Format check
         run: cargo fmt --check
+      # Advisory: the tree carries pre-existing clippy warnings (138 on the 2026-09-15 toolchain),
+      # and `-D warnings` cannot gate until they are cleared. The count is ratcheted locally per
+      # change (no new warning in a touched file); clearing the backlog is its own task. Contributors
+      # are asked to clear anything THEY introduce (see CONTRIBUTING).
       - name: Clippy
-        run: cargo clippy --bin aizen
+        continue-on-error: true
+        run: cargo clippy --bin aizen --tests

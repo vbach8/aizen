@@ -4,19 +4,21 @@
 //! current process: the current terminal keeps its loaded image, while a new terminal resolves the
 //! replaced path and starts the selected version.
 
+use crate::core::download::{download_to, fetch_checksum, http_client, verify_checksum};
 use anyhow::{bail, Context, Result};
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_REPO: &str = "aizen-stack/aizen";
+const DEFAULT_REPO: &str = "talmetis-labs/aizen";
 const CHECK_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_BINARY_BYTES: u64 = 300 * 1024 * 1024;
-const HTTP_TIMEOUT_SECS: u64 = 120;
+/// A previous build (`aizen*.old-*`) is kept this long before the startup sweep removes it,
+/// so a bad update can be rolled back by hand for a week rather than until the next launch
+/// (quality plan S6).
+const BACKUP_PIN_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Version {
@@ -54,6 +56,10 @@ struct ReleaseInfo {
     asset_url: String,
     asset_name: String,
     asset_size: u64,
+    /// The `<asset>.sha256` published beside the binary (release workflow, E5.2). `None` for a
+    /// release from before checksums were published: installable, but said to be unverified.
+    #[serde(default)]
+    checksum_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,17 +109,28 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
-fn asset_suffix_for(os: &str, arch: &str) -> Option<&'static str> {
-    match (os, arch) {
-        ("windows", "x86_64") => Some("windows-x86_64.exe"),
-        ("linux", "x86_64") => Some("linux-x86_64"),
-        ("macos", "aarch64") => Some("macos-aarch64"),
+fn asset_suffix_for(os: &str, arch: &str, voice: bool) -> Option<&'static str> {
+    match (os, arch, voice) {
+        ("windows", "x86_64", false) => Some("windows-x86_64.exe"),
+        ("windows", "x86_64", true) => Some("windows-x86_64-voice.exe"),
+        ("linux", "x86_64", false) => Some("linux-x86_64"),
+        ("linux", "x86_64", true) => Some("linux-x86_64-voice"),
+        ("macos", "aarch64", false) => Some("macos-aarch64"),
+        ("macos", "aarch64", true) => Some("macos-aarch64-voice"),
         _ => None,
     }
 }
 
+/// The asset suffix this binary must look for in a release. A `voice` build is a DISTINCT
+/// artifact, not a runtime toggle: the speech input is compile-time (`--features voice`), so a
+/// voice build that looked for the plain suffix would update itself onto a binary where F9/F10 no
+/// longer exist. The variant is therefore part of the binary's identity.
 fn asset_suffix() -> Option<&'static str> {
-    asset_suffix_for(std::env::consts::OS, std::env::consts::ARCH)
+    asset_suffix_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(feature = "voice"),
+    )
 }
 
 fn repo() -> String {
@@ -165,6 +182,17 @@ fn parse_releases(json: &str, suffix: &str) -> Vec<ReleaseInfo> {
         else {
             continue;
         };
+        let checksum_name = format!("{asset_name}.sha256");
+        let checksum_url = assets
+            .iter()
+            .find(|a| {
+                a.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|n| n == checksum_name)
+            })
+            .and_then(|a| a.get("browser_download_url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         out.push(ReleaseInfo {
             tag: tag.to_string(),
             name: item
@@ -187,18 +215,11 @@ fn parse_releases(json: &str, suffix: &str) -> Vec<ReleaseInfo> {
                 .get("size")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
+            checksum_url,
         });
     }
-    out.sort_by(|a, b| parse_version(&b.tag).cmp(&parse_version(&a.tag)));
+    out.sort_by_key(|release| std::cmp::Reverse(parse_version(&release.tag)));
     out
-}
-
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .build()
-        .context("building update client")
 }
 
 async fn list_releases(limit: usize) -> Result<Vec<ReleaseInfo>> {
@@ -237,50 +258,6 @@ async fn list_releases(limit: usize) -> Result<Vec<ReleaseInfo>> {
         );
     }
     Ok(parse_releases(&body, suffix))
-}
-
-async fn download_to(url: &str, part: &Path, expected_size: u64) -> Result<u64> {
-    let client = http_client()?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("downloading {url}"))?;
-    if !response.status().is_success() {
-        bail!("download returned HTTP {}", response.status().as_u16());
-    }
-    if response
-        .content_length()
-        .is_some_and(|n| n > MAX_BINARY_BYTES)
-    {
-        bail!("release asset is too large");
-    }
-    let mut file = tokio::fs::File::create(part)
-        .await
-        .with_context(|| format!("creating {}", part.display()))?;
-    let mut stream = response.bytes_stream();
-    let mut total = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("reading release asset")?;
-        total = total.saturating_add(chunk.len() as u64);
-        if total > MAX_BINARY_BYTES {
-            let _ = tokio::fs::remove_file(part).await;
-            bail!(
-                "release asset exceeds {} MiB",
-                MAX_BINARY_BYTES / 1024 / 1024
-            );
-        }
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .context("writing release asset")?;
-    }
-    file.flush().await.context("flushing release asset")?;
-    drop(file);
-    if expected_size > 0 && expected_size != total {
-        let _ = tokio::fs::remove_file(part).await;
-        bail!("release asset size mismatch (expected {expected_size}, downloaded {total})");
-    }
-    Ok(total)
 }
 
 fn backup_path(target: &Path) -> PathBuf {
@@ -322,13 +299,40 @@ pub fn cleanup_stale_backups(dir: &Path, live_exe: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
+        // A previous build is the rollback: it stays a week (`BACKUP_PIN_SECS`), not until the
+        // next launch — a bad update noticed the day after used to find its predecessor gone.
         if name != live_name && name.starts_with("aizen") && name.contains(".old-") {
-            let _ = fs::remove_file(path);
+            let pinned = entry
+                .metadata()
+                .and_then(|md| md.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_none_or(|age| age.as_secs() <= BACKUP_PIN_SECS);
+            if !pinned {
+                let _ = fs::remove_file(path);
+            }
+            continue;
+        }
+        // A download killed mid-stream leaves `.aizen-update-{pid}.part` with nothing to collect
+        // it (the in-process removals only run when the SAME process lives to see the error).
+        // Age-gated: another window may be mid-download right now, and an hour is far past any
+        // real download while costing nothing on the sweep.
+        if name.starts_with(".aizen-update-") && name.ends_with(".part") {
+            let stale = entry
+                .metadata()
+                .and_then(|md| md.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age.as_secs() > 60 * 60);
+            if stale {
+                let _ = fs::remove_file(path);
+            }
         }
     }
 }
@@ -345,7 +349,7 @@ fn now_unix() -> u64 {
 }
 
 fn should_check(last: Option<u64>, now: u64) -> bool {
-    last.map_or(true, |last| now.saturating_sub(last) >= CHECK_TTL_SECS)
+    last.is_none_or(|last| now.saturating_sub(last) >= CHECK_TTL_SECS)
 }
 
 fn read_cache() -> Option<UpdateCache> {
@@ -500,7 +504,32 @@ async fn install(release: &ReleaseInfo, target: &Path) -> Result<()> {
         fmt_size(release.asset_size)
     ));
     let part = target.with_file_name(format!(".aizen-update-{}.part", std::process::id()));
-    let size = download_to(&release.asset_url, &part, release.asset_size).await?;
+    let (size, digest) = download_to(
+        &release.asset_url,
+        &part,
+        release.asset_size,
+        MAX_BINARY_BYTES,
+    )
+    .await?;
+    match &release.checksum_url {
+        Some(url) => {
+            let published = match fetch_checksum(url).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = fs::remove_file(&part);
+                    return Err(e.context("the release publishes a checksum but it could not be fetched — not installing"));
+                }
+            };
+            if let Err(e) = verify_checksum(&published, &release.asset_name, &digest) {
+                let _ = fs::remove_file(&part);
+                return Err(e);
+            }
+            emit(&format!("verified SHA-256 {}…", &digest[..16]));
+        }
+        None => emit(
+            "no checksum is published for this release — installing unverified (size-checked only)",
+        ),
+    }
     let backup = match swap_in_place(&part, target) {
         Ok(path) => path,
         Err(error) => {
@@ -529,6 +558,7 @@ async fn install(release: &ReleaseInfo, target: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::download::hex_lower;
 
     #[test]
     fn versions_compare_numerically_and_release_beats_pre() {
@@ -541,12 +571,77 @@ mod tests {
     #[test]
     fn assets_match_published_matrix() {
         assert_eq!(
-            asset_suffix_for("windows", "x86_64"),
+            asset_suffix_for("windows", "x86_64", false),
             Some("windows-x86_64.exe")
         );
-        assert_eq!(asset_suffix_for("linux", "x86_64"), Some("linux-x86_64"));
-        assert_eq!(asset_suffix_for("macos", "aarch64"), Some("macos-aarch64"));
-        assert_eq!(asset_suffix_for("macos", "x86_64"), None);
+        assert_eq!(
+            asset_suffix_for("linux", "x86_64", false),
+            Some("linux-x86_64")
+        );
+        assert_eq!(
+            asset_suffix_for("macos", "aarch64", false),
+            Some("macos-aarch64")
+        );
+        assert_eq!(asset_suffix_for("macos", "x86_64", false), None);
+    }
+
+    #[test]
+    fn voice_builds_update_to_the_voice_asset_not_the_plain_one() {
+        // The feature is compile-time: a voice build that resolved the plain suffix would replace
+        // itself with a binary that has no F9/F10 at all.
+        assert_eq!(
+            asset_suffix_for("windows", "x86_64", true),
+            Some("windows-x86_64-voice.exe")
+        );
+        assert_eq!(
+            asset_suffix_for("linux", "x86_64", true),
+            Some("linux-x86_64-voice")
+        );
+        assert_eq!(
+            asset_suffix_for("macos", "aarch64", true),
+            Some("macos-aarch64-voice")
+        );
+        // An unsupported platform stays unsupported in both variants.
+        assert_eq!(asset_suffix_for("macos", "x86_64", true), None);
+    }
+
+    #[test]
+    fn release_parser_picks_up_the_checksum_asset_when_published() {
+        let json = r#"[
+          {"tag_name":"v0.6.8","draft":false,"assets":[
+            {"name":"aizen-v0.6.8-windows-x86_64.exe","browser_download_url":"https://x/a","size":12},
+            {"name":"aizen-v0.6.8-windows-x86_64.exe.sha256","browser_download_url":"https://x/a.sha256","size":100}]},
+          {"tag_name":"v0.6.7","draft":false,"assets":[
+            {"name":"aizen-v0.6.7-windows-x86_64.exe","browser_download_url":"https://x/b","size":12}]}
+        ]"#;
+        let out = parse_releases(json, "windows-x86_64.exe");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].checksum_url.as_deref(), Some("https://x/a.sha256"));
+        assert_eq!(out[1].checksum_url, None, "older releases have none");
+    }
+
+    #[test]
+    fn a_checksum_mismatch_is_a_refusal_and_other_assets_lines_are_skipped() {
+        let good = "ab".repeat(32);
+        let name = "aizen-v0.6.8-linux-x86_64";
+        // sha256sum shape, shasum shape (`*name`), a bare digest, and a combined file.
+        assert!(verify_checksum(&format!("{good}  {name}\n"), name, &good).is_ok());
+        assert!(verify_checksum(&format!("{good} *{name}\n"), name, &good).is_ok());
+        assert!(verify_checksum(&good, name, &good.to_uppercase()).is_ok());
+        let combined = format!("{}  other-asset\n{good}  {name}\n", "cd".repeat(32));
+        assert!(verify_checksum(&combined, name, &good).is_ok());
+        let bad = verify_checksum(&format!("{}  {name}\n", "cd".repeat(32)), name, &good)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            bad.contains("refusing to install") && bad.contains("mismatch"),
+            "{bad}"
+        );
+        let none = verify_checksum(&format!("{good}  other-asset\n"), name, &good)
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("names no digest"), "{none}");
+        assert_eq!(hex_lower(&[0x00, 0xab, 0xff]), "00abff");
     }
 
     #[test]
@@ -621,16 +716,42 @@ mod tests {
         let root = scratch("sweep");
         let live = root.join("aizen.exe");
         let stale = root.join("aizen.exe.old-0.4.7-123");
+        let fresh = root.join("aizen.exe.old-0.6.7-456");
         let unrelated = root.join("notes.txt");
         fs::write(&live, b"live").unwrap();
         fs::write(&stale, b"stale").unwrap();
+        // Older than the pin: a backup from eight days ago is past its rollback window.
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(BACKUP_PIN_SECS + 86_400),
+            )
+            .unwrap();
+        fs::write(&fresh, b"yesterday").unwrap();
         fs::write(&unrelated, b"keep").unwrap();
+
+        // A download `.part` too fresh to be an orphan: it may be another window's LIVE download,
+        // so the sweep must leave it (the stale case needs an hour-old mtime, which a unit test
+        // cannot fabricate portably — the age gate is the assertion here).
+        let part = root.join(".aizen-update-999.part");
+        fs::write(&part, b"partial").unwrap();
 
         cleanup_stale_backups(&root, &live);
 
         assert!(live.exists(), "the running binary must survive the sweep");
-        assert!(!stale.exists(), "a previous update's backup must be swept");
+        assert!(!stale.exists(), "a backup past the pin must be swept");
+        assert!(
+            fresh.exists(),
+            "a backup inside the pin is the rollback — kept"
+        );
         assert!(unrelated.exists(), "unrelated files must be left alone");
+        assert!(
+            part.exists(),
+            "a fresh .part may be a live download elsewhere"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

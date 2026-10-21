@@ -26,6 +26,12 @@ The chat box is a small line editor: type / Backspace / Del at the cursor, **←
 jump, **↑/↓** recall past prompts, Enter sends. A braille spinner (`⠹ thinking`) shows while the
 model is responding, clearing the moment the first token streams.
 
+**You never wait for a turn to finish before talking again.** A message typed *while the agent is
+working* is handed to the running turn at its next step — a course correction folded into the task
+in flight, not a queued next request (a working turn keeps doing what it already planned AND reads
+your new line immediately). Paste something long or attach an image and it queues as a separate turn
+instead; `/jobs` and `/workflows` typed mid-turn open their panels instantly rather than queueing.
+
 The **mouse works in the box too**: click to put the caret on the character you clicked instead of
 walking there with ←/→, and drag across the text to select it — the selection is copied to the
 clipboard on release, and **Ctrl-C** copies it too (with nothing selected, Ctrl-C copies the whole
@@ -41,11 +47,22 @@ it for its own paste, so the keystroke never reaches `aizen`):
   turns image-file paths on the line into attachments (you can also type/paste a path). Real image
   files only — prose like `nope.png` that isn't a file stays as text.
 
-Both send the image with your text to a **vision-capable** model. **Ctrl-X** removes the most recent
-attachment (keeps your text); **Esc** clears the line and all attachments at once. Clipboard
-screenshots are downscaled to ≤1568px and encoded inline; the token gauge ignores attachments (they
-ride outside `content`). Clipboard grab is desktop-only (Windows/macOS); drag-drop/path works
-everywhere.
+Both attach the image to your text; the selected model must support vision. Ordinary user
+attachments use a **balanced send-only preview** by default when safe: static opaque 8-bit PNGs
+may become smaller JPEGs while canonical attachments and stored blobs remain unchanged.
+`AIZEN_IMAGE_SEND_MODE=original` preserves the attached bytes on the wire. Unsupported/color-sensitive
+formats, transparency, animation, malformed inputs or a busy image-memory budget retain originals;
+remote image URLs are never fetched by the optimizer. Tool images and output screenshots are not
+silently compressed. See [Visual design and tool images](#visual-design-and-tool-images) for grants,
+exact reference inspection and delivery limits.
+
+**Ctrl-E** expands a tool result into a scrollable overlay — the one under your selection when it
+sits on a tool row, else the most recent; a failed command already shows its last lines under its
+row. **Ctrl-X** removes the most recent attachment (keeps your text); **Esc** clears the line and all
+attachments at once. Clipboard screenshots are downscaled to ≤1568px **at ingress**, before canonical
+attachment storage; original send mode cannot recover pre-ingress clipboard pixels. Attach the
+original file for full-resolution references. The token gauge ignores attachments (they ride outside
+`content`). Clipboard grab is desktop-only (Windows/macOS); drag-drop/path works everywhere.
 
 The context window is **auto-detected** from the provider's `/models` when it reports one
 (OpenRouter/LiteLLM-style gateways do; the bare OpenAI schema doesn't). When it's absent the bar
@@ -57,24 +74,31 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | command | does |
 | --- | --- |
 | `/help` | list commands |
+| `/where` | project identity and managed output roots, without creating them (also `aizen where`) |
+| `/files [artifacts\|scratch]` | read-only paths/sizes for this workspace's artifact runs and this process's managed scratch; omit the argument for both (also `aizen files`) |
 | `/model` | list the provider's models (with context windows) + arrow-key pick one |
 | `/provider [name|add|manage]` | one-pick switch among saved providers; add/edit/rename/delete in the same manager |
+| `/login` | sign in to Aizen in a browser — the session opens the gateway, so nothing is stored but the token |
+| `/logout` | leave Aizen here: the session **and** the pinned key. Revokes neither |
 | `/config` | provider-first settings: add/edit/switch connections, then assign providers/models to roles and specialists |
 | `/memory [query]` | show your profile, or search memory |
-| `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory |
+| `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory · `coding on\|off` keeps it on coding turns |
 | `/skills` | saved procedures the agent can load: list · view · new · delete |
 | `/commands` | your **custom slash commands** — markdown macros you fire (see below) |
 | `/mcp` | MCP lifecycle status: connected tools, generation, health, and per-turn schema pinning (see below) |
+| `/design [auto\|on\|off]` | session-scoped visual guidance and evidence; bare shows status. `off` disables automatic guidance/gates, not manual design/image tools |
 | `/browser` | browser profile / host-route / pinned-session status (`--features browser`) |
 | `/apps` | connected apps & MCP catalog — Telegram/Discord/Slack/webhook notify + browser-sign-in MCP apps |
 | `/telegram` | Telegram integration menu: setup · test · status · start daemon · disable |
-| `/sessions` | saved conversations — restore · save · delete (the chat also auto-saves as `last`) |
+| `/sessions` | saved conversations — restore · save · delete (every turn auto-saves under a topic-date name) |
 | `/compact` | summarize older turns now to free context |
 | `/approval [ask|smart|yolo]` | one approval setting: ask every time, auto-run read-only shell, or pre-authorize tools after the hard safety floor |
-| `/timemachine` · `/checkpoint [note]` · `/diff` | `/timemachine` lists every crash-recoverable, worktree-scoped Git checkpoint and jumps back to the code **and** chat of the one you pick (one gesture, reversible); `/checkpoint` saves one now; `/diff` (or `aizen time diff`) shows what changed between two checkpoints, or `working` for the live tree. CLI: `aizen time doctor` inspects without touching the tree and reports loose objects once they pile up; `aizen time gc` compacts this repo's store (packs loose objects — a save does it automatically past 2,048); `aizen time gc --all` sweeps orphaned stores left by deleted/moved repos (dry-run by default, `--apply` moves them to a trash dir, which you then delete to reclaim the space) |
-| `/update` | list every published version (the one you're running is marked) and install whichever you pick — newer or older, so the same command is the rollback |
+| `/timemachine` · `/checkpoint [note]` · `/diff` | `/timemachine` lists every crash-recoverable, worktree-scoped Git checkpoint and jumps back to the code **and** chat of the one you pick (one gesture, reversible); `/checkpoint` saves one now; `/diff` (or `aizen time diff`) shows what changed between two checkpoints, or `working` for the live tree; on the retained TUI `/diff --patch` draws each file as a diff box. `/undo` (alias `/rewind`) shows the rewind's diff stat first, refuses to discard work no checkpoint holds unless you add `--yes`, and names the files it restored. CLI: `aizen time doctor` inspects without touching the tree and reports loose objects once they pile up; `aizen time gc` prunes the objects no checkpoint reaches and compacts this repo's store (packs loose objects — a save does the packing automatically past 2,048); `aizen time gc --all` sweeps orphaned stores left by deleted/moved repos (dry-run by default, `--apply` moves them to a trash dir, which you then delete to reclaim the space) |
+| `/update` | list every published version (the one you're running is marked) and install whichever you pick — newer or older, so the same command is the rollback; the download is checked against the release's published SHA-256 and refused on a mismatch |
 | `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `aizen config set --price-in/--price-out`) |
-| `/clear` | fresh conversation · `/tokens` usage · `/quit` exit |
+| `/jobs` | background work at a glance: running and completed `process` handles (dev servers, watchers) plus live monitor runs (sub-agents · workflows), self-refreshing. ↑↓ picks a row; Enter opens a process log, including completed logs; `x` / `k` stops only running rows (a process is killed by handle; a monitor run gets a stop request). Esc closes; from a log, Esc returns to the list. Typed WHILE A TURN RUNS it opens immediately instead of queueing behind the turn (same inline path as `/workflows`). On the retained TUI the sidebar / clickable narrow strip is a live-only HUD: completed processes leave it but remain available in `/jobs` |
+| `/theme [moonlight\|lanes]` | colour theme: `moonlight` (default) keeps the calm all-silver look; `lanes` colours each kind of work — read=blue, edit=gold, shell=mauve, web=cyan, memory=violet, talk=pink, plan=teal. Bare `/theme` lists both with a live colour swatch; the choice persists |
+| `/clear` | start a fresh conversation that REMEMBERS this one: the thread is distilled into a dense seed note the new conversation starts with · `/clear hard` wipes with nothing carried over · `/tokens` usage · `/quit` exit |
 
 **Input shortcuts** — on a normally typed message (not with an image):
 
@@ -88,10 +112,18 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 **Context window + auto-compact** live in **`/config`** (so the settings stay in one place). The
 window drives the `% context` HUD (auto-detected from `/models` when the provider reports it, else
 estimated by model name, else whatever you type). Auto-compact (default **80%**, the `⊟ 80%` marker
-on the status line) summarizes older turns into one dense note when usage crosses the threshold,
-keeping the last few turns verbatim — the cut is always at a user-message boundary (no orphan tool
-results). `/compact` forces it now. Both also settable non-interactively:
+on the status line) summarizes older turns into one dense note when usage crosses the threshold —
+during a turn, between the agent's steps, so a long task compacts mid-flight instead of after it
+ends — keeping the last few turns verbatim; the cut is always at a user-message boundary (no
+orphan tool results). `/compact` forces it now. Both also settable non-interactively:
 `aizen config set --context-window <tokens> --compact-threshold <0–95>` (`0` = off).
+
+Two cheaper measures run before compaction ever triggers, whatever the threshold: tool results
+older than the eight most recent collapse to a one-line digest (tool, target, size, and the scratch
+file holding the full text) once eight of them qualify, and a raw tool result over 16 KB is written
+to the scratch dir in full before the budget cut, so the cut result can point at it. Both are
+batched and file-backed — the prompt cache breaks rarely and nothing a tool produced is lost; the
+agent reads the named file for the part it needs.
 
 The REPL needs a real terminal; piped/CI stdin prints a hint and exits (`AIZEN_MENU=1` forces it).
 
@@ -221,7 +253,7 @@ since a shell that can read the projected token can talk to the API server as th
 
 ## Configure
 
-**ChatGPT Codex (experimental)** uses ChatGPT/Codex *consumer* OAuth (not the OpenAI Platform API key). Pick **ChatGPT Codex (experimental)** in `aizen config` → Providers & connection: it skips the API-key prompt and offers the browser sign-in in place of it, so no separate command is needed. The manual equivalents still work — `aizen auth login codex`, or `aizen config set --base-url https://chatgpt.com/backend-api/codex --api-key codex-oauth --model gpt-5.4-mini`. Model ids come from a shipped catalog, since the Codex backend has no `GET /models`. Tokens live in `~/.aizen/provider-tokens/codex.json` and `aizen config show` reports whether you are still signed in. Kill-switch: `AIZEN_DISABLE_CODEX=1`. **Risk:** private backend APIs may break or conflict with vendor terms; prefer Platform API keys / OpenRouter for supported production use. Logout: `aizen auth logout codex`.
+**ChatGPT Codex (experimental)** uses ChatGPT/Codex *consumer* OAuth (not the OpenAI Platform API key). Pick **ChatGPT Codex (experimental)** in `aizen config` → Providers & connection: it skips the API-key prompt and offers the browser sign-in in place of it, so no separate command is needed. The manual equivalents still work — `aizen auth login codex`, or `aizen config set --base-url https://chatgpt.com/backend-api/codex --api-key codex-oauth --model gpt-5.4-mini`. Model ids come from a shipped catalog, since the Codex backend has no `GET /models`. Tokens live in `~/.aizen/provider-tokens/codex.json` and `aizen config show` reports whether you are still signed in. Kill-switch: `AIZEN_DISABLE_CODEX=1`. Codex turns stream like any other endpoint: text paints as it arrives, completed tool calls start eagerly, and the same `AIZEN_STREAM_FIRST_FRAME_SECS` / `AIZEN_STREAM_STALL_SECS` stall deadlines apply. **Risk:** private backend APIs may break or conflict with vendor terms; prefer Platform API keys / OpenRouter for supported production use. Logout: `aizen auth logout codex`.
 
 All network commands read three settings, as flags or env vars:
 
@@ -238,6 +270,239 @@ export AIZEN_BASE_URL=https://api.openai.com/v1
 export AIZEN_API_KEY=sk-...
 export AIZEN_MODEL=gpt-4o-mini
 ```
+
+### `aizen login` — pin this machine to the Aizen gateway
+
+The short way to a working endpoint when your key comes from the Aizen gateway: no key to find, no
+URL to type. `aizen` prints a short code, you approve it in a browser you are already signed into,
+and the gateway sends back the key, both base URLs and a default model — written straight into
+`~/.aizen/cli-config.json` and switched on.
+
+It is also the **first row of the provider picker, drawn in green**: `aizen config` → Providers &
+connection → **Aizen (subscription)** runs the same pairing in place of the API-key prompt, the way
+the Codex row runs a browser sign-in. Green marks the one provider you can start using without
+going anywhere else first; picking it there carries on into the model list the fresh key can already
+reach. It does not stop to ask what to call the profile: the pairing has already written the key
+into one, and `~/.aizen/gateway.json` points at that row, so the only name that keeps the key and
+the pin together is the one it chose.
+
+```bash
+aizen login                     # print a code, wait, save the key
+aizen login --no-browser        # a server or an SSH session: print, don't try to open anything
+aizen login --no-activate       # save the profile without making it the endpoint in use
+aizen gateway status            # what the key is allowed to do, asked live
+aizen gateway env               # the two base URLs, for a tool that is not this CLI
+aizen gateway logout            # drop the local key
+```
+
+One domain is all the CLI knows: `https://aizen.talmetis.com`, overridable with `AIZEN_GATEWAY_URL`
+(falling back to `OMNIROUTE_PUBLIC_API_BASE_URL`). The page you open comes back from the gateway —
+nothing here builds a URL.
+
+It is the same domain `aizen account` and `aizen sub` use, deliberately: it serves `/v1/*` against
+the pairing key and `/auth/*` against the session JWT. One name, two prefixes, two credentials — a
+pairing key sent to `/auth/*` answers `401 "Not signed in"`, which is about the paper, not the
+login. `api.talmetis.com` was the gateway before the names merged; it still answers `/v1/` and is
+still recognised as a gateway root, so machines pinned against it keep working.
+
+Three things worth knowing, because each is wrong in a way that still looks like it works:
+
+* **The short code only ever goes one way — from this machine to you.** It names a pending pairing
+  for the account owner to look at; the 256-bit device code, which is what actually collects the
+  key, is printed nowhere and written to no file. So if a code reaches you from anywhere else — a
+  message, an email, someone reading it out — that is somebody else's pairing, and approving it
+  hands them a key on your account. There is deliberately nowhere in this CLI to paste one.
+* **The key crosses the wire exactly once.** It is minted at hand-over, not at approval, so
+  approving and then closing the laptop leaves no live key behind. `aizen login` writes it to disk
+  before it prints anything. If you lose that one answer, pair again — it cannot be re-sent.
+* **The gateway states two base URLs, and they are not the same string.** OpenAI-shaped clients
+  append `/chat/completions` to `…/v1`; Anthropic-shaped clients append `/v1/messages` to the root
+  *without* `/v1`. `aizen gateway env` prints both as the gateway gave them. Deriving one from the
+  other is how a request ends up at `/v1/v1/messages` and a 404 gets read as "the gateway is down".
+
+`aizen gateway logout` removes the local copy and nothing else. The key stays live until you unpin
+the device in the dashboard (**API keys → devices**), which revokes it in the same transaction.
+
+**Each machine carries its own credential.** Pairing used to hand back the account's `ak_…` plan
+key — the same string on every machine — so "unpin this device" in the dashboard could not cut
+anything: revoking that string would cut every other machine and the account's key with it. Since
+2026-09-06 pairing answers with a **JWT bound to this machine's device row**, the gateway reads that
+row on every `/v1` call, and unpinning cuts exactly one machine on its next request. The plan key
+stops leaving the server. Nothing about billing moved: the loadout, the per-minute ceiling and the
+spend ledger still hang off the plan key's row, and calls still count against it.
+
+Three consequences worth knowing, because two of them fail silently:
+
+* **Never test the credential's prefix.** What is stored is `eyJ…`, and a client still checking for
+  `ak_` rejects the one string that works while reporting it as a malformed key — which reads like a
+  server fault. The CLI checks no shape anywhere; the one place it looks at the first three
+  characters is to notice a pre-2026-09-06 pairing and say so.
+* **`key_prefix` is the PLAN key's head, not a piece of what this machine holds.** It is shown so a
+  row can be matched against the keys screen. `aizen gateway status` calls it `plan key`, beside the
+  `device` row that the dashboard's unpin button acts on.
+* **A `401` can now arrive at any moment**, and usually means somebody cut this machine on purpose:
+  unpinned in the dashboard, logged out from another machine, or the account password changed (a
+  password change ends every pairing, deliberately). All three end the same way — the credential is
+  removed from this machine and one sentence names `aizen login`. It is never retried: `401` is
+  absent from the retry table, and it is its own error kind so that goal mode stops at once instead
+  of spending a backoff budget on calls that cannot be built.
+
+**A machine pinned before this still works**, and it is not urgent — but it cannot be cut remotely,
+and the dashboard labels it as such. `aizen gateway status` says so and points at `aizen login`;
+nothing re-pairs on its own. `aizen logout` on one of those tells the gateway nothing, deliberately:
+that string is the account's, has no device row behind it, and posting it to a route that cuts
+device rows is a way to cut the wrong one.
+
+The full wire contract — every field, the error table, the browser-side routes — is
+`docs/reference/DEVICE_PAIRING.md` in `admin_aizen`.
+
+### `aizen account` — signing in, which is how the plan is bought
+```bash
+aizen account login             # opens the browser
+aizen account login --password  # email + password, for an account that has one
+aizen account whoami
+aizen account logout            # drops the token here; revokes nothing
+aizen logout                    # leaves Aizen entirely: session AND pinned key
+```
+
+In the REPL the same two doors are `/login` and `/logout`.
+
+**Deleting the Aizen provider row is a logout, not a row deletion.** Both delete paths —
+`aizen config provider remove <name>` and the manager inside `aizen config` — check whether the row
+is Aizen's, by the pin *or* by its endpoint, and tear down the whole credential when it is: the
+profile, the pin, the local key, and the session. Deleting a keyless row while leaving the session
+behind would be the worse half of the job, since the session still spends and `resolve_endpoint`
+picks it up again on the next turn. Every other provider row deletes as a row.
+
+**Signing in is the whole of it.** The session token opens both prefixes: `/auth/*` for plans and
+purchases, and `/v1/*` for model calls. There is no key to fetch, nothing to paste, and nothing
+written to disk but the token — the Aizen subscription is sold by sign-in, not by a string.
+`aizen login` (device pairing) is the older door and still hands out a key; it is for machines that
+cannot open a browser at all. With a browser, use this one.
+
+**The browser is the default and `--password` is the exception**, because most accounts have no
+password: created through Google or GitHub, their `password_hash` is NULL, and a password prompt
+tells the majority they typed their own password wrong.
+
+**Leaving is one word.** `/logout` in the REPL and `aizen logout` in a shell drop both credentials
+— the session and this machine's pinned one — because from outside they are one thing, and while
+the plan rides the session a logout that dropped only the pin would leave somebody who typed the
+word still able to spend. `aizen account logout` and `aizen gateway logout` are the narrow ones.
+
+The pinned half now really is cut: `aizen logout` calls `POST /v1/device/logout` with this
+machine's own credential, which cuts this machine's device row and nothing else, effective on its
+very next call. **The local teardown happens whatever the server answers** — 200, 401 and a dead
+network all mean one thing here, and the `forget_token` in the reply is an instruction rather than
+a suggestion, since the server cannot reach this disk. Calling twice is another 200: the route
+reports a state, not an event. The account session half still revokes nothing — that token stays
+valid on other machines until it expires.
+
+**The token is a bearer credential.** It is stored owner-only, never printed, never logged, and
+never a field of `--json` output. It lives 30 days with no refresh route, and a password change
+anywhere kills every token minted before it — so a `401` in the middle of a run means *sign in
+again*, not a network hiccup to retry. The CLI says exactly that when it sees one, and `401` is
+absent from the retry table on purpose.
+
+At `/v1` only the `Authorization` header opens the door; a cookie does not. The CLI sends none, and
+should not gain one: a cookie that spent money would make every open browser tab a wallet.
+
+The browser flow binds `127.0.0.1:0` *first* (the port is part of the URL), opens
+`/auth/cli/authorize?port=…&state=…`, catches the redirect, and trades the code at
+`/auth/cli/exchange` for the same JWT a password login returns. It waits **ten minutes**, not the
+code's two: that clock starts only once you have a session, and step one is often a whole round trip
+through Google.
+
+Two things are worth knowing here as well:
+
+* **`state` is the only defence.** A page in the same browser can point at `/auth/cli/authorize`
+  while the listener is up, and the redirect that follows is indistinguishable at the socket. A
+  mismatched `state` means the code is discarded and never exchanged — exchanging it would burn a
+  stranger's code and adopt whatever account it belonged to. The page returned to the browser also
+  says only fixed sentences: `?error=` is chosen by whoever provoked the redirect.
+* **The code burns once, and its three refusals are three different problems.** `404` no such code,
+  `409` already used, `410` expired. Each is printed in the server's own words rather than flattened
+  into "invalid code", and all three exit `2` — a retry is the one thing that cannot help.
+
+### `aizen key` — your keys, and what your plan may call
+```bash
+aizen key ls                       # your keys; the plan's row is marked
+aizen key reveal --id k_123        # the string of a key you made yourself (--id required)
+aizen key loadout ls               # the plans it may call, in `auto` preference order
+aizen key models                   # what those plans resolve to today
+```
+
+**Your plan is not a key you can copy.** Signing in is what buys it, and no route emits a string for
+it. A row of `api_keys` does stand behind each account server-side — it carries the loadout, the
+per-minute ceiling, the budget and every `usage_history.api_key_id` — but it is an internal detail
+this CLI never holds.
+
+So there is no `key show` and no `key rotate`. They existed briefly against a contract that had
+`/auth/plan-key` and `/auth/plan-key/rotate`; those routes were withdrawn before they shipped and
+answer `404` permanently. `reveal` takes no default for the same reason: guessing the plan's row
+there could only produce a refusal that reads like a bug in the command, so it names the row and
+says why instead.
+
+Keys still exist in two places, and neither changed: a key **you made yourself**, for models bought
+from a seller, and your own key at the far end of a BYOK endpoint (`mine/gpt-4o`), which bills there
+and never touches a plan.
+
+There is no revoke subcommand and none should be added — `/auth/keys/{id}` is DELETE, and the
+server refuses it at the plan's row anyway.
+
+Your plan's row also breaks three expectations an ordinary key sets:
+
+* it calls **Aizen's own plans only** — a seller's model through it is a `403`, and belongs on a key
+  you made yourself;
+* an **empty loadout means it can call nothing**, the opposite of an empty allow-list on any other
+  key, so a freshly issued one refuses everything until something is loaded;
+* its loadout holds **plans, not models**, at most 10, and the order is meaning: `auto` resolves to
+  the first entry callable at that moment. `auto` points *into* the list and can never be in it.
+
+Two route shapes are worth knowing because getting them wrong is expensive. The id goes **last** —
+`/auth/keys/reveal/{id}`, `/auth/keys/loadout/{id}` — because `/auth/keys/{id}` is the revoke route.
+And the plan key is found by the `plan_key` flag on each row, never by its label: one issued through
+the admin door is labelled with the owner's email, not `main`.
+
+### `aizen sub` — plans, combos, model subscriptions, plugins
+```bash
+aizen sub plan ls                     # what a plan grants, costs and caps
+aizen sub plan buy pro                # spends karma — confirms first unless --yes
+aizen sub combo ls                    # the marketplace shelf
+aizen sub model add nbz/glm-5-air     # subscribe (free; usage is charged at call time)
+aizen sub model ls --all              # what you hold, cancelled ones included
+aizen sub model confirm nbz/glm-5-air # accept a price change and unblock it
+aizen sub plugin buy <slug> --code X  # the coupon price is the server's quote, never recomputed
+```
+
+Everything here runs on the account session, never on a gateway key, and nothing here mints,
+reveals or loads one.
+
+**Buying a thing and being able to call it are two different questions**, and the gap between them
+is the source of this API's most confusing `403`:
+
+* the **plan key carries Aizen's own plans only**, so a seller's model bought through `model add` is
+  subscribed and still refused through that key — it needs a key of your own (`aizen key ls`);
+* an **empty loadout on the plan key means it can call nothing**, inverting what an empty allow-list
+  means on every other key, so a freshly bought plan refuses everything until `aizen key loadout`
+  holds it.
+
+Both sentences are printed at the moment of the purchase rather than left for the first failed call.
+
+Three details that decide whether a client is correct:
+
+* **Spends never retry.** A purchase whose answer was lost must not be sent again — the second send
+  charges twice, and the server's `409` is a last fence rather than a contract (a plugin *renewal*
+  is legitimately repeatable, so it cannot catch a double send at all).
+* **`null` is not `0`.** A null `quota_units` is "no cap" while `0` is a real cap of zero; a null
+  `karma_price` means "not sold for karma", which is the opposite of free. `owned` on a plugin is
+  the string `none`/`active`/`expired` — read as a boolean it is truthy in three cases out of three.
+* **A listing id is cut from the END.** The model is the last segment and the namespace before it
+  may hold further `/`, so `two/slashes/here` is a legal id, not a typo. The `/` also stays a real
+  separator in the URL path: `%2F` makes the route stop matching.
+
+Own endpoints (`mine/…`, BYOK) do not pass through this door at any point — they are billed by your
+provider at the far end, spend no karma, and hold no subscription. `aizen sub model add mine/gpt-4o`
+is refused here rather than at the server, because the answer is `aizen custom`, not a retry.
 
 ### `aizen config` — provider-first setup (recommended)
 Run it with no subcommand for the config dashboard. **Providers & connection** is the first row: add a
@@ -289,7 +554,8 @@ windows, so the HUD estimates them from the model name until you set one.
 
 Sub-agent configuration uses the same provider list. In `/config` → **Sub-agents**, choose a saved
 provider and either its default model or a model override for Sub-agent default, Summarizer, Oracle,
-Apply, or an installed specialist. No endpoint/key is retyped. Scriptable specialist equivalent:
+Apply, one of the seven Pantheon roles (`roles.pantheon.<role>`, above the sub-agent default), or an
+installed specialist. No endpoint/key is retyped. Scriptable specialist equivalent:
 
 ```bash
 aizen agents set-provider code-reviewer backup              # provider default model
@@ -306,6 +572,16 @@ a frame it cannot read strictly is retried leniently, and whatever is still unre
 noise it drops without a word. If a new gateway ever *does* go quiet or lose tool calls on you, set
 `AIZEN_DEBUG_STREAM=1` to print the offending frames (capped at 3 per response plus a total) — that
 output is the useful thing to attach to a bug report.
+
+A stream has two deadlines: `AIZEN_STREAM_FIRST_FRAME_SECS` (default 600) until the first frame
+parses — a reasoning model that streams nothing until its answer starts is legitimately silent
+for minutes — and `AIZEN_STREAM_STALL_SECS` (default 90) between frames after that. A stream that
+dies or goes quiet before producing anything is replayed up to twice; once it has produced text or
+a tool call it is never replayed, so nothing is duplicated. Some models reject a request field
+(`max_tokens` on o-series/gpt-5 models, `parallel_tool_calls` or `tool_choice` on strict local
+servers, `cache_control` on some gateways, `reasoning_effort` out of range): the 400 is read, the
+field is dropped or renamed (`max_tokens` → `max_completion_tokens`), the request is re-sent, and
+the model is remembered for the session so it costs one failed call per model, once.
 
 ### `aizen models` — list the provider's models
 ```bash
@@ -351,16 +627,83 @@ aizen agent "add a --version flag and update the help text"
 aizen agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/shell ops
 aizen agent --max-iters 40 "..."                            # raise the step cap
 aizen agent --save-session "..."                            # keep the transcript for /sessions
+aizen agent --resume fix-delete-btn --save-session "..."    # continue a saved session under its slug
 aizen agent --effort high "..."                             # this run only; the config is untouched
 aizen agent --image shot.png "why is this button misaligned?"  # vision: repeat --image for more
+aizen agent --reference-images --image ref.png "reconstruct this reference" # task-local exact reference grant
+aizen agent --output-format stream-json "..."               # one JSON record per line on stdout (front-ends, CI)
+aizen agent --design auto "preserve this page's brand while fixing its mobile layout"  # session-scoped; auto|on|off
 ```
 Behavior worth knowing:
+- **Machine-readable output.** `--output-format stream-json` turns the run into one JSON record
+  per line on stdout, and nothing else on stdout, in the shape Claude Code's `stream-json` uses
+  (the Claude Agent SDK message types) — so a front-end, an editor extension or a CI script that
+  already reads Claude Code reads an aizen run with the same parser, instead of parsing the human
+  transcript by its leading glyphs. `--output-format json` prints only the closing `result`
+  object. Every record has a `type`, a `uuid` and the run's `session_id`; fields are only ever
+  added, so ignore what you do not know:
+
+  | record | fields |
+  |---|---|
+  | `system` / `init` | `cwd`, `model`, `tools` (the names the first request advertises), `permissionMode` (`default`, or `bypassPermissions` with `--yes`), plus aizen's `approval_mode`, `version`, `effort`, `images`, `pid` |
+  | `stream_event` | `event{type: content_block_delta, delta{type: text_delta, text}}` — a fragment of the answer as it streams; a `thinking_delta` for the model's reasoning channel, when the provider exposes one |
+  | `assistant` | `message{id, role, model, content[block]}` — one record per finished block: `text`, `thinking`, or `tool_use{id, name, input}`; the blocks of one model turn share `message.id`; `target` names what a tool call is about, and `request_id` names that invocation's approval request, including refused calls whose result reports an error |
+  | `user` | `message{content[{type: tool_result, tool_use_id, content, is_error}]}` — a call's result (`content` cut at 64 KB); `tool_use_result{name, target, digest, elapsed_ms, truncated, dispatch}` is aizen's own account of it |
+  | `control_request` | `request_id`, `request{subtype: can_use_tool, tool_name, input, tool_use_id, agent_id, title, description, preview}` — a destructive call is waiting for an answer on stdin |
+  | `system` / `permission_denied` | `tool_name`, `tool_use_id`, `request_id`, `message` — the answer was no (or stdin closed) |
+  | `system` / `informational` | `content`, `level` — `info` for a progress line the transcript would have shown, `warning` (with `kind`: `blocked`, `caution`, `network`) when the safety floor spoke |
+  | `system` / `plan` | `items[{status: pending \| in_progress \| done, text}]` — the todo panel as last written |
+  | `system` / `diff` | `path`, `added`, `removed` — the size of an edit (its text is in the `tool_result`) |
+  | `system` / `verify` | `command`, `detail` — a verify-gate line |
+  | `system` / `hook_response` | `hook_name`, `hook_event`, `output`, `exit_code`, `outcome`, plus `decision`, `reason`, `timed_out`, `elapsed_ms` |
+  | `system` / `compact_boundary` | `compact_metadata{trigger, pre_tokens, post_tokens}` — older turns were summarized in place |
+  | `system` / `session_saved`, `session_not_saved` | `slug`, `path` (with `--save-session`), or `error` |
+  | `system` / `steer_queued`, `steer_dropped` | `text`, plus `pending` when queued, `reason` when dropped — a stdin steer was taken into the mailbox or refused |
+  | `result` | `subtype` (`success`, `error_max_turns`, `error_during_execution`), `is_error`, `duration_ms`, `num_turns`, `result` (the answer), `usage{input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens}`, `permission_denials[]`, plus aizen's `stop`, `question` (with `awaiting_input`), `session`, `calls`; `errors[]` when `is_error` |
+
+  A delegated child's records (`task`, `workflow`) are on the stream too: their
+  `parent_tool_use_id` is the `tool_use` id of the call that spawned them and `dispatch` names
+  the child; the loop's own records carry `null`. Children run in parallel, so their records
+  interleave with each other's and with the parent's — pair a `tool_result` with its `tool_use`
+  by `tool_use_id`, never by order. `stop` is one of `done`, `divergence`, `max_iters`,
+  `verification_failed`, `awaiting_input`, `cancelled`, `deadline`. **Approvals are answered on
+  stdin** with the SDK's control protocol: when a destructive call needs a decision the run
+  writes a `control_request` and blocks until a line
+  `{"type":"control_response","response":{"subtype":"success","request_id":"<id>","response":{"behavior":"allow"}}}`
+  arrives; `{"behavior":"deny","message":"…"}` refuses it, and an allow may widen the grant with
+  `updatedPermissions`: `[{"type":"addRules","rules":[{"toolName":"<tool>"}],"behavior":"allow","destination":"session"}]`
+  allows that tool for the rest of the run, `[{"type":"setMode","mode":"bypassPermissions","destination":"session"}]`
+  allows every later call (as `--yes` from here on). A closed stdin is a deny, exactly as a
+  non-TTY run has always been, and so is `--output-format json`, which has no channel to ask on.
+  **Steering is answered on stdin too**: a `stream-json` run arms the steer mailbox, and a line
+  `{"type":"steer","text":"…"}` queues text for the loop to fold in at the next turn boundary —
+  the same mailbox the TUI drives with Alt+Enter, capped at 8 pending of 4000 chars each. The
+  run acknowledges with a `system` record `{"subtype":"steer_queued","text":…,"pending":n}`, or
+  `{"subtype":"steer_dropped","text":…,"reason":…}` when the mailbox is full, the text oversized,
+  or no live turn is accepting; a leftover when the run ends is also dropped, with
+  `reason: "turn ended"`. A front-end that sees `steer_dropped` may keep the text and retry it on
+  the next run. Lines that are neither a reply to the pending request nor a steer are ignored.
+  Not on the stream: a cost in dollars (aizen has no price list) and the API's per-message
+  `usage` (the run's total is in `result`). Nothing else changes: `--yes`, `--save-session`, `--effort` and `--image` mean what
+  they mean in text mode, and the exit code is `0` for every `result` that ends a run (read
+  `is_error` and `stop`) and `1` when the run died (a `result` with `errors`).
 - **Nothing is saved unless you ask.** This subcommand is also the scripting and CI entry point, so
   it writes no session file by default — a file per invocation would bury the pool `/sessions` reads.
+  Saved conversations are bounded: `sessions_keep` (default 200) and `sessions_max_bytes`
+  (default 256 MiB) in the config prune the oldest at autosave, never the live one; each turn
+  appends to `<session>.jsonl` and the `.json` transcript is rewritten only when needed; images
+  of 4 KB or more live once under `sessions/blobs/` by content hash.
   With `--save-session` the finished conversation is written to `~/.aizen/sessions` with the same
   provenance stamp the REPL writes (project key, root and slug), so `/sessions` reopens it without
   caring which surface produced it, and the path is printed to **stderr** — stdout stays the answer.
   A run that ends in an error is saved too: it still happened.
+  `--resume <slug>` continues a saved conversation instead of starting one: the stored transcript
+  becomes the run's history (its prompt lanes rebuilt for the current project and model — the same
+  contract as `/resume`, with the same loud warning when the session came from another project),
+  and the task is appended as the next user turn. Combined with `--save-session` the run writes
+  back into the **same** slug rather than allocating a fresh one, so a front-end can chain runs
+  into one continuous conversation: save, resume-and-save, resume-and-save. Resuming a missing or
+  unreadable slug fails the run before any request goes out.
 - **Effort is per run, not per config.** `/effort` in the REPL pins a tier by writing
   `reasoning_effort` into the config; `--effort` arms the same per-turn override the REPL arms and
   persists nothing, so a front-end can send one hard run and one cheap one without editing the
@@ -368,6 +711,37 @@ Behavior worth knowing:
   typed REPL turn goes through, against the task text. Omit the flag and nothing changes: the
   configured `reasoning_effort` applies and the request is byte-identical to one from a core that
   never had the flag. The tier is named on **stderr**, next to the rest of the trace.
+- **A tier changes the harness, not only the wire.** In the REPL the resolved tier also sets the
+  step cap and its extension, how many fresh budgets a still-progressing run may claim, how many
+  verify-and-fix rounds a broken tree gets, whether the self-review pass runs before Done
+  (`xhigh`/`max`), and how much of a build log reaches the model — so `/effort low` and
+  `/effort max` behave differently even on a provider that ignores `reasoning_effort`. A tier can
+  also change the model: `"models_by_effort": {"low": "cheap-model", "max": "strong-model"}` in
+  `cli-config.json` sends turns of that tier to that model on the same endpoint (the effort line
+  then names it); tiers without an entry use the main model.
+- **Architect mode: plan, then apply.** Multi-file turns use `metis` at `max` effort by default;
+  lower tiers also use it when `models_by_effort.max` or `xhigh` explicitly configures a planner.
+  The planner drafts a Markdown spec: requirements, scope/non-goals, design decisions, phases
+  naming files and checks, acceptance criteria and verification. The editor receives it under
+  `<architect_plan>` with a suggested unique `docs/plans/<topic>-<id>.md` path and instructions to
+  save it **before implementation**, using ordinary `file_write` (`purpose: project`). Missing
+  parent directories must first be created through the approved shell tool. Preparing
+  the draft does not write files or bypass approval, ownership checks or checkpoints. Denial or
+  write failure must be reported; the draft remains in context, not falsely reported as saved.
+  Confirmed nonvisual work may select `models_by_effort.low` as editor at low wire effort;
+  visual/unknown work preserves the selected model and effort unless an explicit apply role is set.
+  Harness budgets stay unchanged. Single-file turns, questions and research do not enter the split;
+  no usable planner result leaves the ordinary turn unchanged. Disable with `architect_mode: false`
+  or `AIZEN_ARCHITECT=0`.
+- **Two planning tiers.** The model judges scope: a few reversible steps get a short `todo_write`
+  list; multi-system work, migrations or multi-phase audits get a `docs/plans/<topic>.md` spec first,
+  then todos for execution. Plans are ordinary repo files the user can review and commit. Keep the
+  path in handoff summaries and re-read it after compaction or resume; this is guidance, not an
+  automatic resume loader. The top-level harness adds at most one advisory `[plan-nudge]` to the
+  next normal model request: initially for a multi-file request, or when edits grow to 3+ paths,
+  if neither todos nor a referenced/read/written nonempty plan is known. It does not block tool
+  calls or add a Done-gate round-trip; children do not run it. An architect draft already carries
+  save-first advice. Explicit plan-only requests do not authorize implementation.
 - **Images are attached, not described.** `--image <PATH>` inlines a PNG/JPEG/GIF/WebP (≤ 8 MB) into
   the first user message as an `image_url` data part — the same wire shape the REPL produces when you
   drag a file onto the window or press Ctrl-O to grab a screenshot — so a front-end driving this
@@ -387,30 +761,404 @@ Behavior worth knowing:
   request together, and the model is never told about a tool it cannot call.
 - **Parallel reads** — when a turn only reads (file_read/glob/memory), the calls run
   concurrently; any turn that edits or runs shell stays serial (and approval-gated).
-- **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running. In the sticky
+- **Continuing earlier work** — a fresh conversation's prompt lists this project's recent saved
+  conversations in a `<sessions>` block, and the read-only `session_recall` tool returns a clipped
+  digest (opening request + latest exchanges) so "continue the most recent session" resumes the
+  work instead of sending the model hunting for transcripts. Restoring a full transcript stays
+  yours: `/resume`.
+- **Purpose-aware native files** — new `file_write` targets and new `file_move` destinations
+  require `purpose: project | artifact | scratch`; an existing-file overwrite still works without
+  purpose. `project` keeps the explicit path for source, assets, repository docs, or an export whose
+  location you requested. `artifact` stores durable output under
+  `AIZEN_HOME/artifacts/<workspace-key>/<run-id>/<child-scope>/`, outside the checkout by default
+  (an explicit `AIZEN_HOME` inside the checkout keeps that location). `scratch` stores disposable output
+  under `managed/<compact-run>/root/` or a run-owned `agent-N/` namespace in this process's scratch
+  root. Handles are short labels, not truncated workspace/child identities; checked ownership
+  metadata still binds the full identity. Tool rows show `scratch/<relative>` (or
+  `scratch/agent-N/<relative>`), while complete-label copy and links retain the real absolute
+  destination. These are display labels, not executable filesystem aliases. Arguments, approvals,
+  raw results and event logs keep real paths. For managed purposes,
+  `path`/`to` is a safe relative logical name (for example `reports/audit.txt`), not the actual absolute
+  destination: traversal, absolute/device paths and unsafe Windows components are rejected. The tool
+  returns the actual final path; use that path for later reads or edits. `file_edit` edits existing
+  files only; create with `file_write` and purpose instead. Publish managed output to a requested
+  project location only through an explicitly approved `file_move` with `purpose: project`.
+  Managed directories are created after approval, never while planning/previewing or after denial;
+  if a later lease/checkpoint fails, approved empty parent directories may remain, but the transfer
+  is not run. Normal project writes retain their parent-must-exist rule. Native moves refuse different workspace
+  owners, including a repository outside this run's workspace; run from the owning workspace instead
+  of relying on a lease that protects only one side. Managed directory transfers use a bounded
+  no-follow preflight (1,024 entries, depth 32, 32 MiB of file contents) and refuse unsafe or oversized
+  trees. Artifacts persist across runs and are not scratch-TTL data. Scratch is not durable storage.
+  A lifetime ownership lock protects live
+  managed roots; the existing sweeper conservatively skips process roots containing a managed
+  namespace. Abandoned managed-scratch age cleanup is deferred: these files are not automatically
+  deleted after seven days.
+  This is native-tool placement, not universal filesystem enforcement: shell, MCP and build tools
+  retain their existing permissions; the prompt discourages using them to bypass native rules.
+- **Discover managed outputs** — `/where` / `aizen where` names the effective workspace artifact
+  root and the current process's planned managed scratch root without creating either. `/files`
+  / `aizen files` lists paths and sizes only; optional `artifacts` or `scratch` filters select one
+  root. Artifacts are listed across runs so a later session can find durable outputs; scratch lists
+  only this process's managed scopes (a fresh CLI invocation does not inspect another running
+  process's scratch). The shared listing caps traversal at 256 entries, depth 4 and 32 KiB of output,
+  reports truncation, quotes/control-escapes bounded filenames, refuses symlink/reparse roots and
+  skips linked descendants. Missing roots stay absent. It reads no file contents, provides no
+  cleanup/delete command and does not automatically publish output into your project. Path checks
+  are read-only no-follow guards, not kernel-atomic isolation against hostile concurrent path swaps.
+- **Internal scratch results** — large tool results and collapsed older results still use the
+  process scratch directory: the full text of any result over 16 KB (the cut result names its file),
+  and every result aged past the eight most recent and collapsed to a one-line digest — see the
+  context notes under the REPL section.
+- **Calls written as text are still calls** — arguments that are almost JSON (a trailing comma, a
+  raw newline inside a string, Python quotes, a brace cut off by `max_tokens`) are repaired and the
+  repair is traced; a call a local model wrote into its text — `<tool_call>…</tool_call>`, a
+  ```json fence, a bare `{"name": …, "arguments": {…}}` reply or Mistral's `[TOOL_CALLS] [...]` —
+  is executed when the native `tool_calls` array is empty and every name is a registered tool.
+  Prose with no such block, or a block naming an unknown tool, is left exactly as written.
+- **Diagnostics ride the next result, and the loop checks after three edits** — the post-edit
+  LSP fold waits 300 ms; a slower analysis finishes in the background and its diagnostics — the
+  edited file's, plus new errors in up to three caller files — are appended to the next tool
+  result, or become a demand before Done when the model is about to finish. After every three
+  successful edits the loop runs the project's fast check itself and appends the verdict to the
+  last edit's result; a pass satisfies the verify gate. `harness_check_after_edits` (default 3,
+  `0` off) sizes the batch.
+- **LSP and the `/init` index warm up after the first frame** — once the retained screen is
+  up, a background task enables the LSP runtime and starts a server for each language the
+  project's files use (one `documentSymbol` probe per language, so the first edit of the session
+  already gets diagnostics), then refreshes an existing `/init` index incrementally. It never
+  builds an index unasked, and nothing runs before the screen is usable. `AIZEN_NO_WARMUP=1`
+  turns it off.
+- **Edits: `replace_all` on every rung, `dry_run`, and a diff the model does not re-read** —
+  `file_edit` matches on a ladder (exact, indentation-tolerant, whitespace-normalized, …) and
+  `replace_all` now applies on whichever rung matches. `dry_run: true` shows the diff and writes
+  nothing. The result the model sees keeps the removed lines, the `@@` line anchor and a
+  `+N line(s)` count per hunk (three hunks at most, the rest summed); the terminal still shows
+  the full diff. `file_glob` sees everything by default (dotfiles, `target/`, `node_modules/`);
+  `ignore: true` honours `.gitignore` and skips the heavy dirs the way `search_files` does. The
+  five search tools — `file_glob`, `search_files`, `codebase_search`, `lsp_workspace_symbol`,
+  `read_symbol` — end their descriptions with the same routing sentence.
+- **Concise tool output by default** — `shell_run`, `process` and `search_files` take
+  `format: concise | detailed`. Concise, the default, changes nothing for a short result; a log
+  over about 4,000 characters is cut to its status line, the head, the first error and the tail,
+  with a second line stating the line and byte counts and the scratch file that holds the full
+  text; a search past 40 rows shows those rows and counts the rest per file, the whole list on
+  disk. `detailed` returns everything up to the loop's budget (16 KB for logs), and the 16 KB
+  spill still applies above that.
+- **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running, and the
+  prompt shows what the call WILL do first: an edit's patch in the diff box (computed without
+  writing), a write's create-or-overwrite line with its patch, a shell command's directory and
+  full command line, a move's both ends — the same payload reaches a Telegram approval. Edit
+  headers carry the repo-relative path. Two `always` rows grant a scope narrower than
+  allow-all — the tool everywhere, or the tool under the directory this call writes to — for
+  the rest of the window; a project ships standing grants in `.aizen/approvals.json`
+  (`{"allow": [{"tool": "shell_run", "under": "scripts"}]}`), `/approval grants` lists them,
+  and an auto-approved call is named in the transcript. In the sticky
   REPL each one shows an inline **`[y]es · [n]o · [a]llow all this session`** prompt (the `[a]`
-  choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval` is the persisted
-  three-level setting: `ask` prompts, `smart` auto-runs read-only-shaped shell, and `yolo` pre-authorizes
-  all non-floor operations. Legacy `/smart` and `/yolo` aliases remain accepted. Non-TTY (CI/pipes) safely denies unless `--yes` is set;
+  choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval ask|smart|yolo`
+  is the three-level setting: `ask` prompts, `smart` auto-runs read-only-shaped shell, and `yolo`
+  pre-authorizes all non-floor operations. It applies to **this window only** unless you add
+  `--persist`, which writes it to `cli-config.json` as the default every new window, `aizen serve`
+  lane and cron job starts from — a one-off `/yolo` in one terminal no longer arms the whole
+  machine. Legacy `/smart` and `/yolo` toggles are session-scoped the same way. Non-TTY (CI/pipes) safely denies unless `--yes` is set;
   under `aizen serve` the prompt is routed to your phone. The hard `cmd_guard` floor blocks catastrophic
   commands underneath all of these.
-- **Verify gate** — after an editing run, a fast typecheck (`cargo check` / a `typecheck`
-  npm script / `npx tsc --noEmit`) runs once before the agent reports done; on failure the
-  errors are fed back for one fix turn. Skips silently for unrecognized projects.
-- **Sub-agents** — the agent can call the `task` tool to delegate a self-contained sub-task to
-  a fresh role-scoped sub-agent (`coder`/`tester`/`planner`/`reviewer`). Single depth: a
-  sub-agent cannot spawn further sub-agents.
+- **Verify gate** — after an editing run, a fast check runs before the agent reports done and
+  its errors are fed back for a fix turn: `cargo check`, a `typecheck` npm script or
+  `npx tsc --noEmit`, `go build ./...` then `go vet ./...`, `mvn -q -DskipTests compile`,
+  `gradle -q compileJava` (through the repo's wrapper when it ships one), `dotnet build`, or a
+  Python byte-compile pass (`python -m compileall`, syntax only — Python has no universal
+  typecheck). A toolchain that is not installed counts as "nothing ran", never as a failure. When
+  nothing could run at all — no recognised manifest, no toolchain — the model is asked once to
+  run the project's own build or test command and quote the result before finishing, instead of
+  reaching "done" unverified in silence. Before Done the gate climbs a ladder, cheapest rung
+  first: the typecheck; the narrowest test the edited files name (`cargo test -- module::` or
+  `--test file`, the sibling `test_x.py` under pytest or unittest, `go test ./pkg/`, the sibling
+  `x.test.ts` under vitest or jest — no declared runner, no rung); and, on a change that touched
+  more than one file, the suite (`cargo test`, `npm test`, `go test ./...`, `pytest`,
+  `mvn test`, `dotnet test`), which runs only while it fits the verify budget — the first run
+  times it, and a suite that blew the budget once is skipped with a note from then on. `/init`
+  detects the commands and the suite and times the fast rung; the record lives in
+  `~/.aizen/verify/<project>.json`, never in the checkout. A trusted `.aizen/verify.json`
+  overrides detection: `{"commands": [...], "suite": "...", "timeout_secs": N}`.
+  The same engine runs headless as `aizen init` (`--status` reports without scanning, `--force`
+  rebuilds, `--progress` prints machine-readable `PROGRESS {json}` lines for the desktop app's
+  Codebase map tab, and the verify-command measurement runs only on an explicit `--verify` —
+  a script or GUI must not surprise-launch your build).
+- **Sub-agents (the Pantheon)** — the agent can call the `task` tool to delegate a self-contained
+  sub-task to a fresh role-scoped sub-agent. Seven built-in roles, each with its own tool scope
+  and embedded working method: `argus` (searcher — read-only, repo-local), `metis` (planner —
+  read-only), `daedalus` (coder — the only role that edits; read/edit/shell), `nemesis` (reviewer
+  — read-only), `themis` (tester — shell, no edit), `clio` (librarian — read-only web research),
+  `mnemosyne` (historian — read-only memory + session recall, no web). Every role gets
+  `git_inspect`, a read-only git window (status/log/diff/show/blame), so a reviewer can see the
+  diff it reviews without holding a shell. The legacy names `coder`/`planner`/`reviewer`/`tester`
+  are still accepted everywhere a role is named (deprecated: result headers answer with the
+  canonical name). An unknown `agent` or `role` is refused with the real list — never silently
+  substituted. With neither given, the dispatch runs as `argus` (the safe read-only default;
+  editing must be asked for by name: `role=daedalus`). Read-only dispatches fan out in parallel;
+  exact native readers and editors with frozen `read_paths`/`write_paths` can also run together
+  when no write intersects another child's reads or writes. Shared exact reads may overlap.
+  Conflicting files, shell/build and unrestricted dispatches remain serial barriers. A reader
+  without a frozen footprint does not overlap a writer. Single depth: a child cannot spawn
+  further sub-agents.
+  Each role has its own default step budget — argus 15, clio 20, metis / nemesis / mnemosyne 25,
+  themis 30, daedalus 45 (`max_steps` overrides; cap 80) — and can be pinned to its own provider
+  or model: `roles.pantheon.<role>` in `cli-config.json`, or `/config` → Sub-agents → Pantheon
+  roles (env `AIZEN_<ROLE>_MODEL` wins; an explicit `model` on the dispatch beats the pin;
+  unpinned roles take the sub-agent default). A child does not start from zero: its brief
+  opens with a `<parent_context>` block carrying the parent's in-progress todo item, the
+  findings passed in the `context` arg (up to ten short lines), and up to fifteen
+  `path:start-end` locations the parent already read in this conversation (from its read
+  cache), capped at 2,500 chars — so the child goes to those lines instead of searching, and
+  does not re-derive what the parent states as established. Every child's full report is also
+  filed on the conversation's blackboard (`<scratch>/blackboard/<scope>/<child>.md`, append-only,
+  named in each child's `<environment>` with the notes already there), so a later child can
+  `file_read` a sibling's whole report. The workspace writer lease is keyed by scope: a child
+  reenters its parent's lease, a sibling scope (another `serve` lane, a parallel dispatch)
+  waits for the OS lock and is told who holds it. An approval a child raises is attributed
+  (`daedalus · fix parser wants: Run …`); `/workflows` shows each child's current step and its
+  own tokens (`12.3k→1.2k tok`), which the `task` result header, the workflow status lines and
+  `--trace` repeat. A write-capable `task` child that runs out of time or fails verification is
+  retried once with a tightened brief (its partial report attached). Aizen's workspace restore/undo
+  APIs are parent-only, and no failure or cancellation automatically rolls back a child's
+  edits. Pre-dispatch checkpoints are audit baselines, not child undo grants. The coordinating
+  parent inspects and consolidates actual or possibly-applied work; a whole-tree restore requires
+  explicit parent action and workspace exclusion, never merely a child's failure. Known direct
+  Git/Aizen restore commands are refused in children before hooks/approval, including `/yolo`.
+  Unrestricted children still have shell access: arbitrary scripts and unrecognized command
+  wrappers can bypass this detector, so it is not a capability boundary against restoration.
+  Scoped native children do not receive those tools. Automatic checkpoint
+  recovery settles metadata only; an interrupted restore with conflicting contents retains its
+  journal and files for explicit parent reconciliation. If a blocking worker still owns the
+  attempt, no retry is authorized: reconcile its eventual effects first. A brief
+  under 80 chars that names no file or symbol is refused (`brief too
+  thin`) — a child starts from an empty context, so the brief must say what to look at and what
+  to return. A child's `Refresh` stop is explicitly incomplete: the body says no automatic
+  continuation ran, and the parent must dispatch any remaining work explicitly. Live token
+  totals include retry and output-contract repair calls; publishing the final total does not
+  add those calls a second time. Final-answer synthesis and contract repair respect child
+  cancellation and the remaining absolute dispatch deadline.
+  Example: `task(agent="argus", prompt="find every caller of parse_server_line …")` — and a solid
+  change flow is one `daedalus` implementation followed by separate `themis` (verify) and
+  `nemesis` (review) dispatches.
+- **Specialist cards** — markdown personas under `.aizen/agents/` / `.claude/agents/` still
+  dispatch via `task(agent="<slug>")`. **Migration note:** a card with no `tools:` line now runs
+  READ-ONLY (it used to receive the full coder scope implicitly). A card that needs to edit or
+  run commands must say so in frontmatter — add e.g. `tools: Edit, Bash` (a shell grant carries
+  the background `process` pool with it). Runtime capability always comes from the resolved tool
+  registry, never from the card's prose.
 - **Clarify, don't guess** — when a choice is genuinely ambiguous and a wrong guess would waste
-  real work, the agent calls `clarify` to ask ONE question; the turn pauses and your next message
-  is the answer (in the REPL, the plain prompt, or over Telegram — no stdin contention with the
-  input box). For low-stakes choices it assumes and states rather than stalling.
+  real work, the agent calls `clarify` to ask one or more focused questions; the turn pauses and your
+  next message is the answer (in the REPL, the plain prompt, or over Telegram — no stdin contention
+  with the input box). Under the retained REPL an ask with suggested answers opens a
+  Claude-Code-style panel: ↑/↓ chooses a single answer, Space toggles `multi_select` options,
+  Tab switches questions, and Enter submits all answers as a normal user message and resumes the
+  turn. Unanswered questions keep the panel open. Esc or typing dismisses it; the questions and
+  options remain in the transcript for a typed reply. For low-stakes choices it assumes and states
+  rather than stalling.
 - **Web research** — `web_search` (needs a free Tavily key — set `TAVILY_API_KEY`) finds pages; `web_fetch` GETs a URL and
   returns it as readable text (HTML reduced to prose, capped); `web_crawl` spiders a site from a
-  seed URL (see `aizen crawl` below). Read-only; available to every role.
+  seed URL (see `aizen crawl` below). Read-only; available to every role except `argus`, whose
+  whole job is inside the repository.
+
+### Scoped native delegation
+
+`task` and workflow tasks accept `read_paths` and `write_paths`: a union of 1–32 distinct exact
+local files, not directories, patterns, traversal spellings or authority inferred from a prompt.
+`read_paths` alone grants only `file_read`. `write_paths` grants reads and writes to those files;
+with both fields, reads use their union and writes use only `write_paths`. The final registry is
+an intersection with the selected role's existing tools: declaring writes never turns a reader
+role into an editor. Inherited scopes may narrow, never widen or upgrade read access to write.
+Scoped children receive only bounded native file tools; shell, builds, processes, LSP, search,
+move/delete, nested delegation and recovery are not granted. Every entry in a multi-file read
+is authorized before data is returned; scoped reads cannot use the ordinary cache shortcut.
+Preparation freezes actual targets and bytes; drift requires new preparation. Resource locks
+use canonical parent + normalized basename, so atomic replacement does not lose exclusion.
+These locks coordinate cooperating Aizen workers; fingerprint checks are **not** kernel
+conditional writes or confinement of external editors.
+
+**Parallel scoped reader/editor admission is enabled in source.** Submit exact `argus` readers
+and `daedalus` editors in the same turn or workflow. Admission uses frozen capabilities, not
+role names or prompt claims. Read/read pairs may share files; reader/editor and editor/editor
+pairs overlap only without write/read or write/write intersections, including cross-reads.
+Conflicting scopes serialize so later children read committed postimages; use `after` for an
+explicit dependency. Shell/build, opaque, image-bearing and unrestricted work remain barriers,
+as do readers without a frozen exact footprint beside a writer. The coordinating parent records
+actual settled edits (including partial edits before a later failure), verifies the combined tree,
+and owns recovery. A successful child report alone is not mutation or verification evidence.
+This source contract does not retroactively enable previously installed binaries.
+
+Live shell and build commands remain serialized on Windows: Job Objects contain process trees,
+not filesystem or network access. A copied working directory does not authorize editor/build
+overlap. No concurrent isolated-snapshot build capability is advertised on Linux or macOS either;
+that requires a dedicated restrictive backend and real escape/settlement tests, not merely the
+ordinary sandbox profile. Local verification identity tracks membership, contents and modes
+within limits but excludes output/dependency stores and lacks environment/toolchain provenance.
+It rejects stale or unsettled success; it is not permission to reuse arbitrary build results.
+
+Strict process/verify lifetime checks accompany scoped admission. On Windows, complete-tree
+proof requires suspended creation, checked
+Job assignment before the initial thread resumes, an empty Job and completed actual pipe workers.
+An ordinary late Job attachment is not proof: descendants may already have escaped the Job. Unix
+process groups and missing containment cannot prove detached descendants stopped. Do not enable
+overlap on the strength of a timeout, wrapper exit, pipe EOF or a UI “done” row. Unproven verify and
+sidecar startup effects remain typed uncertainty, not ordinary failure or permission to retry.
+A local sidecar (LSP or MCP stdio) is charged as unsettled while it starts, but a start that is still
+IN FLIGHT never blocks anything — its own caller is awaiting it, so a slow cold index cannot wedge the
+session. Only a startup that FAILS (or whose observer goes away) starts blocking, and that charge is
+retired **only** by its monitor proving the tree exited with every pipe worker finished. So a start
+that fails and then settles stops blocking on its own — no `/lsp off`, no restart, no relaunch —
+while a child nobody can account for keeps new work refused until the CLI exits. A boundary waits a
+short grace period for a just-failed start's teardown and refuses immediately when there is no proof
+path at all.
+Persistent local sidecars and ambiguous remote operations may keep scoped admission excluded until
+the CLI exits; ordinary parent native IO does not borrow that sidecar exclusion gate.
+
+Scoped writes use private durable native journals (64 MiB total, 128 records, before/after images
+at most 4 MiB each). Prepared intent precedes mutation; applied/settled records precede success.
+A failure from the first Prepared-publication attempt onward is possibly applied, not permission to
+retry or undo. Its assigned intent ID is retained even before source mutation starts; a failed first
+save does not prove whether that record reached disk. Missing exact proof remains unresolved.
+Conflicts are retained and block further mutation. There is no pruning or emergency undo reserve:
+a full journal refuses further writes **and undo**. Ordinary native edits cannot target journal
+storage. `native_owner_undo` is a destructive, parent-only exact-owner/exact-path operation; newer
+same-file sibling ownership conflicts rather than being overwritten. On Windows, undo deletion
+of an owner-created file is unsupported without a checked durable unlink primitive. Native and
+Time Machine restore/undo APIs remain parent-only, including for unrestricted children; no failure
+triggers rollback. This does not remove the unrestricted-shell limitation described above.
+The parent retains and consolidates actual reports before deciding on explicit recovery.
+Transcript autosave and an Idle phase are not physical settlement proof. Unsettled effects retain
+recovery warnings and baseline attribution even when ordinary shutdown cleanup runs. The recovery
+lease stays locked while the owning CLI process is alive; after process exit, its durable warning
+can be offered by recovery. Neither a later successful reader nor the lease TTL silently reconciles
+those effects.
+
+### Native speculative execution (source implementation; recovery incomplete)
+
+An explicit `execution: "speculative"` on scoped `task` or workflow tasks requests a different
+native lane; omission keeps the direct admission rules above. A controller captures one immutable
+base for a bounded cohort and seats each child in a distinct private overlay. Only native
+`file_read`/`file_edit`/`file_write` are eligible. Children see the base plus their own edits, never
+peer overlays or live changes. Exact scopes and role capabilities still apply. Configured lifecycle
+hooks that could run cause admission to refuse; disabling hook display does not isolate a process.
+
+Same-file children may edit concurrently, but only the coordinating parent integrates after every
+physical worker settles. Integration is deterministic, not completion-order overwrite. Identical
+results retain all contributors; overlapping edits, competing rewrites and uncertain syntax conflict.
+For Rust, automatic same-file combination requires confidently identified distinct function bodies;
+imports, signatures, macros and same-function changes require resolution. Other languages retain
+conservative same-file refusal. Live base/read drift refuses integration rather than rebasing intent.
+Partial effects and uncertain workers are retained without automatic retry or rollback.
+
+Combined-tree command verification is separate from overlay completion and byte integration.
+Workflow dependencies and accepted reports wait for required verification. Peer-read concerns remain
+explicit semantic-review flags even after commands pass; base-scoped findings are not fresh live-tree
+reviews. This is optimistic native-tool isolation, **not** isolated shell/build execution.
+
+Verification reserves its start/finish evidence capacity before integration source effects, claims a
+single attempt, and durably records `integration-verification-started` before invoking the opaque
+gate. Its finish links that exact immutable start and records `settled`, `possibly_applied` or
+`unknown_worker` explicitly. A start alone means attempt intent, not proof a process spawned or
+settled. Publication failure retains the evidence without rerunning the gate. No admission or
+metadata lock is held across a verifier subprocess. Workflow live completion and replay require the
+supported exact linked-ID success summary with an explicit settled effect; arbitrary strings and
+legacy summaries missing lifecycle evidence do not release dependents. Summaries remain provenance,
+not current-source proof or restart execution authority. Legacy verification is inspectable but
+cannot silently gain an accepted current lifecycle.
+
+Integration evidence retains exact per-file native journal IDs for changed files; no-ops do not gain
+journal ownership. New integrations first persist a complete ordered changed-write fence in the v2
+journal, bound to a random journal epoch and batch ID. The exact identity is copied into immutable
+prepared evidence before source effects and repeated by the version-2 receipt linkage. Existing-only
+restart inspection checks the entire fence, owner, historical bindings, images, ordinals and claims,
+including a real fence lookup for an empty batch. Missing expected records or omitted claims remain
+unresolved; unrelated journal writes do not count toward the batch. Legacy version-1 selected-ID
+receipts remain inspectable but never gain complete coverage by matching numeric IDs. Fences are
+bounded (128 retained fences, within the shared 64 MiB journal quota); exhaustion refuses admission.
+
+IDs and stored paths are evidence, not restart execution capabilities. Time Machine validates the
+prepared/receipt/verification chain and refuses mutation on unresolved or unsupported evidence,
+including older receipts missing exact journal linkage. Restart inspection requires fresh parent
+admission and caller-selected exact resources, classifies exact pre/post images, and refuses foreign
+or mixed images. Inspection never reconciles the native journal. A complete historical native batch
+is not a durable physical-worker roster or closure receipt; those lifecycle guarantees remain
+unfinished. A matching postimage or missing native proof is not effect attribution or proof of no effect.
+
+Use `checkpoint_view action=recovery_report cohort=<id> prepared=<m-hash.json>
+resource_paths=["src/file.rs"]`, or `aizen time doctor --cohort <id> --prepared <m-hash.json>
+--resource src/file.rs [--resource ...] [--json]`. Select every prepared file explicitly; the tool
+requires `resource_paths` even when empty. Stored paths are compared, never used as access authority.
+The default report cannot combine with `--repair`, settle pending evidence, replay, undo or append.
+It may create admission metadata/registry bookkeeping, but does not change source or journal bytes or
+initialize Git checkpoint storage. Non-Git restart inspection remains unsupported.
+
+For an explicit metadata-only write, add `--record-observation` to the same `aizen time doctor`
+selection. A freshly admitted plain parent records a bounded nonterminal observation in the existing
+cohort under exclusive ownership: exact prepared/receipt IDs, observed image fingerprints and
+historical native proof statuses. The default CLI report and `checkpoint_view` remain read-only.
+An observation is historical evidence, not accepted verification, effect attribution, current-tip
+proof or authority to retry/undo. It leaves pending guards and source/native journal bytes unchanged.
+Stale selection, active ownership, unsupported evidence and exhausted physical/expanded-data quotas
+refuse publication; a publication error may retain immutable artifacts and never runs cleanup/retry.
+
+**Not complete or release-verified:** terminal abandon/reconcile, selected integration inverse,
+atomic checkpoint linkage and cooperative-authorship integration are not yet implemented. There are
+no `aizen time` commands for those operations. Do not delete evidence to bypass a refusal, or use
+whole-tree restore as an individual child's undo. Existing binaries are unchanged until separately
+built and installed.
+
+### Hooks — your own commands around the loop
+Three points of every run take a command of yours, configured under `hooks` in
+`~/.aizen/cli-config.json` — your file, never the repository's, so a cloned checkout cannot plant
+one:
+
+```json
+"hooks": {
+  "pre_tool":  [{ "match": "shell_run",            "run": "python ~/hooks/guard.py" }],
+  "post_tool": [{ "match": "file_edit|file_write", "run": "cargo fmt --quiet", "timeout_secs": 60 }],
+  "stop":      [{ "run": "notify-send aizen 'run finished'" }]
+}
+```
+
+- **`pre_tool`** runs before a tool call — after the hard safety floor, which no hook can
+  override, and before the approval prompt, which a hook can answer. Exit `2` (stderr becomes the
+  reason) or print `{"decision":"deny","reason":"…"}` to refuse the call: the model is told
+  `blocked by hook …` and moves on. Print `{"decision":"allow"}` to run it without asking the
+  user. Say nothing (exit `0`, no JSON) and the call proceeds as it would have.
+- **`post_tool`** runs after the call, with its result. Whatever it prints — or the `context` field
+  of a JSON line — is appended to the tool result the model reads, under a `[hook …]` heading, so a
+  formatter's or a checker's verdict reaches the model on the same step, with no extra round-trip.
+- **`stop`** runs when a top-level run ends: a one-shot, a REPL turn, a bot message. Its output is
+  only traced.
+
+`match` is a tool name, a glob with `*` (`file_*`), or `|`-separated alternatives; absent means
+every tool (`stop` hooks have no tool). Each hook reads one JSON object on stdin — `event`, `cwd`,
+`session`, `dispatch` (the sub-agent label when a delegated child made the call), `pid`, `time`,
+and for tool events `tool` and `args`, plus `result` (cut at 32 KB) and `ok` after the call; a
+`stop` hook gets `stop` (the reason word), `steps` and `final_text` — and sees `AIZEN_HOOK_EVENT`
+and `AIZEN_HOOK_TOOL` in its environment. It runs in the run's working directory through the same
+sandbox runner as every other child, with the network allowed and Aizen's own secrets scrubbed
+from its environment, under a wall clock (`timeout_secs`, default 30). A hook that fails — cannot
+start, exits non-zero other than `2`, or times out — is reported and never stops the run; only a
+deliberate deny blocks. `aizen hooks` lists what is configured; `AIZEN_NO_HOOKS=1` turns every
+hook off. On the stream each run is a `system` / `hook_response` record; in the transcript it is
+one `→ hook …` line.
+
+Native-only scoped children cannot spawn these opaque hook commands: the runner reports refusal
+before a process starts, without widening the child's file authority. As with other settled hook
+startup errors, the authorized native tool may proceed without that hook; do not rely on a
+subprocess hook as a mandatory policy gate inside a native scope. Unproven physical hook effects
+are different: they block further work until settlement can be established.
 
 ### `aizen workflow <spec.json>` — fan-out + synthesis
-Run several role-scoped sub-agents concurrently (bounded to 5), then merge their results into
-one answer (mixture-of-agents). See [examples/review.workflow.json](../examples/review.workflow.json):
+Run several role-scoped sub-agents concurrently (bounded to a machine-derived cap, shared with
+in-REPL dispatches), then merge their results into one answer (mixture-of-agents). In the REPL the
+individual `task`/`workflow` dispatch lines collapse into one **`sub-agents` block** — a header
+(`▸ sub-agents (3) · 1 running`) plus a one-line summary; **Ctrl-E** toggles it open to a row per
+agent (mark · label · current step · elapsed) and shut. Ctrl-E still expands a tool result into its
+overlay whenever no sub-agents block is on screen. See
+[examples/review.workflow.json](../examples/review.workflow.json):
 ```bash
 aizen workflow examples/review.workflow.json
 ```
@@ -418,16 +1166,60 @@ Spec shape:
 ```jsonc
 {
   "name": "review-changes",
-  "tasks": [ { "id": "bugs", "role": "reviewer", "prompt": "...", "model": "optional-per-task" }, ... ],
+  "tasks": [ {
+    "id": "bugs", "role": "nemesis", "prompt": "...",
+    "model": "optional-per-task",
+    // optional dispatch contract — same semantics as the task tool:
+    "boundaries": "Do not edit files",
+    "expected_output": "Findings with severity and file:line evidence",
+    "context": ["what the parent already established — the child does not re-derive it"],
+    "after": ["implement"],               // wait for these tasks; their reports ride in ahead of the brief
+    "retry_on_fail": "implement",         // on VERDICT: FAIL, re-run that task once with the failure, then this one
+    "max_steps": 25,                      // total step budget (default: the role's own; cap 80)
+    "expects": { "type": "object" }       // JSON Schema the child's answer must satisfy
+  }, ... ],
   "synthesis": { "model": "optional-override", "prompt": "optional merge instruction" }
 }
 ```
-Roles set each sub-agent's tools (coder = read/edit/shell, tester = shell no edit,
-planner/reviewer = read-only). A failed task never aborts the workflow — its result is captured
-and the synthesis still runs. The synthesis uses `AIZEN_MODEL` unless `synthesis.model` overrides it.
+Roles set each sub-agent's tools (see the Pantheon above; omitted role = `nemesis`, read-only —
+legacy role names in existing specs keep working, unknown ones are refused). The contract fields
+travel INTO the child's prompt exactly as they do on a `task` dispatch; an `expects` schema is
+validated (one repair attempt) and the task's status carries `json:ok`/`json:invalid`. A failed
+child remains a reported outcome; cancellation, admission infrastructure or journal failure stops new
+admission and drains already-admitted work. Synthesis uses `AIZEN_MODEL` unless `synthesis.model`
+overrides it; incomplete outcomes remain unresolved in the merged report.
 **Model diversity (mixture-of-agents):** each task may set its own `model` (e.g. a cheap model
-scouts, a strong one reviews) — else the workflow default. `--trace <path>` writes a JSON audit of
-the fan-out (per-task model + outcome + the synthesis model).
+scouts, a strong one reviews) — else the configured role/default. `--trace <path>` records physical
+attempts, including their token spend; final logical reports select one outcome, without counting
+an alias as another paid call.
+**Chains and the fix loop:** `after` waits for durable logical settlement (unknown IDs and cycles
+are refused). Eligible tasks run from one queue, not a wave barrier. Every initial, restart, fix,
+recheck, planner and replacement passes the same global/model admission gate. Frozen disjoint
+native scopes may overlap; same-file, opaque and unrestricted work remains exclusive. A queued
+conflicting task occupies no slot, so compatible ready tasks may progress. Readers without exact
+footprints do not overlap writers: put a review AFTER the change with `after`. `<upstream>`
+contains settled dependency reports (4,000 chars each, 12,000
+total), never an unpublished failed fix. `retry_on_fail` runs one upstream fix then one recheck.
+IDs such as `a`, `a#2`, and `a#restart` are literal and independent; attempt labels are display only.
+The CLI may invoke Metis after a persistent failure and then one actual replacement worker, with
+the original role, model, boundaries and output contract. Planner success is not task success.
+The in-conversation collect path does not enable this extra planner policy.
+
+CLI logs flush dispatch intent before execution and completion before dependency publication.
+`aizen resume <run-id> --spec <spec.json>` replays pending transitions, not completed attempts;
+it checks frozen worker/recovery/synthesis routing and reuses the original prompt date. Old versioned
+journals lacking the frozen synthesis contract require reconciliation, not a guessed migration. An intent without a
+completion has an unknown possible side effect: resume refuses it and directs you to crash recovery
+and checkpoints. Legacy suffix collisions also require reconciliation. This contract covers
+process crashes, not exactly-once effects or power-loss durability (`flush` is not `fsync`).
+`Refresh`, deadline, verification failure and invalid output contracts are incomplete, never a
+successful skip. Cancellation/timeout does not prove a blocking worker stopped: its permits and
+workspace leases remain held until the worker actually releases them.
+
+Workflow writers run under the verify gate like a `task` writer. From the REPL,
+`workflow(mode="implement", prompt="…")` prebuilds implement (daedalus) → verify (themis,
+first line `VERDICT: PASS|FAIL`) → review (nemesis) with that fix loop; the same spec as a
+file is `bench-fixtures/workflows/implement.json`.
 
 ### `aizen crawl <url>` — katana-style web crawler
 BFS over HTTP from a seed URL: extracts links from HTML (`href`/`src`/`action`) and endpoints
@@ -516,21 +1308,78 @@ aizen soul clear
 
 ### `aizen skill` — reusable procedures (skills)
 A **skill** is a saved step-by-step playbook (deploy the VPS, cut a release, triage logs) — distinct
-from **memory** (facts/preferences). Skills live as human-editable markdown under `~/.aizen/skills/`.
-A compact index (`name: when`) is injected into the agent's system prompt (`<skills>`); the agent
-pulls a skill's full steps on demand with the **`skill_load`** tool, and can persist a new one with
-**`skill_save`** (approval-gated). Manage them from the REPL with **`/skills`** (list · view · new ·
-**fetch from URL** · delete), or the CLI:
+from **memory** (facts/preferences). A compact index (`lookup-key: when`) enters the agent's
+`<skills>` prompt; **`skill_load`** reads the full procedure only when needed. **`skill_save`**
+authors a local skill; **`skill_install`** imports third-party instructions and remains
+approval-gated and serial. Manage skills with **`/skills`** (view · new · fetch URL · install
+GitHub bundle · search marketplace · retire · restore), or the CLI:
+
 ```bash
 aizen skill add deploy-vps -d "ship over SSH" -w "asked to deploy"   # body from --body or stdin
-aizen skill fetch https://example.com/deploy-vps.md                  # pull a shared skill from a URL
-aizen skill list / show <name> / delete <name>
-aizen skill where                                                    # the three folders + counts
+aizen skill fetch https://example.com/deploy-vps.md --name deploy    # one Markdown file, not its resources
+aizen skill search deploy fastapi                                   # agentskill.sh; recent-catalogue fallback
+aizen skill install OWNER/SKILL                                     # existing marketplace syntax
+aizen skill install --github OWNER/REPO --path skills/release         # selected directory + resources
+aizen skill install --github OWNER/REPO --path skills/release --ref v1.2 --name team-release
+aizen skill list --all-zones
+aizen skill show team-release
+aizen skill refine team-release --body "Improved procedure"
+aizen skill delete team-release                                     # retire, not permanent deletion
+aizen skill restore team-release
+aizen skill where                                                   # scope folders + counts
 ```
 
-Optional frontmatter narrows when a skill shows in the index: **`requires:`** (tool names — hidden
-unless every one is in the live tool surface, so a `browser_*` skill is silent when browser tools
-aren't built) and **`platforms:`** (`linux`/`macos`/`windows`, or `unix`/`posix` — hidden off-OS).
+**Identity, scopes, and layouts.** The lookup key is the local install slug, not necessarily the
+upstream `name:`. A GitHub install defaults to the selected directory's name (repository name for
+`--path .`); `--name` gives it an alias without rewriting the source. Use that key in
+show/load/refine/retire/restore. Discovery
+accepts flat `<key>.md` and one-level `<key>/SKILL.md` bundles; Markdown resources inside a bundle
+are not separate skills. The same resolver is used throughout the lifecycle, in this order:
+
+1. `<repo>/.aizen/skills/` — repo-shipped, highest precedence; read-only through skill mutation tools.
+2. `~/.aizen/skills/p/<project-slug>/` — this workspace's zone; auto-learned procedures live here.
+3. `~/.aizen/skills/` — personal global skills; explicit authoring and imports live here.
+
+Other workspaces' zones are inspection-only with `list --all-zones`. If one scope has both
+`<key>.md` and `<key>/SKILL.md`, the key is ambiguous and cannot be loaded: resolve the duplicate
+rather than relying on an arbitrary choice. Imports are **new-only**: an existing global flat or
+bundle destination is refused untouched; there is no `--replace` or update mode. Installing a
+global copy below a repo/zone override is allowed, but the result reports the actual installed
+entry and warns that it is **shadowed**, not active here. Refinement/retirement do not fall through
+to a hidden global copy beneath a repo skill.
+
+**Source metadata and local state.** URL/marketplace imports preserve the complete source Markdown;
+GitHub bundles preserve it along with selected resources. UTF-8 is required, with non-empty steps
+and valid YAML frontmatter when present. Quoted, folded, and literal descriptions are supported;
+unknown/nested metadata is retained. Optional **`requires:`** (tool names) and **`platforms:`**
+(`linux`/`macos`/`windows`, or `unix`/`posix`) accept strings or lists and filter the index against
+available tools and the current OS. Install alias, provenance (source URL or registry,
+repository/path/resolved SHA), and local usage/version/update counters live in the writable scope's
+`.state/<key>.json`. Loading/recording usage does not rewrite source Markdown; legacy flat counters
+remain readable. Refinement preserves unrelated header fields, archives the prior version, and
+retirement/restoration keeps bundle resources and state with collision checks.
+
+**GitHub bundles and resources.** `--github OWNER/REPO` requires `--path` to a directory containing
+`SKILL.md` (use `--path .` for the repository root); it is mutually exclusive with the marketplace
+slug. `--ref` and `--name` are GitHub-only
+install options. Only **public GitHub repositories** are supported here; no credentials, Git
+subprocess, Node/Python runtime, dependency install, or script execution is involved. The default
+branch or supplied branch/tag/ref is resolved to an immutable commit SHA before the ZIP download;
+re-running with a branch does not update an existing install. The result and loaded skill expose
+its final entry and resource root. Relative references/assets/scripts resolve under that root,
+**not** the agent's working directory; the installer never changes cwd or executes scripts.
+Following a skill's procedure remains subject to the normal tool approvals and sandbox.
+
+The GitHub archive download and actual selected decompressed content are each capped at **64 MiB**,
+with **16 MiB per file**, **4096 archive entries**, and **32 path components**. Only Stored/Deflate
+ZIP entries are supported. Exact subtree selection keeps relative binary assets and dotfiles;
+unsafe paths, links/reparse points, duplicate/case-colliding outputs, unsupported archive forms,
+and exceeded limits are refused before publication. A hidden staging directory is validated
+before the final bundle is published, with recoverable state commits; multi-path renames are not
+universally atomic. Windows-reserved names and non-portable paths can be rejected even on another
+OS. URL/marketplace installs still fetch one document with the ordinary bounded HTTP limit; use a
+GitHub bundle when a skill needs sibling resources. Marketplace search remains best-effort: its
+recent-catalogue fallback cannot recover every older skill during an index outage.
 
 **Self-learning** — after a completed multi-step task, the REPL distills a *generalizable* procedure
 into a new skill automatically (conservative: skips one-offs and duplicates; prints `↯ learned skill
@@ -584,6 +1433,52 @@ At startup `aizen` connects each enabled server, lists its tools, and exposes ea
 Node/Python MCP SDK, no extra runtime; the single static binary is preserved. `aizen mcp list` or
 **`/mcp`** shows the manager/connection generation, sanitized health, pinned schema hash, and tools.
 
+**Tool Search — big surfaces stop bloating the context.** Every advertised tool's JSON Schema rides
+on *every* request, so a few schema-heavy servers (GitHub-sized) can burn thousands of tokens per
+turn before a single call is made. Aizen defers them instead: a deferred server's tools are still
+fully callable, but their schemas leave the request — the agent discovers them through a small
+`tool_search` tool whose results carry each match's full schema in-band, then calls the found tool
+directly by name. The request's tool list stays byte-stable all session, so the provider's prefix
+cache is never invalidated by connecting more integrations, and this works on ANY endpoint (it is
+client-side — no provider feature required). Control it per server with `"defer": true` (always
+deferred) / `"defer": false` (always advertised), or opt into the automatic budget: set
+`"deferAutoTokens"` (top-level in mcp.json) and when the combined schema estimate of all connected
+servers exceeds it, the **largest servers defer first** until the advertised remainder fits.
+`/mcp` marks a deferred server with `deferred → tool_search`.
+
+**Built-in tools defer too, where it is safe.** On first-party APIs (`api.anthropic.com`,
+`api.openai.com`) the rarely-used built-ins — `workflow`, `persona_create`, `checkpoint` /
+`checkpoint_view`, the memory and skill write surface (`memory_save`/`update`/`forget`/`ask`/
+`profile`, `skill_save`/`refine`/`forget`/`search`/`install`), `team_status`, `notify`, the
+language-server query and symbolic-edit tools (`lsp_references`/`definition`/`hover`/
+`workspace_symbol`, `symbol_replace`/`insert` — `read_symbol`, `lsp_document_symbols` and
+`lsp_diagnostics` stay), `codebase_search`, `session_recall`, and `web_crawl` outside research
+turns — ride behind `tool_search` instead of on every request (about 22 KB of the 40 KB
+schema block; the cut was measured on 79 saved sessions: those tools took 4 of ~2,800 calls);
+a conversation that is a pure question also defers
+`process`, `file_move` and `task`. The set is decided by the conversation's shape (question ·
+small edit · multi-file · research, classified from the prompt in English or Vietnamese) and only
+ever widens, so the advertised tool list stays byte-stable. Elsewhere it is off for the reason
+below; `"lean_tools": true` in `cli-config.json` turns it on for a gateway you have checked,
+`false` turns it off everywhere. `aizen prompt-size` prints both sizes.
+
+**Deferral is opt-in — check your provider first.** It requires an endpoint that lets the model
+call a tool whose name is not in the request's `tools` array. First-party APIs (Anthropic, OpenAI)
+accept that; some hosted gateways grammar-lock generated call names to the advertised set, and
+there a deferred tool can never be called (measured A/B on one such gateway: the same model called
+the tool instantly when advertised and could not produce the call at all when deferred). That is
+why nothing defers until you set `deferAutoTokens` or pin a server `"defer": true`.
+
+```json
+{
+  "deferAutoTokens": 4000,
+  "mcpServers": {
+    "github": { "url": "https://api.githubcopilot.com/mcp/", "auth": "oauth", "defer": true },
+    "time":   { "command": "uvx", "args": ["mcp-server-time"], "defer": false }
+  }
+}
+```
+
 MCP schemas are **pinned for one agent run**. If a server emits `notifications/tools/list_changed`,
 Aizen defers the new schema until the next fresh user message instead of mutating the tool registry
 mid-run. Connection EOF/send/read/timeout poisons that connection: a read-only MCP call may reconnect
@@ -608,20 +1503,176 @@ prompts only for real secrets, signs you in if it's OAuth), `aizen apps info <ke
 masked + a live tool probe), `aizen apps login <key>`, `aizen apps remove <key>`. Also the `/apps` TUI hub.
 LOCAL-FIRST: a self-hostable package (runs on your machine with your keys) beats a hosted gateway.
 
-### Browser automation (`--features browser`)
-Build with `cargo build --release --features browser` to give the agent five CDP tools that drive an
-**existing** Chrome/Edge/Brave (it never bundles a browser). The legacy local setup still works:
-```bash
-chrome --remote-debugging-port=9222     # or msedge / brave; AIZEN_BROWSER_CDP overrides local
+### Visual design and tool images
+
+`/design auto|on|off` and `aizen agent --design auto|on|off` affect only the current session/run,
+not saved configuration. `auto` activates on a model-grounded **create, redesign or preserve**
+visual intent, not a keyword or specialist role. `on` enables guidance; `off` disables automatic
+guidance and visual completion gates while keeping manual tools available. `design_brief` records
+a bounded audience/brief/type/palette/layout/assets/responsive/interactions/acceptance contract;
+`design_guide` reads one compact guide; `design_review` records concrete observations of an image
+actually shown to the model. Existing branding and repository conventions remain the default.
+For exact user-requested review sizes, a new `design_brief` may include
+`"required_viewports":[{"width":390,"height":844},{"width":1440,"height":900}]` alongside its
+intent, brief and acceptance. Supply one to four unique integer sizes (1–4096 pixels per side,
+at most 8,388,608 pixels each). They become the gate's exact width/height requirements rather than
+only prose; otherwise the default is narrow and wide review, or the task's existing requirements.
+This records review criteria, not a browser resize or a user waiver: capture those sizes with
+approved browser tools. Requirements persist with the brief across explicit resume; `{"resume":true}`
+must stand alone, without replacement fields/viewports. Invalid requests leave the prior contract
+unchanged; changing a brief never replenishes the task's operation or repair budgets.
+
+The full capsule is scoped to the active task and rides only on the outgoing user turn, not the
+cached system prefix. Finalization archives it; a later user turn receives only a prior-brief
+pointer until an explicit `design_brief` call with `{"resume":true}`. Saved sessions/recovery keep
+typed brief and evidence metadata; restoring a session makes old evidence **stale**, not verified.
+Delegated children inherit concise constraints, with separate task/evidence namespaces.
+
+**Vision capability is explicit per effective endpoint/model.** Open `/config` → provider/model →
+**Vision** to declare Supported or Unsupported for that exact destination. Unknown may be declared
+for this session only; persistent saving is a separate explicit action. The declaration is the
+user's assertion, not an automatic paid probe or inference from the model's name/HTTP success.
+The equivalent stored configuration is:
+
+```json
+{
+  "vision_capabilities": [
+    { "base_url": "https://your-provider.example/v1", "model": "your-model-id", "supported": true }
+  ]
+}
 ```
 
-For multiple/local-or-remote CDP endpoints, create versioned `~/.aizen/browser.json`:
+An absent entry means **unknown**; `supported:false` means unsupported. Both leave tool images as
+text/metadata rather than pretending the model saw them. The capability must match the effective
+endpoint and model after role/effort routing; configuring support does not grant image-transmission
+permission. For ChatGPT Codex, that tuple is the fixed Responses URL
+`https://chatgpt.com/backend-api/codex/responses` and the actual wire model **without its effort
+suffix** (for example, `gpt-5.4-high` uses `gpt-5.4`). Configure that URL/model, not a Codex base-URL
+alias or the effort-suffixed picker name; this routing normalization does not imply vision support.
+Tool-image approval names that destination, and a routed destination change requires matching
+approval. Media asks for invocation-only consent: generic allow-all grants do not bypass it, and a
+stream-json reply granting a tool/session is applied only to the current media call.
+`image_read` requires explicit `transmit_image:true` plus exactly one local
+PNG `path`, current scoped `evidence_id` or granted `ref_id`; an optional pixel crop preserves source lineage. Missing,
+expired or metadata-only retained images are unavailable, not silently replaced from another session.
+Manual image reads/crops do not establish current-render evidence or consume the successful capture
+budget, but approved transmitting reads during an active visual task consume its aggregate operation budget.
+
+A browser capture with `transmit:false` is capture-only and needs no vision declaration: saved
+pixels are available locally but are not visually reviewed. `image_read` remains a transmitting
+read requiring explicit `transmit_image:true`; it does not currently expose a capture-only mode.
+Capability Unknown/Unsupported, denied transmission, omitted budget selection and failed delivery
+are distinct limitations; none is repaired by silently changing providers. Executor and request
+projection use one frozen route/capability context; a route change needs a fresh context and grant.
+
+**Balanced user-reference sending.** The optimizer tries JPEG quality 88 at the attached resolution,
+then quality 82 only above a soft **512 KiB data-URL** target. If still necessary, one aspect-preserving
+Lanczos resize caps the long side at **1280px**, without upscaling. At most three candidates are
+encoded, and a larger candidate is never kept. This is lossy previewing, not exact pixel inspection.
+Only static opaque 8-bit PNGs with supported metadata are converted; APNG, 16-bit, nonopaque alpha,
+transparency chunks, ICC/gamma and other unsupported color metadata keep original bytes. Cache is bounded to eight
+encoded entries / 16 MiB, with no decoded pixels retained. Codecs, request materialization and local
+comparison share a nonblocking **192 MiB** application-buffer/work reservation budget; contention
+produces a limitation or original fallback. This is not a hard process-RSS cap: allocator overhead
+and unrelated memory are outside that accounting. After a successful parent send, one numeric
+note reports preview URI sizes/cache/encoding time; child calls remain quiet. Token estimation and
+occurrence-only queries do not invoke codecs.
+
+**Selected references and fidelity.** Reference IDs identify attachments in the already-loaded
+conversation, not globally readable blobs or file authority. The controller grants current-task
+purpose, destination/account route and allowed originals/previews/crops separately from declaring
+vision or approving a tool. Same-route children may receive only explicitly selected `reference_ids`;
+a different route/account requires fresh consent. Restoring a session does not restore live grants.
+For headless intentional handoff, use
+`aizen agent --reference-images --image ref.png "reconstruct this reference"`: this grants the attached
+references to this task and same-route selected delegates, with exact-original sending; it does **not**
+declare model vision support. Current exact fidelity selects **Original for the whole request**, not a
+mixed exact/preview projector. Preview-only grants are rejected with an actionable limitation.
+
+Discover `reference_read`, `reference_compare` and `reference_trace` with `tool_search` when they are
+not on the current schema surface. Inspect granted originals/crops before constructing geometry;
+`reference_trace` is deterministic bounded color/mask contour tracing, not semantic segmentation.
+`reference_compare` uses originals and current scoped output captures locally, with explicit equal
+viewport/region alignment, reporting changed-pixel fraction, channel error and mismatch regions.
+It never uploads originals merely to calculate a diff, silently aligns/resizes inputs or invents a
+passing tolerance. Exact mode requires zero pixel difference under frozen dimensions/source/render
+conditions; a model `design_review(passed:true)` cannot override failed or missing comparison.
+Unsupported formats/metadata, stale render/source state or unavailable grants remain incomplete.
+A delivery receipt proves successful request inclusion of that exact source occurrence and wire
+representation, not semantic understanding. Failed/replayed calls, omitted images, revoked grants
+and a different occurrence with identical pixels earn no delivery credit. A preview or crop cannot
+certify whole-original inspection, functional UI, accessibility or mobile behavior.
+
+**Image limits and privacy.** Browser capture/local crop are PNG-only. MCP image observations accept
+validated PNG/JPEG/GIF/WebP base64 blocks, at most **8 MiB per image**, with a tool-image request
+budget of **four images** and **16 MiB** combined. Existing user attachments retain their legacy
+wire behavior and are not silently stripped by the new tool-image capability gate; they consume
+that same request budget and can leave no room for tool images. This is not a new global cap or
+vision-support claim for legacy user attachments. Malformed, oversized, unsupported or
+unapproved tool blocks remain explicit text/metadata limitations; MCP error images are not projected.
+Image payloads may be retained in owner-only session blobs and sent to the approved provider; page
+content can contain private information. Inspect the target and destination before approving.
+Image approval does not authorize unrelated shell commands, browser setup or navigation.
+
+**Verification is deliberately limited.** A passing build or DOM/accessibility snapshot is not a
+visual review. The gate needs settled current-render viewport captures, actual image projection and
+an acceptance review for both narrow and wide views (or controller-required viewports). Editing the
+source, changing target or restoring a session makes prior checks stale. Each task allows at most
+**36 approved native visual operation attempts** across viewport changes, screenshots and transmitting
+image reads/crops, including failures. Separately, evidence allows **four successful capture records
+per pass** and **two repair rounds**. Repairs, brief edits/resume and compaction do not refill the
+aggregate attempt budget; a new user task or isolated child has its own budget. This bounds native
+visual retries, not total task wall time or arbitrary browser navigation/eval/shell work.
+Exhaustion without current verified evidence reports incomplete; an already verified current result
+remains verified. Unavailable vision/rendering/freshness also stops with an honest incomplete result
+rather than a fabricated pass. A user/controller waiver is labeled skipped, never verified.
+Dynamic pages/dev servers currently have **unknown workspace-source freshness**: a running
+server or a page marker alone does not prove it serves the latest source. The deterministic freshness
+path is limited to allowlisted, **scriptless**, self-contained static local HTML (up to 256 KiB,
+without external styles/assets or dynamic resources) whose served/browser resource bytes
+match canonical workspace bytes before and after capture. Time Machine restores workspace files,
+not live browser state, running dev-server output or external services; rewind is not a browser
+rollback and does not recover visual verification. Refresh/recapture must earn current-source evidence
+again, and dynamic source correspondence remains unknown. No live visual-quality claim is implied.
+
+**Machine-readable verdict.** The closing `result` in `--output-format json` / `stream-json` may
+include `verification`, captured from typed loop/gate state before task finalization, not parsed
+from the model's prose. It separates `build_test` (`passed`, `unverified`, `not_required`) from
+`visual.status` (`disabled`, `not_required`, `verified`, `pending`, `unavailable`, `failed`,
+`skipped_by_user`). The visual object includes `reason`, `task_id`, `revision`, `operations`,
+`repair_rounds` and bounded `evidence` rows (`id`, `status`, `width`, `height`, `revision`,
+`pixels_delivered`, `ready`); `limitations` states the remaining scope. No image hashes, target
+URLs or image payload bytes are included in this verdict. A delivered, ready image is not itself
+an acceptance pass, and visual review is not WCAG certification or proof of unobserved interactions.
+The field is optional; its absence is not proof of verification. Machine consumers should read
+these statuses rather than infer a visual pass from a successful build or the answer text.
+
+### Browser automation (included by default)
+
+The default build ships the lazy, attach-only CDP client; `--no-default-features` excludes browser
+code (`--features browser` opts it back in). Browser tool schemas are registered only when a valid,
+explicit `AIZEN_BROWSER_CDP` endpoint or nonempty `~/.aizen/browser.json` profiles are configured.
+This availability check is offline: no discovery, attachment or probe during registry construction,
+and no dead browser schemas from an implicit localhost default. Each operation consumes one validated,
+bounded configuration snapshot before attachment; deleting or emptying the explicit configuration
+cannot make an already registered tool fall back to localhost. A configured endpoint does not prove
+that a browser or unambiguous page target is reachable.
+
+Tools attach to an **existing**, explicitly configured Chrome/Edge/Brave target. Aizen does not
+install, bundle or launch a browser. `AIZEN_BROWSER_CDP` may override the legacy local endpoint;
+a missing endpoint/target is reported as unavailable, not repaired by silently changing browser
+security settings.
+
+For multiple/local-or-remote CDP endpoints, create versioned `~/.aizen/browser.json`.
+`target_id` must name an existing page; without it, attachment succeeds only when exactly one page
+exists. Multiple pages are an explicit ambiguity error, never an arbitrary "first page" choice.
+Tool calls can name the configured `profile` and existing `target_id` explicitly:
 ```json
 {
   "schema": 1,
   "default_profile": "local",
   "profiles": {
-    "local": { "provider": "cdp", "endpoint": "127.0.0.1:9222" },
+    "local": { "provider": "cdp", "endpoint": "127.0.0.1:9222", "target_id": "existing-page-id" },
     "work":  { "provider": "cdp", "endpoint": "https://cdp.example.com", "auth_env": "WORK_CDP_AUTH" }
   },
   "routes": { "*.corp.example": "work", "localhost": "local" }
@@ -640,7 +1691,13 @@ credential values.
 
 Tools: **`browser_navigate`** (open a URL), **`browser_snapshot`** (the page's accessibility tree as
 `[@ref] role "name"` lines), **`browser_click`** / **`browser_type`** (act on a `@ref`), and
-**`browser_eval`** (run JS — read DOM/state, await fetches). `browser_snapshot` may reconnect/retry
+**`browser_eval`** (run JS — read DOM/state, await fetches). **`browser_set_viewport`** changes the
+attached target's bounded CSS width/height at DPR 1, with optional mobile emulation; **`browser_screenshot`**
+returns an approval-gated viewport/clip PNG with target, readiness, revision and capture metadata.
+Viewport/clip dimensions are at most 4096 pixels per side and 8,388,608 pixels total. Viewport overrides
+persist until an explicit `reset:true`; cancellation may retain them. Optional reload is also
+approval-gated, not automatic. Screenshot readiness has a bounded wait and may be false; it does not
+prove animation idle, full-page coverage or current dynamic-server source. `browser_snapshot` may reconnect/retry
 once after a transport failure; navigate/click/type/eval are never replayed after transport ambiguity.
 Still a **pure-Rust static binary, no bundled browser/Node/Playwright/CEF**. An absent browser returns
 an actionable error, not a crash.
@@ -655,6 +1712,8 @@ aizen memory ask "which package manager should I use?"   # abstains rather than 
 aizen memory learn "<a user turn>"  # free extraction → threat-scan → route → store
 aizen memory frozen                 # the always-on prompt-prefix core
 aizen memory style | review | as-of <date> | supersede <old> <new> | archive | restore <id> | compact
+aizen memory consolidate [--apply]  # merge near-duplicates locally (lexical, then MinHash + normalised tokens); dry run by default
+aizen memory reconcile [--apply]    # the model-judged pass for the pairs consolidate leaves in the review band
 aizen memory where                  # the folders + counts, for editing or clearing out many at once
 ```
 
@@ -701,13 +1760,76 @@ so a key pasted into a chat is still in that file's message text.
 ```bash
 aizen bench memory [--split gate|tune|all] [--hybrid]   # retrieval recall vs a baseline
 aizen bench memory --evolution                          # multi-session reuse gate (≥5%/session lift)
-aizen bench profile                                     # golden set for the profile rollup
+aizen bench profile                                     # golden set for the profile rollup (+ tier hints)
+aizen bench loop                                        # loop discipline on scripted models, no key
+aizen bench tasks [--json] [--record --task <id>]       # the six-task suite on recorded tapes (see bench-tasks/)
+aizen bench sessions [--json]                           # turn-shape statistics of your saved conversations
 aizen bench dialectic                                   # golden set incl. abstain-when-unknown
+aizen bench loop                                        # loop discipline vs a scripted model (offline)
+aizen bench tasks [--task <id>] [--json]                # task suite: real loop + real tools on fixture crates
+aizen bench tasks --record [--task <id>]                # record the model's answers once (spends tokens)
+aizen bench tasks --update-baseline                     # capture steps/tokens per task as the baseline
 ```
+
+`bench tasks` runs each `bench-tasks/<id>/` (a prompt plus a dependency-free cargo crate) through
+the real agent loop with the verify gate on and every tool rooted in a throwaway copy, then checks
+that the loop reached Done, `cargo test` exits 0, only the task's `allowed_files` changed, and
+steps/tokens stay within 1.25× of `bench-fixtures/loop-baseline.json`. The model's answers come
+from a recorded tape, so the suite runs in CI without a key; a task with no tape is skipped.
+
+### Record and replay model calls (`AIZEN_TAPE`)
+
+Any run can be taped. `AIZEN_TAPE=record` writes one JSON line per model call to
+`AIZEN_TAPE_FILE` (default `.aizen/tapes/<stamp>-<pid>.jsonl`); `AIZEN_TAPE=replay` answers from
+that file instead of the provider, matching calls by position and warning when what the model was
+shown differs from the recording (the workspace root, dates, times, durations and hashes are
+normalised first — set `AIZEN_TAPE_ROOT` when the workspace moved); `AIZEN_TAPE=strict` fails the
+call on such drift or on a tape that runs out. Tools still execute for real on replay; only the
+model is simulated. Record single-threaded flows (`aizen agent`, the task suite) — the REPL's
+background chores race the turn and land on the tape in arrival order.
 
 ## Exit codes
 `0` success · `1` error (bad args, network/HTTP failure, a bench gate FAIL). The agent loop
-returns `0` even if it stops on the step limit or divergence — it prints the reason to stderr.
+returns `0` even if it stops on the step limit or divergence — it prints the reason to stderr
+(with `--output-format stream-json` or `json`, the `stop` and `is_error` fields of the `result`
+record; a run that died is a `result` with `errors` and a `1`).
+
+## Voice (hold-to-talk)
+
+Voice is an **opt-in Aizen build** (the default binary must not require Linux's audio library).
+Install the voice build, then fetch the engine and Vietnamese model through Aizen:
+
+```sh
+aizen voice install                 # engine + vi
+aizen voice install --with-english  # + streaming en (F10)
+```
+
+Measured pack sizes (2026-10-18; Windows engine built, macOS/Linux pending V-002):
+
+| Pack | Download | Installed |
+|---|---:|---:|
+| engine win-x64 | 12.6 MiB | 35.5 MiB |
+| engine macOS arm64 | 15.2 MiB | 56.1 MiB |
+| engine Linux x64 | 21.5 MiB | 69.2 MiB |
+| vi model | 57.0 MiB | 73.5 MiB |
+| en model (optional) | 161.8 MiB | 179.9 MiB |
+
+Enable with `voice.enabled: true`, then hold `F9` for Vietnamese; with the `en` pack, hold `F10` for
+English. Change the keys with `voice.hotkey` / `voice.hotkey_alt`. After install nothing leaves the
+machine: no account, no key, no telemetry. Uninstall by deleting `~/.aizen/voice` (or
+`AIZEN_VOICE_HOME`); this removes the engine and both model packs.
+
+| Symptom | Fix |
+|---|---|
+| install HTTP 403/429 | retry later; set `AIZEN_VOICE_MANIFEST` to a mirror |
+| checksum mismatch | delete the part file and retry; report the digest |
+| F9 does nothing | check `voice.enabled`; use a voice build; try `AIZEN_NO_STICKY=1` |
+| F10 does nothing | install the `en` pack: `aizen voice install --with-english` |
+| no microphone on Linux | install `libasound2`; check `arecord -l`; use the voice build |
+| SmartScreen warning | binaries are unsigned; "More info → Run anyway" |
+
+The full install/troubleshooting matrix lives in
+[`aizen-voice` V-007](https://github.com/vbach8/aizen-voice/blob/main/specs/V-007-install-and-troubleshooting.md).
 
 ## Safety model
 Three layers, bottom to top. (1) A **hard safety floor** — a deterministic blocklist (`rm -rf /`

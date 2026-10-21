@@ -164,7 +164,7 @@ fn pkce() -> Result<(String, String)> {
     Ok((verifier, challenge))
 }
 
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     // Do not route the URL through `cmd /C start`: OAuth query strings contain `&`,
     // which cmd treats as command separators. Use Windows URL protocol handling directly,
     // so the complete authorize URL is handed to the default browser as one argument.
@@ -270,7 +270,7 @@ fn b64_decode_std(s: &str) -> Option<Vec<u8>> {
         }
     }
     let bytes = s.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);

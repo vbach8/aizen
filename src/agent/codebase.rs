@@ -1174,7 +1174,7 @@ fn finalize_regions(
             symbol_name: r.symbol_name,
             symbol_type: r.symbol_type.to_string(),
             parent_symbol: String::new(),
-            token_estimate: body.chars().count() / 4,
+            token_estimate: crate::core::tokens::estimate_str(&body),
             tokens,
             preview,
             content: body,
@@ -1995,12 +1995,11 @@ impl Tool for CodebaseSearch {
         "codebase_search"
     }
     fn description(&self) -> &str {
-        "Find the code CHUNKS most relevant to a natural-language query over the index built by \
+        concat!("Find the code CHUNKS most relevant to a natural-language query over the index built by \
          /init (\"where is auth handled\", \"database connection setup\"). Ranks function/class/heading \
          chunks by concept, returning `path:lines (score)` + symbol + preview — use it to LOCATE \
-         where a feature lives, then file_read the top hits. Not for content regex → use \
-         search_files; not for file NAMES → use file_glob. Read-only. Errors if the index is missing \
-         (tell the user to run /init)."
+         where a feature lives, then file_read the top hits. Read-only. Errors if the index is \
+         missing (tell the user to run /init).", crate::search_routing!())
     }
     fn parameters(&self) -> Value {
         serde_json::json!({

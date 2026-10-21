@@ -32,7 +32,7 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             Ok(())
         }
         TimeCmd::Restore { id } => {
-            let snap = timemachine::restore(id)?;
+            let (snap, removed) = timemachine::restore_with_report(id)?;
             let label = if snap.label.is_empty() {
                 "(no label)".to_string()
             } else {
@@ -47,6 +47,7 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             // never your chat/history — and because the pre-restore state was auto-snapshotted, you
             // can always go forward again (`aizen time redo`, or restore the newest checkpoint).
             println!("{}", style("  files only — your conversation is untouched · reversible with `aizen time redo`").dim());
+            print_removed(&removed);
             Ok(())
         }
         TimeCmd::Diff {
@@ -57,21 +58,23 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             json,
         } => run_time_diff(from, to, paths, patch, json),
         TimeCmd::Undo => {
-            let snap = timemachine::undo()?;
+            let (snap, removed) = timemachine::undo_with_report()?;
             println!(
                 "{} #{}",
                 style("⏪ undo →").color256(splash::ACCENT),
                 snap.id
             );
+            print_removed(&removed);
             Ok(())
         }
         TimeCmd::Redo => {
-            let snap = timemachine::redo()?;
+            let (snap, removed) = timemachine::redo_with_report()?;
             println!(
                 "{} #{}",
                 style("⏩ redo →").color256(splash::ACCENT),
                 snap.id
             );
+            print_removed(&removed);
             Ok(())
         }
         TimeCmd::Prune { keep } => {
@@ -83,7 +86,29 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             );
             Ok(())
         }
-        TimeCmd::Doctor { json, repair } => {
+        TimeCmd::Rm { ids } => {
+            let removed = timemachine::remove(&ids)?;
+            println!(
+                "{} {removed} checkpoint(s); disk is reclaimed by the next `aizen time gc`.",
+                style("🧹 removed").color256(splash::ACCENT)
+            );
+            Ok(())
+        }
+        TimeCmd::Doctor {
+            json,
+            repair,
+            cohort,
+            prepared,
+            resources,
+            record_observation,
+        } => {
+            match (cohort, prepared) {
+                (Some(cohort), Some(prepared)) if !repair => {
+                    return run_recovery_report(&cohort, &prepared, &resources, json, record_observation);
+                }
+                (None, None) if resources.is_empty() && !record_observation => {}
+                _ => bail!("restart report requires cohort and prepared together and cannot be combined with repair"),
+            }
             let report = if repair {
                 timemachine::doctor_repair()?
             } else {
@@ -128,7 +153,7 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
                 let fmt_mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
                 if report.orphans.is_empty() {
                     println!(
-                        "{} {} store(s) scanned · no orphans (every source repo still exists)",
+                        "{} {} store(s) scanned · no orphans (every store is still reachable from its repo)",
                         style("🧹 time gc --all:").color256(splash::ACCENT),
                         report.stores.len()
                     );
@@ -141,12 +166,25 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
                         fmt_mb(total)
                     );
                     for o in &report.orphans {
+                        // Two distinct fates, named apart: a repo that vanished, and a repo that is
+                        // alive but re-keyed under a different store id after an identity change.
+                        let why = if !o.source_exists {
+                            format!(
+                                "source gone: {}",
+                                o.source.as_deref().unwrap_or("(unknown)")
+                            )
+                        } else {
+                            format!(
+                                "superseded by {} — its repo now keys there",
+                                o.superseded_by.as_deref().unwrap_or("(unknown)")
+                            )
+                        };
                         println!(
-                            "  {} · {} · {} checkpoint(s) · source gone: {}",
+                            "  {} · {} · {} checkpoint(s) · {}",
                             o.repo_id,
                             fmt_mb(o.bytes),
                             o.checkpoints,
-                            o.source.as_deref().unwrap_or("(unknown)")
+                            why
                         );
                     }
                     if report.applied {
@@ -168,7 +206,7 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
                 }
                 Ok(())
             } else {
-                let (report, compacted) = timemachine::doctor_gc()?;
+                let (report, compacted, pruned) = timemachine::doctor_gc()?;
                 println!(
                     "{} repo {} · worktree {} · {} checkpoint(s)",
                     style("🧹 time metadata cleaned:").color256(splash::ACCENT),
@@ -195,6 +233,22 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
                         size(c.after_bytes)
                     );
                 }
+                if let Some(p) = pruned.filter(|p| p.pruned > 0) {
+                    let size = |b: u64| {
+                        if b >= 1_048_576 {
+                            format!("{:.1} MB", b as f64 / 1_048_576.0)
+                        } else {
+                            format!("{:.0} KB", b as f64 / 1024.0)
+                        }
+                    };
+                    println!(
+                        "  pruned {} unreachable object(s) of {} · {} → {}",
+                        p.pruned,
+                        p.owned,
+                        size(p.before_bytes),
+                        size(p.after_bytes)
+                    );
+                }
                 Ok(())
             }
         }
@@ -209,13 +263,41 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
     }
 }
 
+/// Explicit inspection CLI boundary; metadata append requires its separate flag. No ordinary repair.
+fn run_recovery_report(
+    cohort: &str,
+    prepared: &str,
+    resources: &[String],
+    json: bool,
+    record_observation: bool,
+) -> Result<()> {
+    use crate::core::exec_ctx::{self, ExecutionContext};
+    let root = std::env::current_dir()?;
+    let inspect = || {
+        if record_observation {
+            timemachine::record_speculation_recovery_observation(&root, cohort, prepared, resources)
+        } else {
+            timemachine::inspect_speculation_recovery(&root, cohort, prepared, resources)
+        }
+    };
+    // Only this top-level CLI boundary may seat a parent; never replace an existing restriction.
+    let report = if exec_ctx::current().is_some() {
+        inspect()?
+    } else {
+        let parent = ExecutionContext::default()
+            .with_resource_scope(format!("cli/recovery-report/{}", std::process::id()));
+        exec_ctx::with_current(parent, inspect)?
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+    } else {
+        println!("{}", report.to_text());
+    }
+    Ok(())
+}
+
 /// Resolve the `[FROM] [TO]` positional pair into two timeline sides.
-///
-/// The defaults encode the question people actually ask. Bare `time diff` means "what have I changed
-/// since the last checkpoint" (cursor → working tree), which is the state you want before deciding
-/// whether to keep or rewind. One argument means "since THAT point" (given → working tree), because
-/// naming a single checkpoint and getting a checkpoint↔checkpoint diff against an unnamed second
-/// point would be guesswork.
+/// Defaults: cursor -> working; with one argument, that checkpoint -> working.
 fn resolve_diff_sides(
     from: Option<&str>,
     to: Option<&str>,
@@ -444,7 +526,7 @@ fn print_timeline() -> Result<()> {
 /// saved to its own session file before being replaced.
 pub(crate) async fn timemachine_menu(
     history: &mut Vec<Message>,
-    model_label: &mut String,
+    model_label: &mut str,
 ) -> Result<()> {
     let theme = ui_theme();
     loop {
@@ -492,6 +574,7 @@ pub(crate) async fn timemachine_menu(
         );
         let pick = match Select::with_theme(&theme)
             .with_prompt(prompt)
+            .report(false)
             .items(&items)
             .default(cursor.unwrap_or(0))
             .interact_opt()?
@@ -536,7 +619,7 @@ pub(crate) async fn timemachine_menu(
 fn restore_checkpoint(
     snap: &timemachine::Snapshot,
     history: &mut Vec<Message>,
-    model_label: &mut String,
+    model_label: &mut str,
 ) -> Result<()> {
     // Files-only checkpoints (auto/agent) have no chat to restore.
     if !snap.has_chat {
@@ -587,4 +670,28 @@ fn files_restore(id: u32) -> Result<()> {
         style("  (reversible — the pre-restore tree was auto-saved; pick it to go back)").dim()
     );
     Ok(())
+}
+
+/// Name the files a restore removed because the target checkpoint never had them (E5.1). They are
+/// all in the checkpoint the restore saved first, so `aizen time redo` brings them back.
+fn print_removed(removed: &[String]) {
+    if removed.is_empty() {
+        return;
+    }
+    let shown: Vec<&str> = removed.iter().take(8).map(String::as_str).collect();
+    let more = removed.len().saturating_sub(shown.len());
+    println!(
+        "{}",
+        style(format!(
+            "  removed {} file(s) that checkpoint never had: {}{}",
+            removed.len(),
+            shown.join(", "),
+            if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            }
+        ))
+        .dim()
+    );
 }

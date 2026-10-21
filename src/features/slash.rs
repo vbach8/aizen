@@ -30,10 +30,12 @@ pub enum SlashId {
     Help,
     Init,
     Where,
-    Handoff,
+    Files,
     Goal,
     Model,
     Provider,
+    Login,
+    Logout,
     Config,
     Memory,
     Persona,
@@ -48,6 +50,7 @@ pub enum SlashId {
     Import,
     Resume,
     Workflows,
+    Jobs,
     Work,
     Agents,
     Recover,
@@ -59,6 +62,7 @@ pub enum SlashId {
     Reach,
     Approval,
     Sandbox,
+    Design,
     Effort,
     Ultimate,
     Clear,
@@ -75,6 +79,7 @@ pub enum SlashId {
     Team,
     Yolo,
     AutoCopy,
+    Theme,
 }
 
 /// When a command takes over stdin (a `dialoguer` menu, the effort slider, a daemon) and the
@@ -167,18 +172,18 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show project root, zone slug, git, and data locations",
         argument_hint: "",
-        help: "show THIS project's identity: root · zone slug · git executable · where memory/skills/sessions live (also `aizen where`, `aizen zone migrate`)",
+        help: "show THIS project's identity: root · zone slug · git executable · memory/skills/sessions and managed artifact/scratch roots (also `aizen where`, `/files`)",
         stdin: Stdin::Never,
     },
     Builtin {
-        id: SlashId::Handoff,
-        name: "handoff",
+        id: SlashId::Files,
+        name: "files",
         aliases: &[],
         hidden_aliases: &[],
         hidden: false,
-        description: "start a fresh thread carrying only what matters",
-        argument_hint: "<goal>",
-        help: "",
+        description: "list managed artifacts and current-process scratch (read-only)",
+        argument_hint: "[artifacts|scratch]",
+        help: "[artifacts|scratch] list paths/sizes only, across artifact runs and this process's scratch; bounded, no link traversal, no creation or deletion (also `aizen files`)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -213,6 +218,31 @@ pub const BUILTINS: &[Builtin] = &[
         argument_hint: "[name|add|manage]",
         help: "[name]   one-pick switch; `add` creates and `manage` edits/renames/deletes providers",
         stdin: Stdin::BareOr(&["add", "manage"]),
+    },
+    Builtin {
+        id: SlashId::Login,
+        name: "login",
+        aliases: &[("signin", "alias for /login")],
+        hidden_aliases: &["sign-in", "account"],
+        hidden: false,
+        description: "sign in to Aizen with your browser",
+        argument_hint: "",
+        help: "sign in to your Aizen account in a browser; the session opens the gateway on its own, so nothing is stored but the token (`aizen account login`)",
+        // Prints a link and then waits — up to ten minutes, since the code's own two-minute clock
+        // only starts once the person has a session and step one is often a round trip through
+        // Google. The frame has to come down for any of that to be readable.
+        stdin: Stdin::Always,
+    },
+    Builtin {
+        id: SlashId::Logout,
+        name: "logout",
+        aliases: &[("signout", "alias for /logout")],
+        hidden_aliases: &["sign-out"],
+        hidden: false,
+        description: "leave Aizen here: the session and the local key",
+        argument_hint: "",
+        help: "drop this machine's Aizen session AND its pinned gateway key. Revokes neither — the token stays valid elsewhere until it expires, and the key until you unpin the device in the dashboard (`aizen logout`)",
+        stdin: Stdin::Never,
     },
     Builtin {
         id: SlashId::Config,
@@ -357,7 +387,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "reopen the last conversation with its context",
         argument_hint: "[name]",
-        help: "reopen the last conversation FROM THIS PROJECT (or a named one); /handoff <goal> starts a fresh thread carrying only what that goal needs",
+        help: "reopen the last conversation FROM THIS PROJECT (or a named one)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -373,6 +403,17 @@ pub const BUILTINS: &[Builtin] = &[
         description: "show live multi-agent activity (self-refreshing); stop one run",
         argument_hint: "[stop <#id|name>]",
         help: "multi-agent status — live task/workflow children, sub-agent slots (also /wf)",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::Jobs,
+        name: "jobs",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "show background work (long-running processes + live monitor runs)",
+        argument_hint: "",
+        help: "background jobs — `process` handles and monitor runs, self-refreshing (the footer strip opens this on click)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -486,9 +527,9 @@ pub const BUILTINS: &[Builtin] = &[
         aliases: &[],
         hidden_aliases: &[],
         hidden: false,
-        description: "set the approval level",
-        argument_hint: "[ask|smart|yolo]",
-        help: "approval level — ask every time, auto-run read-only, or pre-authorize",
+        description: "set the approval level (this window; --persist to save)",
+        argument_hint: "[ask|smart|yolo] [--persist]",
+        help: "approval level — ask every time, auto-run read-only, or pre-authorize; this window only unless --persist",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -500,6 +541,17 @@ pub const BUILTINS: &[Builtin] = &[
         description: "OS sandbox around model-run commands",
         argument_hint: "[status|auto|strict|guarded|off]",
         help: "the OS sandbox under approval: status shows what THIS machine enforces (kernel vs software); auto|strict|guarded|off sets the mode (strict fails closed where the kernel can't enforce). Full detail: `aizen sandbox status|doctor`",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::Design,
+        name: "design",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "visual design guidance and evidence (this session only)",
+        argument_hint: "[auto|on|off]",
+        help: "bare: scoped status; auto activates on semantic visual briefs, on enables guidance, off disables automatic guidance/gates but leaves manual tools available. No saved config change",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -530,9 +582,11 @@ pub const BUILTINS: &[Builtin] = &[
         aliases: &[("new", "alias for /clear"), ("reset", "alias for /clear")],
         hidden_aliases: &[],
         hidden: false,
-        description: "start a fresh conversation",
-        argument_hint: "",
-        help: "start a fresh conversation",
+        description: "start a fresh conversation (distills a memory of this one)",
+        argument_hint: "[hard]",
+        help: "start a fresh conversation that REMEMBERS this one: the thread is distilled into one \
+               dense seed note (goals, decisions, files, open tasks) that the new thread starts with; \
+               /clear hard wipes with nothing carried over",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -593,7 +647,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         id: SlashId::Undo,
         name: "undo",
-        aliases: &[],
+        aliases: &[("rewind", "alias for /undo")],
         hidden_aliases: &[],
         hidden: false,
         description: "rewind to the previous checkpoint",
@@ -679,6 +733,17 @@ Builtin {
         description: "auto-copy on mouse select release",
         argument_hint: "[on|off|status]",
         help: "on (default): releasing a drag-select copies to the clipboard. off: keep the highlight and copy with Ctrl-C (Windows/Linux) or ⌘C (macOS). bare /auto-copy toggles",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::Theme,
+        name: "theme",
+        aliases: &[],
+        hidden_aliases: &["themes"],
+        hidden: false,
+        description: "pick the colour theme (moonlight | lanes)",
+        argument_hint: "[moonlight|lanes]",
+        help: "bare: list themes. `lanes` colours each kind of work — read=blue, edit=gold, shell=mauve, web=cyan, memory=violet, talk=pink, plan=teal; `moonlight` (default) keeps the calm all-silver look",
         stdin: Stdin::Never,
     },
 ];
@@ -996,7 +1061,6 @@ mod tests {
         let names: std::collections::HashSet<String> = list().into_iter().map(|c| c.name).collect();
         for name in [
             "init",
-            "handoff",
             "goal",
             "lsp",
             "reach",
@@ -1008,9 +1072,20 @@ mod tests {
             "serve",
             "auto-copy",
             "autocopy",
+            "login",
+            "logout",
+            "design",
         ] {
             assert!(names.contains(name), "slash catalog must include /{name}");
         }
+        // Both spellings of each credential command reach it: somebody who types `/signin` is
+        // asking for the same door, and a slash surface that answers "unknown command" there is
+        // telling them the door does not exist.
+        assert_eq!(resolve("login").map(|b| b.id), Some(SlashId::Login));
+        assert_eq!(resolve("signin").map(|b| b.id), Some(SlashId::Login));
+        assert_eq!(resolve("account").map(|b| b.id), Some(SlashId::Login));
+        assert_eq!(resolve("logout").map(|b| b.id), Some(SlashId::Logout));
+        assert_eq!(resolve("signout").map(|b| b.id), Some(SlashId::Logout));
         assert_eq!(resolve("auto-copy").map(|b| b.id), Some(SlashId::AutoCopy));
         assert_eq!(resolve("autocopy").map(|b| b.id), Some(SlashId::AutoCopy));
         assert_eq!(cmd("/auto-copy off"), ("auto-copy".into(), "off".into()));
@@ -1279,10 +1354,6 @@ mod tests {
             cmd("/goal làm cho xong bản release rồi báo tôi"),
             ("goal".into(), "làm cho xong bản release rồi báo tôi".into())
         );
-        assert!(matches!(
-            classify("/handoff finish the retry work"),
-            Verdict::Command { .. }
-        ));
         assert!(matches!(
             classify("/memory what did I say about MCP"),
             Verdict::Command { .. }

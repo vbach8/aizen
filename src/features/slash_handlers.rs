@@ -137,9 +137,18 @@ pub(crate) enum SlashOutcome {
 /// Bare `/` → an arrow-key picker over the slash commands; runs the chosen one (default args).
 /// Built-ins and user-defined custom commands both come from the shared [`crate::features::slash`]
 /// catalog, so the picker, the live palette, and `/help` can never drift apart.
-pub(crate) async fn slash_menu(
+pub(crate) async fn slash_menu_with_design(
     history: &mut Vec<Message>,
     model_label: &mut String,
+    design: &crate::agent::design::DesignContext,
+) -> SlashOutcome {
+    slash_menu_scoped(history, model_label, Some(design)).await
+}
+
+async fn slash_menu_scoped(
+    history: &mut Vec<Message>,
+    model_label: &mut String,
+    design: Option<&crate::agent::design::DesignContext>,
 ) -> SlashOutcome {
     let catalog = crate::features::slash::list();
     let items: Vec<String> = catalog
@@ -157,12 +166,13 @@ pub(crate) async fn slash_menu(
     let theme = ui_theme();
     match Select::with_theme(&theme)
         .with_prompt("slash command")
+        .report(false) // the command runs right after; the palette is not a transcript line
         .items(&items)
         .default(0)
         .interact_opt()
     {
         // Every entry (built-in or custom) dispatches by name through the one `handle_slash` path.
-        Ok(Some(i)) => handle_slash(&catalog[i].name, history, model_label).await,
+        Ok(Some(i)) => handle_slash_scoped(&catalog[i].name, history, model_label, design).await,
         _ => SlashOutcome::Continue, // Esc / error → back to the prompt
     }
 }
@@ -199,6 +209,17 @@ async fn slash_workflows(arg: &str) {
     if !tui::retained_overlay_open_live("Activity", agent::orchestration::format_status) {
         tui::emit_line(&agent::orchestration::format_status());
     }
+}
+
+/// `/jobs` — the background-work panel: long-running `process` handles plus live monitor runs, in one
+/// self-refreshing overlay (the same surface the footer strip and a click on it open). Falls back to
+/// printing the text when the retained overlay is unavailable (a suspended menu, a non-retained edge).
+/// `/jobs` — the background-work panel: long-running `process` handles plus live monitor runs. Under
+/// the retained UI this is a selectable, stop-able overlay (↑↓ pick, Enter/x stop, Esc close); the same
+/// surface the footer strip and a click on it open. Falls back to printing the text where that overlay
+/// cannot be driven (a pipe, a suspended menu).
+fn slash_jobs() {
+    tui::open_jobs_panel();
 }
 
 /// `/init` — build (or incrementally refresh) the per-repo codebase index that powers
@@ -338,6 +359,20 @@ async fn slash_init(arg: &str) {
             );
             if !summary.trim().is_empty() {
                 tui::emit_line(&style(summary).dim().to_string());
+            }
+            // The verify ladder's knowledge: which commands this project has and how long the
+            // fast rung takes, kept in HOME beside the index (never in the checkout). The
+            // headless twin (`aizen init`) runs this only on an explicit --verify — see
+            // cli/init_cmd.rs.
+            let root = crate::core::config::project_root();
+            tui::emit_line(&style("  measuring verify commands…").dim().to_string());
+            for line in crate::agent::verify_gate::init_verify(
+                &root,
+                crate::agent::verify_gate::DEFAULT_TIMEOUT_SECS,
+            )
+            .await
+            {
+                tui::emit_line(&style(format!("  {line}")).dim().to_string());
             }
         }
         Ok(Err(e)) => {
@@ -843,7 +878,7 @@ async fn slash_team_commit(rest: &str) {
                     .dim()
                     .to_string(),
             ),
-            Some(r) if r.passed => tui::emit_line(
+            Some(r) if r.accepted() => tui::emit_line(
                 &style(format!("verify: {} passed", r.command))
                     .color256(theme::OK)
                     .to_string(),
@@ -1016,10 +1051,20 @@ fn slash_work(arg: &str) {
     }
 }
 
-pub(crate) async fn handle_slash(
+pub(crate) async fn handle_slash_with_design(
     input: &str,
     history: &mut Vec<Message>,
     model_label: &mut String,
+    design: &crate::agent::design::DesignContext,
+) -> SlashOutcome {
+    handle_slash_scoped(input, history, model_label, Some(design)).await
+}
+
+async fn handle_slash_scoped(
+    input: &str,
+    history: &mut Vec<Message>,
+    model_label: &mut String,
+    design: Option<&crate::agent::design::DesignContext>,
 ) -> SlashOutcome {
     let mut parts = input.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").trim();
@@ -1037,13 +1082,42 @@ pub(crate) async fn handle_slash(
         SlashId::Help => tui::emit_line(&style(slash::help_page()).dim().to_string()),
         SlashId::Quit => return SlashOutcome::Quit,
         SlashId::Clear => {
-            rebuild_system(history, model_label);
-            reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
-            set_session_slug(None); // the next turn names + autosaves a brand-new session file
-            update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
-                                          // immediate window-close after /clear doesn't re-save it
-            tui::emit_line(&style("(new conversation)").dim().to_string());
+            // `new`/`reset` are aliases of `/clear` (same identity) — they refresh too. To wipe
+            // without carrying a memory of this thread, spell it `/clear hard` (see the help).
+            let hard = matches!(arg.trim().to_ascii_lowercase().as_str(), "hard" | "fresh" | "wipe" | "blank");
+            if hard {
+                if let Some(design) = design { design.reset(); }
+                rebuild_system(history, model_label);
+                reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
+                set_session_slug(None); // the next turn names + autosaves a brand-new session file
+                update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
+                                              // immediate window-close after /clear doesn't re-save it
+                tui::emit_line(&style("(new conversation — nothing carried over)").dim().to_string());
+            } else {
+                match crate::repl::postturn::refresh_distill_now(history).await {
+                    Ok(seed) => {
+                        if let Some(design) = design { design.reset(); }
+                        rebuild_system(history, model_label);
+                        history.push(Message::system(format!(
+                            "{}{seed}",
+                            crate::agent::compact::HANDOFF_MARKER_PREFIX
+                        )));
+                        reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
+                        set_session_slug(None); // the next turn names + autosaves a brand-new session file
+                        update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
+                                                      // immediate window-close after /clear doesn't re-save it
+                        tui::emit_line(&style("(new conversation — carried over a memory of this one)").dim().to_string());
+                    }
+                    Err(e) => {
+                        tui::emit_line(&style(format!("carry-over failed ({e}) — conversation left as-is; retry or /clear hard to wipe")).dim().to_string());
+                    }
+                }
+            }
         }
+        SlashId::Files => match crate::cli::files_cmd::parse_kind(arg) {
+            Ok(kind) => tui::emit_line(&crate::cli::files_cmd::files_report(kind)),
+            Err(e) => tui::emit_line(&e.to_string()),
+        },
         SlashId::Where => {
             tui::emit_line(&where_report());
             // In the REPL, "where" includes WHICH FILE this conversation is being written to.
@@ -1061,12 +1135,20 @@ pub(crate) async fn handle_slash(
             tui::emit_line(&style("→ use /sessions — restore / save / delete are all there now").dim().to_string());
         }
         SlashId::Sessions => {
-            if let Err(e) = sessions_menu(history, model_label).await {
+            let result = match design {
+                Some(design) => crate::cli::sessions::sessions_menu_with_design(history, model_label, design).await,
+                None => sessions_menu(history, model_label).await,
+            };
+            if let Err(e) = result {
                 tui::note_line(&format!("{} {e}", style("sessions:").red()));
             }
         }
         SlashId::Import => {
-            if let Err(e) = import_menu(history, model_label).await {
+            let result = match design {
+                Some(design) => crate::cli::sessions::import_menu_with_design(history, model_label, design).await,
+                None => import_menu(history, model_label).await,
+            };
+            if let Err(e) = result {
                 tui::note_line(&format!("{} {e}", style("import:").red()));
             }
         }
@@ -1087,8 +1169,17 @@ pub(crate) async fn handle_slash(
             };
             match target {
                 None => tui::emit_line(&style("no saved conversation to resume yet").dim().to_string()),
-                Some(name) => match load_session(history, &name, model_label) {
-                    Ok(n) => {
+                Some(name) => match load_session_with_design(history, &name, model_label) {
+                    Ok((n, saved_design)) => {
+                        if let Some(design) = design {
+                            design.reset();
+                            if let Some(saved) = saved_design {
+                                if let Err(error) = design.restore_session(saved) {
+                                    tui::emit_line(&format!("design state not restored: {error}"));
+                                }
+                            }
+                            update_live_history_with_design(history, Some(&design.snapshot()));
+                        }
                         // A restore is a thread switch — the restored thread must not inherit the
                         // previous one's todos/cost/grants. Only on success: a failed load leaves
                         // the live thread (and its state) untouched.
@@ -1111,6 +1202,7 @@ pub(crate) async fn handle_slash(
             }
         }
         SlashId::Workflows => slash_workflows(arg).await,
+        SlashId::Jobs => slash_jobs(),
         // Multi-window cooperation: who else is in this repo, what they changed, and committing one
         // window's work. `/work` manages the isolated-worktree mode.
         SlashId::Team => slash_team(arg).await,
@@ -1129,9 +1221,19 @@ pub(crate) async fn handle_slash(
             } else {
                 // Restore the newest offer. Side effects are never auto-replayed — only history + draft.
                 let offer = &offers[0];
-                match crate::core::recovery::accept(offer) {
-                    Ok((restored, draft)) => {
+                match crate::core::recovery::accept_with_design(offer) {
+                    Ok((restored, draft, saved_design)) => {
                         *history = restored;
+                        set_session_slug(offer.manifest.session_name.clone());
+                        if let Some(design) = design {
+                            design.reset();
+                            if let Some(saved) = saved_design {
+                                if let Err(error) = design.restore_session(saved) {
+                                    tui::emit_line(&format!("design recovery state not restored: {error}"));
+                                }
+                            }
+                            update_live_history_with_design(history, Some(&design.snapshot()));
+                        }
                         migrate_legacy_prompt_lanes(history, model_label);
                         refresh_prompt_lanes_for_thread_switch(history, model_label);
                         // Same thread-switch contract as /resume: the crashed thread's todos/cost/
@@ -1174,50 +1276,6 @@ pub(crate) async fn handle_slash(
                 // Cancelled before the summary landed. `compact_history` only splices AFTER a
                 // non-empty summary returns, so dropping the future leaves history untouched.
                 None => tui::emit_line(&theme::muted("⏹ compact stopped — context unchanged.").to_string()),
-            }
-        }
-        SlashId::Handoff => {
-            if arg.trim().is_empty() {
-                tui::emit_line(&style("usage: /handoff <new goal> — start a fresh thread carrying only what matters for it").dim().to_string());
-            } else {
-                tui::emit_line(&style("handing off…").dim().to_string());
-                // Same cancellable wrapper as /compact: this is a blocking model call inside the
-                // REPL loop, so without an armed token Esc can't reach it.
-                match cancellable_slash(handoff_now(history, arg.trim())).await {
-                    Some(Ok(summary)) => {
-                        // Fresh thread: new system prompt, the goal-relevant extraction seeded as
-                        // context, todos cleared, destructive-op session grants re-armed (like /clear).
-                        rebuild_system(history, model_label);
-                        // The marker prefix keeps the seed alive through lane rewrites (/config,
-                        // /model, resume) — `leading_system_count` stops at it, so lane splices go
-                        // around the seed instead of overwriting it.
-                        history.push(Message::system(format!(
-                            "{}\n{summary}",
-                            agent::compact::HANDOFF_MARKER_PREFIX
-                        )));
-                        reset_per_session_state();
-                        // The finished conversation keeps its file; the handoff starts a NEW one.
-                        // Without re-slugging, the very next autosave overwrote the previous
-                        // thread's saved transcript with this freshly seeded stub.
-                        let previous = current_session_slug();
-                        set_session_slug(None);
-                        update_live_history(history);
-                        tui::emit_line(&style("handoff — fresh thread seeded with the relevant context").color256(splash::ACCENT).to_string());
-                        // Name the thread being left behind, so the full transcript is findable.
-                        if let Some(prev) = previous {
-                            tui::emit_line(
-                                &style(format!("  (the previous thread stays saved as “{prev}” — /sessions to reopen it)"))
-                                    .dim()
-                                    .to_string(),
-                            );
-                        }
-                        return SlashOutcome::Submit(arg.trim().to_string());
-                    }
-                    Some(Err(e)) => tui::emit_line(&format!("{} {e}", style("handoff:").red())),
-                    // Cancelled before the extraction landed. Nothing was rebuilt, so the current
-                    // thread continues untouched.
-                    None => tui::emit_line(&theme::muted("⏹ handoff stopped — thread unchanged.").to_string()),
-                }
             }
         }
         SlashId::Goal => {
@@ -1318,18 +1376,68 @@ pub(crate) async fn handle_slash(
             }
         }
         SlashId::Approval => {
-            let requested = arg.split_whitespace().next().unwrap_or("status");
+            let mut words = arg.split_whitespace();
+            let requested = words.next().unwrap_or("status");
+            let persist = words.any(|w| matches!(w, "--persist" | "persist" | "--save"));
             let mut cfg = cli_config::load();
             if requested.is_empty() || matches!(requested, "status" | "st") {
-                tui::emit_line(&style(format!("approval: {} · ask=prompt · smart=read-only auto · yolo=pre-authorized", approval_mode())).dim().to_string());
+                let saved = cfg.persisted_approval_mode();
+                let scope = match cli_config::session_approval() {
+                    Some(s) if s != saved => format!(" (this window; saved default: {saved})"),
+                    _ => String::new(),
+                };
+                let session = crate::core::approval::session_grants();
+                let project = crate::core::approval::project_grants();
+                tui::emit_line(&style(format!("approval: {}{scope} · ask=prompt · smart=read-only auto · yolo=pre-authorized · add --persist to change the saved default · grants: {} session, {} project (`/approval grants`)", approval_mode(), session.len(), project.len())).dim().to_string());
+            } else if matches!(requested, "grants" | "grant") {
+                // What runs without asking right now: the menu's `always` picks (this window) and
+                // the project's `.aizen/approvals.json`.
+                let session = crate::core::approval::session_grants();
+                let project = crate::core::approval::project_grants();
+                if session.is_empty() && project.is_empty() {
+                    tui::emit_line(&style(format!("no grants: pick `always for <tool>` on an approval, or add {{\"allow\": [{{\"tool\": \"shell_run\", \"under\": \"scripts\"}}]}} to .aizen/{}", crate::core::approval::PROJECT_ALLOWLIST)).dim().to_string());
+                }
+                for g in &session {
+                    tui::emit_line(&style(format!("  session · {}", g.describe())).dim().to_string());
+                }
+                for g in &project {
+                    tui::emit_line(&style(format!("  project · {}", g.describe())).dim().to_string());
+                }
             } else if let Ok(mode) = requested.parse::<ApprovalMode>() {
-                cfg.set_approval_mode(mode);
-                match cli_config::save(&cfg) {
-                    Ok(_) => tui::emit_line(&style(format!("approval → {mode}")).color256(splash::ACCENT).to_string()),
-                    Err(e) => tui::emit_line(&format!("{} {e}", style("approval:").red())),
+                if persist {
+                    // The explicit way to change the machine's default: the saved file is what
+                    // every new window, `aizen serve` lane and cron job starts from.
+                    cfg.set_approval_mode(mode);
+                    cli_config::set_session_approval(None);
+                    match cli_config::save(&cfg) {
+                        Ok(_) => tui::emit_line(&style(format!("approval → {mode} (saved as the default)")).color256(splash::ACCENT).to_string()),
+                        Err(e) => tui::emit_line(&format!("{} {e}", style("approval:").red())),
+                    }
+                } else {
+                    // This window only: a one-off "just do it" must not arm every other window and
+                    // every cron job on the machine, which is what writing it to disk did.
+                    cli_config::set_session_approval(Some(mode));
+                    tui::emit_line(&style(format!("approval → {mode} (this window only — `/approval {mode} --persist` to make it the default)")).color256(splash::ACCENT).to_string());
                 }
             } else {
-                tui::emit_line(&style("usage: /approval ask|smart|yolo").dim().to_string());
+                tui::emit_line(&style("usage: /approval ask|smart|yolo [--persist]").dim().to_string());
+            }
+        }
+        SlashId::Design => {
+            if let Some(design) = design {
+                if arg.is_empty() {
+                    tui::emit_line(&theme::muted(design.status()).to_string());
+                } else {
+                    match arg.parse::<crate::agent::design::DesignMode>() {
+                        Ok(mode) => {
+                            design.set_mode(mode);
+                            tui::emit_line(&theme::muted(design.status()).to_string());
+                        }
+                        Err(_) => tui::emit_line("usage: /design auto|on|off (bare: status)"),
+                    }
+                }
+            } else {
+                tui::emit_line("design: no scoped session is attached; automatic mode is not process-global");
             }
         }
         SlashId::Sandbox => {
@@ -1371,11 +1479,11 @@ pub(crate) async fn handle_slash(
             }
         }
 SlashId::Yolo => {
-            let mut cfg = cli_config::load();
-            let mode = if cfg.persisted_approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
-            cfg.set_approval_mode(mode);
-            let _ = cli_config::save(&cfg);
-            tui::emit_line(&style(format!("approval → {mode} (legacy /yolo alias)")).color256(splash::ACCENT).to_string());
+            // Session-scoped toggle (see `cli_config::session_approval`): flips THIS window
+            // between yolo and ask, and never touches the saved default.
+            let mode = if approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
+            cli_config::set_session_approval(Some(mode));
+            tui::emit_line(&style(format!("approval → {mode} (this window only; `/approval {mode} --persist` to save)")).color256(splash::ACCENT).to_string());
         }
         SlashId::AutoCopy => {
             // Copy shortcut wording is OS-specific so the status line teaches the right chord.
@@ -1467,11 +1575,10 @@ SlashId::Yolo => {
             }
         }
         SlashId::Smart => {
-            let mut cfg = cli_config::load();
-            let mode = if cfg.persisted_approval_mode() == ApprovalMode::Smart { ApprovalMode::Ask } else { ApprovalMode::Smart };
-            cfg.set_approval_mode(mode);
-            let _ = cli_config::save(&cfg);
-            tui::emit_line(&style(format!("approval → {mode} (legacy /smart alias)")).color256(splash::ACCENT).to_string());
+            // Session-scoped like `/yolo`; `/approval smart --persist` changes the saved default.
+            let mode = if approval_mode() == ApprovalMode::Smart { ApprovalMode::Ask } else { ApprovalMode::Smart };
+            cli_config::set_session_approval(Some(mode));
+            tui::emit_line(&style(format!("approval → {mode} (this window only; `/approval {mode} --persist` to save)")).color256(splash::ACCENT).to_string());
         }
         SlashId::Ultimate => {
             let mut cfg = cli_config::load();
@@ -1560,6 +1667,137 @@ SlashId::Yolo => {
                 ),
             }
         }
+        SlashId::Theme => {
+            let sub = arg.trim().to_ascii_lowercase();
+            // Persist + apply one theme choice. `lanes` is stored explicitly; moonlight is the
+            // default, so choosing it CLEARS the field rather than pinning a redundant value.
+            let set = |lanes: bool, label: &str| {
+                let mut cfg = cli_config::load();
+                cfg.theme = lanes.then(|| "lanes".to_string());
+                match cli_config::save(&cfg) {
+                    Ok(_) => {
+                        crate::ui::theme::set_lanes_enabled(lanes);
+                        tui::emit_line(
+                            &style(format!("theme → {label}"))
+                                .color256(splash::ACCENT)
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("theme:").red())),
+                }
+            };
+            match sub.as_str() {
+                "" | "list" | "status" => {
+                    let on = crate::ui::theme::lanes_enabled();
+                    let dot = |sel: bool| if sel { "●" } else { "○" };
+                    tui::emit_line(&style("themes:").color256(splash::ACCENT).to_string());
+                    tui::emit_line(&format!(
+                        "  {} moonlight — the calm all-silver default",
+                        dot(!on)
+                    ));
+                    // The swatch shows each lane in its own hue, so the choice is visible before
+                    // it is made.
+                    let swatch = [
+                        ("read", theme::LANE_READ),
+                        ("edit", theme::LANE_EDIT),
+                        ("shell", theme::LANE_EXEC),
+                        ("web", theme::LANE_WEB),
+                        ("memory", theme::LANE_MIND),
+                        ("talk", theme::LANE_TALK),
+                        ("plan", theme::LANE_PLAN),
+                    ]
+                    .map(|(word, c)| style(word).color256(c).to_string())
+                    .join(" · ");
+                    tui::emit_line(&format!(
+                        "  {} lanes — each kind of work in its own colour: {swatch}",
+                        dot(on)
+                    ));
+                    tui::emit_line(
+                        &style("pick with /theme moonlight | lanes")
+                            .dim()
+                            .to_string(),
+                    );
+                }
+                "lanes" | "lane" | "colors" | "colours" => {
+                    set(true, "lanes — each kind of work in its own colour")
+                }
+                "moonlight" | "default" | "silver" | "mono" => {
+                    set(false, "moonlight — the calm all-silver default")
+                }
+                other => tui::emit_line(
+                    &style(format!("usage: /theme [moonlight|lanes]  (unknown '{other}')"))
+                        .dim()
+                        .to_string(),
+                ),
+            }
+        }
+        SlashId::Login => {
+            // `Stdin::Always`, so the frame is down and plain `println!` from the shared sign-in
+            // screen lands on the terminal — one copy of that screen, warnings included.
+            let web = crate::llm::account::web_url();
+            if let Some(who) = crate::llm::account::load().map(|s| s.email) {
+                let who = if who.trim().is_empty() {
+                    "this machine".to_string()
+                } else {
+                    who
+                };
+                println!("Already signed in as {who}. Signing in again replaces that session.");
+            }
+            match crate::cli::account_cmd::browser_login(&web).await {
+                Ok(session) => {
+                    // A session that cannot be written is a sign-in that did not happen: the next
+                    // turn would resolve nothing and blame the endpoint. Said, not swallowed.
+                    if let Err(e) = crate::llm::account::save(&session) {
+                        tui::emit_line(
+                            &style(format!("signed in, but the session could not be saved: {e}"))
+                                .color256(theme::WARN)
+                                .to_string(),
+                        );
+                        return SlashOutcome::Continue;
+                    }
+                    tui::emit_line(
+                        &style(if session.email.is_empty() {
+                            "signed in".to_string()
+                        } else {
+                            format!("signed in as {}", session.email)
+                        })
+                        .color256(splash::ACCENT)
+                        .to_string(),
+                    );
+                    // Worth saying here and not only in the CLI: somebody who reached for `/login`
+                    // inside a running window is usually renewing a session that just 401'd.
+                    tui::emit_line(
+                        &theme::muted(
+                            "the plan is ready to call — no key needed; `/provider` to switch endpoints",
+                        )
+                        .to_string(),
+                    );
+                }
+                // Never fatal in the REPL: the window is holding a conversation, and the three
+                // refusals here (no such code, already used, expired) all mean "run it again".
+                Err(e) => tui::emit_line(
+                    &style(format!("sign-in did not finish: {e}"))
+                        .color256(theme::WARN)
+                        .to_string(),
+                ),
+            }
+        }
+        SlashId::Logout => {
+            // The same teardown and the same words as `aizen logout`; only the way a line reaches
+            // the screen differs, which is why `left_lines` is shared rather than re-worded.
+            let left = crate::llm::gateway::leave(None).await;
+            for line in crate::ui::gateway_ui::left_lines(&left) {
+                tui::emit_line(&line);
+            }
+            if left.signed_out || left.key_profile.is_some() {
+                // This window resolved its endpoint before the teardown, so it may still be
+                // holding a credential that is now gone from disk. Say so rather than let the next
+                // turn be the thing that explains it.
+                tui::emit_line(
+                    &theme::muted("`/login` to sign in again before the next turn").to_string(),
+                );
+            }
+        }
         SlashId::Provider => {
             let selected = if arg.eq_ignore_ascii_case("add") || arg.eq_ignore_ascii_case("manage") {
                 let mut cfg = cli_config::load();
@@ -1637,7 +1875,28 @@ SlashId::Yolo => {
             }
         }
         SlashId::Persona => {
-            if let Err(e) = personas_menu(history, model_label).await {
+            // `/persona coding on|off|status`: keep the character in the prompt on coding turns
+            // (E4.7). Everything else opens the menu as before.
+            if let Some(rest) = arg.strip_prefix("coding") {
+                let want = rest.trim();
+                let mut cfg = cli_config::load();
+                match want {
+                    "on" | "off" => {
+                        cfg.persona_for_coding = Some(want == "on");
+                        if let Err(e) = cli_config::save(&cfg) {
+                            tui::note_line(&format!("{} {e}", style("persona:").red()));
+                        } else {
+                            tui::emit_line(&format!(
+                                "persona on coding turns: {want} (from your next message)"
+                            ));
+                        }
+                    }
+                    _ => tui::emit_line(&format!(
+                        "persona on coding turns: {} — `/persona coding on|off`",
+                        if cfg.persona_for_coding.unwrap_or(false) { "on" } else { "off" }
+                    )),
+                }
+            } else if let Err(e) = personas_menu(history, model_label).await {
                 tui::note_line(&format!("{} {e}", style("persona:").red()));
             }
         }
@@ -1692,6 +1951,8 @@ SlashId::Yolo => {
             if let Err(e) = timemachine_menu(history, model_label).await {
                 tui::note_line(&format!("{} {e}", style("time:").red()));
             }
+            // The legacy picker does not report whether it restored; invalidate conservatively.
+            if let Some(design) = design { design.mark_render_changed(); }
         }
         // Capture the conversation alongside the tree so a pick in `/timemachine` can rewind chat as
         // well as code — a `/checkpoint` is a deliberate save point where the chat is worth keeping,
@@ -1725,20 +1986,72 @@ SlashId::Yolo => {
             match build_time_diff(from, to, paths, patch) {
                 // Must go through `emit_line`: raw `println!` from inside the REPL is wiped by the
                 // retained render thread's next repaint.
-                Ok(report) => {
-                    for line in diff_lines(&report, "-- <path>") {
+                Ok(mut report) => {
+                    // On the retained TUI a patch goes through the diff boxes an edit result
+                    // gets (colour, side-by-side, gutter numbers) instead of monochrome lines.
+                    let boxed = if tui::retained_running() { report.patch.take() } else { None };
+                    let mut lines = diff_lines(&report, "-- <path>");
+                    if boxed.is_some() && lines.last().is_some_and(|l| l.contains("--patch for the full text")) {
+                        lines.pop();
+                    }
+                    for line in lines {
                         tui::emit_line(&line);
+                    }
+                    if let Some(text) = boxed {
+                        crate::agent::emit_patch_boxes(&text);
+                        if report.patch_truncated {
+                            tui::emit_line(&style("… patch truncated — narrow it with `-- <path>`").dim().to_string());
+                        }
                     }
                 }
                 Err(e) => tui::emit_line(&style(format!("diff: {e}")).color256(crate::ui::theme::WARN).to_string()),
             }
         }
-        SlashId::Undo => match timemachine::undo() {
-            Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏪ rewound to").color256(splash::ACCENT), s.id)),
-            Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
-        },
+        // `/undo` (alias `/rewind`): show what the rewind WILL change first, refuse to discard
+        // work no checkpoint holds unless told `--yes`, and name the files it touched after.
+        SlashId::Undo => {
+            let yes = arg.split_whitespace().any(|w| matches!(w, "--yes" | "-y" | "yes"));
+            match timemachine::undo_target() {
+                Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
+                Ok((current, target)) => {
+                    let stat = build_time_diff(Some("working".into()), Some(format!("#{target}")), Vec::new(), false).ok();
+                    let files: Vec<String> = stat.as_ref().map(|r| r.files.iter().map(|f| f.path.clone()).collect()).unwrap_or_default();
+                    if let Some(r) = &stat {
+                        tui::emit_line(&style(format!("⏪ rewind to checkpoint #{target}: {} file(s), +{} −{}", r.files.len(), r.total_added(), r.total_deleted())).color256(splash::ACCENT).to_string());
+                        for line in diff_lines(r, "-- <path>").into_iter().skip(1) {
+                            if line.contains("--patch for the full text") { continue; }
+                            tui::emit_line(&line);
+                        }
+                    }
+                    let dirty = timemachine::working_tree_differs_from(current).unwrap_or(false);
+                    if dirty && !yes {
+                        tui::emit_line(&style(format!("the working tree has changes since checkpoint #{current} that no checkpoint holds — `/diff` shows them; `/undo --yes` (or `/rewind --yes`) rewinds anyway")).color256(crate::ui::theme::WARN).to_string());
+                    } else {
+                        match timemachine::undo_with_report() {
+                            Ok((s, removed)) => {
+                                if let Some(design) = design { design.mark_render_changed(); }
+                                let named = if files.is_empty() { String::new() } else {
+                                    let shown: Vec<&str> = files.iter().take(6).map(String::as_str).collect();
+                                    let more = files.len().saturating_sub(shown.len());
+                                    format!(" — {}{}", shown.join(", "), if more > 0 { format!(" (+{more} more)") } else { String::new() })
+                                };
+                                tui::emit_line(&format!("{} checkpoint #{}{named}", style("⏪ rewound to").color256(splash::ACCENT), s.id));
+                                if !removed.is_empty() {
+                                    let shown: Vec<&str> = removed.iter().take(8).map(String::as_str).collect();
+                                    tui::emit_line(&style(format!("  removed {} file(s) that checkpoint never had: {} — `/redo` brings them back", removed.len(), shown.join(", "))).dim().to_string());
+                                }
+                            }
+                            Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
+                        }
+                    }
+                }
+            }
+        }
         SlashId::Redo => match timemachine::redo() {
-            Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id)),
+            Ok(s) => {
+                if let Some(design) = design { design.mark_render_changed(); }
+                tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id));
+            }
             Err(e) => tui::emit_line(&style(format!("redo: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
         // Codebase index: scan the repo into a semantic chunk index for `codebase_search` +
@@ -1747,6 +2060,9 @@ SlashId::Yolo => {
         SlashId::Init => {
             slash_init(arg).await;
         }
+    }
+    if let Some(design) = design {
+        update_live_history_with_design(history, Some(&design.snapshot()));
     }
     SlashOutcome::Continue
 }
@@ -1773,4 +2089,145 @@ fn slash_custom_or_unknown(name: &str, arg: &str) -> SlashOutcome {
         ),
     }
     SlashOutcome::Continue
+}
+
+#[cfg(test)]
+mod recovery_session_tests {
+    use super::*;
+    use crate::agent::design::{DesignContext, DesignMode};
+    use crate::core::config::EnvGuard;
+    use crate::core::recovery::{RecoveryManifest, RecoveryPhase};
+    use std::path::PathBuf;
+
+    struct RecoveryHome {
+        root: PathBuf,
+        env: Option<EnvGuard>,
+        previous_slug: Option<String>,
+    }
+
+    impl RecoveryHome {
+        // Caller retains HOME -> TAPE -> TODO locks until this fixture has restored its globals.
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "aizen-recover-session-{}-{}",
+                std::process::id(),
+                crate::core::persist::unique_sequence()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let previous_slug = current_session_slug();
+            let env = EnvGuard::set([
+                ("AIZEN_HOME", root.as_os_str()),
+                ("AIZEN_PROJECT_ROOT", root.as_os_str()),
+            ]);
+            Self {
+                root,
+                env: Some(env),
+                previous_slug,
+            }
+        }
+    }
+
+    impl Drop for RecoveryHome {
+        fn drop(&mut self) {
+            set_session_slug(self.previous_slug.take());
+            drop(self.env.take());
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "hermetic recovery fixture retains HOME, tape and todo isolation for the awaited handler"
+    )]
+    async fn recover_adopts_manifest_session_slug_before_next_autosave() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tape = crate::llm::replay::TAPE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _todo = crate::agent::todo::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = RecoveryHome::new();
+        let mut history = vec![Message::user("previous conversation must survive")];
+        save_session(&history, "previous-conversation", Some("fixture-model")).unwrap();
+        set_session_slug(Some("previous-conversation".into()));
+        let previous_path = sessions_dir().join("previous-conversation.json");
+        let previous_bytes = std::fs::read(&previous_path).unwrap();
+
+        let scope = crate::core::recovery::current_repo_scope();
+        let saved_design = DesignContext::new("crashed-owner", &scope, DesignMode::On).snapshot();
+        let recovered_history = vec![Message::user("recovered conversation")];
+        let lease = fixture.root.join("recovery").join("fixture-abandoned");
+        std::fs::create_dir_all(&lease).unwrap();
+        let manifest = RecoveryManifest {
+            schema: 2,
+            binary_version: env!("CARGO_PKG_VERSION").into(),
+            pid: 0,
+            run_id: "fixture-abandoned".into(),
+            repo: "fixture".into(),
+            repo_scope: scope.clone(),
+            phase: RecoveryPhase::WaitingModel,
+            session_name: Some("recovered-conversation".into()),
+            safe_history_len: recovered_history.len(),
+            checkpoint_id: None,
+            sidecar_generation: 1,
+            has_design_state: true,
+            turn_id: Some(1),
+            side_effects_possible: false,
+            effects_unsettled: false,
+            updated_unix: 1,
+        };
+        // Publish the authoritative history/state generation before its manifest, as real recovery
+        // does. No ACTIVE lease or copied RecoveryOffer preview is involved in this fixture.
+        let generation = serde_json::json!({
+            "generation": 1,
+            "design_state": saved_design,
+            "messages": recovered_history,
+        });
+        crate::core::persist::atomic_write_owner_only(
+            &lease.join("history.1.json"),
+            &serde_json::to_vec(&generation).unwrap(),
+        )
+        .unwrap();
+        crate::core::persist::atomic_write_owner_only(
+            &lease.join("manifest.json"),
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let design = DesignContext::new("previous-owner", scope, DesignMode::On);
+        let mut model = "fixture-model".to_string();
+        let outcome =
+            handle_slash_with_design("recover restore", &mut history, &mut model, &design).await;
+        assert!(matches!(outcome, SlashOutcome::Continue));
+        assert_eq!(
+            current_session_slug().as_deref(),
+            Some("recovered-conversation")
+        );
+        assert_eq!(design.snapshot().owner_id, "crashed-owner");
+        assert!(history
+            .iter()
+            .any(|m| m.content.as_deref() == Some("recovered conversation")));
+        assert!(
+            !lease.exists(),
+            "successful acceptance consumes the authoritative lease"
+        );
+
+        autosave_last_with_design(&history, Some(&model), Some(&design.snapshot()));
+        assert_eq!(
+            std::fs::read(&previous_path).unwrap(),
+            previous_bytes,
+            "the recovered turn must not overwrite the previously open conversation"
+        );
+        let (saved, _, state) =
+            read_session_path_with_design(&sessions_dir().join("recovered-conversation.json"))
+                .unwrap();
+        assert!(saved
+            .iter()
+            .any(|m| m.content.as_deref() == Some("recovered conversation")));
+        assert_eq!(state.unwrap().owner_id, "crashed-owner");
+    }
 }

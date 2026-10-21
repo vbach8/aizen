@@ -11,6 +11,8 @@
 //! (no live calls). Production passes a closure over `client::chat_with_tools`.
 
 pub mod app_catalog;
+pub mod architect;
+pub mod blackboard;
 #[cfg(feature = "browser")]
 pub mod browser;
 pub mod builtin;
@@ -18,22 +20,36 @@ pub mod clarify;
 pub mod cmd_guard;
 pub mod codebase;
 pub mod compact;
+pub mod context_pack;
+pub mod design;
 pub mod goal;
+pub mod hooks;
+pub mod image_read;
+pub mod lenient;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_oauth;
 pub mod mcp_serve;
+pub(crate) mod native_undo;
+pub mod observe;
 pub mod orchestration;
+pub mod plan_nudge;
 pub mod process;
 pub mod project_context;
 pub mod prompt_lanes;
 pub mod query_lang;
 pub mod reach;
 pub mod repo_map;
+pub mod result_format;
+pub mod roles;
+pub mod runlog;
 pub mod search;
+pub(crate) mod speculation;
+pub(crate) mod speculative_attempt;
 pub mod task_tool;
 pub mod todo;
 pub mod tool_routing;
+pub mod tool_search;
 pub mod tools;
 pub mod toolsets;
 pub mod verify_gate;
@@ -46,7 +62,7 @@ use crate::llm::client::ChatTurn;
 use anyhow::Result;
 use console::style;
 use std::future::Future;
-use tools::ToolRegistry;
+use tools::{ToolObservation, ToolRegistry};
 
 /// XOR-obfuscated system prompts (see `build.rs`): the plaintext is not present in the binary, so
 /// `strings aizen(.exe)` can't lift it. `decode` reverses the build-time XOR; the public accessors
@@ -212,27 +228,37 @@ pub fn build_system_prompt_bundle(
         "cwd: {cwd}\nos: {os}\nshell: {}\ndate: {date}\nmodel: {model}\n",
         shell_line(os)
     ));
+    // Paths stay stable without creating directories merely to build a prompt.
+    stable.push_str(&format!(
+        "scratch process (legacy tools): {}\nnative new files: declare project|artifact|scratch; managed names are relative, use returned paths for later reads.\n",
+        crate::core::scratch::planned_dir().display()
+    ));
     stable.push_str("</environment>\n");
 
     let mut dynamic = String::new();
-    // Durable AGENT operating-identity (who the agent IS across every persona/project) — ABOVE the
-    // persona costume and the user model. HOME-only + sanitized + fail-closed (see `crate::persona::soul`).
-    if let Some(soul) = crate::persona::soul::prompt_block() {
-        dynamic.push_str("\n<agent_identity>\n");
-        dynamic.push_str(soul.trim());
-        dynamic.push_str("\n</agent_identity>\n");
-    }
-    // Active character card (who the agent IS) — before user_memory (who the user is).
-    if let Some(p) = crate::persona::prompt_block() {
-        dynamic.push_str("\n<persona>\n");
-        dynamic.push_str(p.trim());
-        dynamic.push_str("\n</persona>\n");
-        // The character's accumulated experience (who it has BECOME) — only meaningful with a
-        // persona active, so nested under it.
-        if let Some(sb) = crate::persona::self_block() {
-            dynamic.push_str("\n<self>\n");
-            dynamic.push_str(sb.trim());
-            dynamic.push_str("\n</self>\n");
+    // The three identity blocks are left out while the persona gate is raised — a tool-bound
+    // REPL turn, unless `persona_for_coding` is on (E4.7). See `persona::suppress_for_turn`.
+    if !crate::persona::suppressed() {
+        // Durable AGENT operating-identity (who the agent IS across every persona/project) — ABOVE
+        // the persona costume and the user model. HOME-only + sanitized + fail-closed (see
+        // `crate::persona::soul`).
+        if let Some(soul) = crate::persona::soul::prompt_block() {
+            dynamic.push_str("\n<agent_identity>\n");
+            dynamic.push_str(soul.trim());
+            dynamic.push_str("\n</agent_identity>\n");
+        }
+        // Active character card (who the agent IS) — before user_memory (who the user is).
+        if let Some(p) = crate::persona::prompt_block() {
+            dynamic.push_str("\n<persona>\n");
+            dynamic.push_str(p.trim());
+            dynamic.push_str("\n</persona>\n");
+            // The character's accumulated experience (who it has BECOME) — only meaningful with
+            // a persona active, so nested under it.
+            if let Some(sb) = crate::persona::self_block() {
+                dynamic.push_str("\n<self>\n");
+                dynamic.push_str(sb.trim());
+                dynamic.push_str("\n</self>\n");
+            }
         }
     }
     if let Some(fc) = frozen_core {
@@ -322,6 +348,21 @@ pub(crate) fn build_role_scoped_subagent_base_prompt(
     s.push_str(&format!(
         "cwd: {cwd}\nos: {os}\nshell: {}\ndate: {date}\nmodel: {model}\n",
         shell_line(os)
+    ));
+    // Legacy tools share a process namespace; purpose-managed native outputs isolate child scopes.
+    s.push_str(&format!(
+        "scratch process (legacy tools): {}\nnative new files: declare project|artifact|scratch; managed names are relative, use returned paths for later reads.\n",
+        crate::core::scratch::planned_dir().display()
+    ));
+    // The sibling blackboard of the conversation this child is spawned into. The CURRENT
+    // context here is the parent's: the child's own scope is derived after its prompt is built.
+    s.push_str(&format!(
+        "{}\n",
+        crate::agent::blackboard::env_line(
+            &crate::core::exec_ctx::current()
+                .unwrap_or_default()
+                .resource_scope()
+        )
     ));
     s.push_str("</environment>\n");
     if let Some(idx) = crate::skills::gated_index(task) {
@@ -414,6 +455,14 @@ pub fn build_top_level_system_prompt_bundle(
     {
         bundle.dynamic.push('\n');
         bundle.dynamic.push_str(&block);
+        // The DEFERRED half of the surface, when one exists: connected MCP tools whose schemas
+        // ride `tool_search` results instead of the request. Appended directly under the map it
+        // narrows (the map says "these are the only tools"; this names the exception and the
+        // door). Same lane, same stability: byte-identical while the surface is unchanged.
+        if let Some(note) = builtin::deferred_tools_note() {
+            bundle.dynamic.push('\n');
+            bundle.dynamic.push_str(&note);
+        }
     }
     // Project conventions (AGENTS.md / CLAUDE.md), top-level only: coder turns inherit the repo's
     // build/test commands and house rules. Kept in the stable lane so they don't thrash the cache
@@ -457,8 +506,39 @@ pub fn build_top_level_system_prompt_bundle(
     bundle
 }
 
+/// Which role the loop's mid-run nudges (`push_nudge`) are delivered in.
+///
+/// A `system` message mid-history is what Anthropic-style gateways handle best. The Codex
+/// Responses path hoists EVERY system message into its instructions blob, so "you repeated the
+/// same call" became a permanent instruction and busted the cache; many local chat templates
+/// reject a system role anywhere but first. Everywhere else the nudge rides in the user turn,
+/// tagged so it can be recognised and retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NudgeRole {
+    #[default]
+    System,
+    User,
+}
+
+impl NudgeRole {
+    /// The role for an endpoint: `system` on Anthropic-style bases, `user` elsewhere.
+    pub fn for_base_url(base_url: &str) -> Self {
+        if crate::llm::client::is_anthropic_endpoint(base_url) {
+            NudgeRole::System
+        } else {
+            NudgeRole::User
+        }
+    }
+}
+
+/// A delegated child's live step reporter: the orchestration row id and the callback the loop
+/// invokes with `(row, step, tool names)` before each tool batch (see `AgentConfig::step_note`).
+pub type StepNote = (u64, fn(u64, usize, &str));
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Where mid-run nudges go (see [`NudgeRole`]). Default `System`; the REPL sets it per endpoint.
+    pub nudge_role: NudgeRole,
     /// Hard step cap before the one-shot auto-extend.
     pub max_iters: usize,
     /// Extended cap after the single auto-extend (the extension's anti-throttle lesson:
@@ -466,6 +546,15 @@ pub struct AgentConfig {
     pub auto_extend_to: usize,
     /// Per-tool result truncation (chars). Bounds history growth cheaply.
     pub max_tool_result_chars: usize,
+    /// Budget for LOG-shaped results (`shell_run`, `process`, `git_inspect`): build and test
+    /// output is the ground truth the verify loop runs on, and at the 4 k default a `cargo test`
+    /// with three failures lost the middle two. Cut tail-weighted around the first error line
+    /// (see [`truncate_log`]), never head-⅔/tail-⅓.
+    pub max_log_result_chars: usize,
+    /// Budget for DELEGATE results (`task`, `workflow`): a sub-agent's report is the whole value
+    /// of the dispatch, and its findings list sits in the middle — exactly what a head+tail cut
+    /// drops. Cut by whole `## ` sections with the omitted ones named (see [`truncate_sections`]).
+    pub max_delegate_result_chars: usize,
     /// Larger budget for the READ/FETCH tools whose output is a document scanned for specifics
     /// (`file_read`/`web_fetch`/`web_crawl`/`search_files`). The reach layer already caps a fetched
     /// page at `FETCH_CAP` (20k); cutting that again to `max_tool_result_chars` (4k) here would drop
@@ -517,23 +606,36 @@ pub struct AgentConfig {
     /// one-time "wrap up" nudge. `0` (default) disables the guard — set by the interactive/one-shot
     /// callers from the resolved window; sub-agents leave it 0 (they are bounded + quiet).
     pub context_window: usize,
-    /// Tool-result clearing: keep the most recent N tool results verbatim; OLDER ones whose body
-    /// exceeds `clear_tool_result_min_chars` have their content evicted (the message + `tool_call_id`
-    /// stay intact) once history crosses `clear_at_pct` of `context_window`. The cheap,
-    /// deterministic first line of defense before summarization compaction. `0` disables clearing.
+    /// The overflow shrink (the recovery behind a provider's context-overflow rejection) keeps
+    /// the most recent N tool results verbatim and evicts OLDER bodies longer than
+    /// `clear_tool_result_min_chars` (the message + `tool_call_id` stay intact). Ordinary history
+    /// pressure is handled by observation collapsing (below) and compaction.
     pub keep_recent_tool_results: usize,
-    /// Min chars before an OLD tool result is worth clearing (small results aren't worth the churn).
+    /// Min chars before an OLD tool result is worth evicting in that shrink.
     pub clear_tool_result_min_chars: usize,
-    /// Clearing arm threshold as a percent of `context_window`. `0` disables clearing.
-    pub clear_at_pct: u8,
-    /// Batch-clear DOWN TO this percent of the window in one pass (the floor). Big infrequent
-    /// mutations beat a per-turn trickle: every mid-history rewrite busts the provider prompt
-    /// cache from that byte onward, so clearing rarely-but-thoroughly keeps hit rates alive.
-    pub clear_target_pct: u8,
-    /// Re-fire only after history grows this many percentage points past the last clear…
+    /// Compaction cadence: re-fire only after history grows this many percentage points past the
+    /// last attempt…
     pub clear_step_pct: u8,
-    /// …or after this many loop iterations since the last clear, whichever comes first.
+    /// …or after this many loop iterations since it, whichever comes first.
     pub clear_cooldown_iters: usize,
+    /// Age-based observation collapsing, independent of context %: a tool result older than the
+    /// newest `collapse_after_observations` results and longer than `collapse_min_chars` becomes a
+    /// one-line digest (tool, target, size) naming the scratch file that holds the full text — the
+    /// recent window SWE-agent found optimal, with nothing lost. Fires only once
+    /// `collapse_batch` results qualify, then collapses all of them, so the prompt cache breaks
+    /// once per batch rather than once per step. `0` disables.
+    pub collapse_after_observations: usize,
+    pub collapse_batch: usize,
+    pub collapse_min_chars: usize,
+    /// A raw tool result longer than this many bytes is written to the scratch dir in full BEFORE
+    /// the budget cut, and the cut result ends with the path. `0` disables. `file_read` is exempt
+    /// (its file is already on disk).
+    pub spill_result_over_chars: usize,
+    /// After this many successful edit-tool calls (across turns, reset by each check) the loop
+    /// runs the project's fast check itself and appends the verdict to the last tool result, so
+    /// the model does not spend a round-trip on `cargo check` between edit batches. A pass
+    /// latches the verify gate as satisfied. `0` disables. Needs `enable_verify_gate`.
+    pub harness_check_after_edits: usize,
     /// Re-show the todo list as a tail reminder every N loop iterations on long runs (recitation
     /// keeps the goal in the model's recent-attention span). `0` disables.
     pub todo_reminder_every: usize,
@@ -542,6 +644,12 @@ pub struct AgentConfig {
     /// summarized in place. `0` disables compaction (the loop falls back to the one-shot wrap-up
     /// nudge). Requires `context_window > 0`.
     pub compact_at_pct: u8,
+    /// The run id for this loop, if the caller wants a durable event log (durable-run Phase 1).
+    /// When set, the loop opens `scratch/runs/<run_id>.jsonl` and records `Note` events at every
+    /// phase checkpoint, so a crash leaves a trace of which phases completed. `None` disables
+    /// run-logging entirely (the default for one-shot `aizen agent` calls, where the transcript
+    /// is already the durable record).
+    pub run_id: Option<String>,
     /// The one-shot "wrap up now" context guard fires when running history crosses this percent of
     /// `context_window` (P-ctx4 — was a hardcoded 90). Kept above `compact_at_pct` so a summarizer-
     /// equipped caller compacts first; the guard is the last-ditch nudge for callers WITHOUT one.
@@ -578,6 +686,11 @@ pub struct AgentConfig {
     /// Max incomplete-todo pokes per run before Done is allowed anyway. `0` disables poking even
     /// when `enable_todo_poke` is true.
     pub max_todo_poke_attempts: usize,
+    /// Nudge once before a model call when the request looks broad or edits grow, with no plan/todos.
+    /// Task size picks the artifact (todo list for small, `docs/plans/*.md` for large); this is the
+    /// harness's reminder for when the model judged the size wrong. Never blocks, never edits source.
+    /// Sub-agents leave it OFF — the artifacts belong to the top-level user's run.
+    pub enable_plan_nudge: bool,
     /// P0.2: arm a one-shot re-check when a todo is marked done with a large confidence jump.
     pub enable_confidence_gate: bool,
     /// Confidence ≥ this (and a spike of `conf_spike_delta`) when marking done arms the gate.
@@ -644,6 +757,12 @@ pub struct AgentConfig {
     /// through every sub-agent spawn, so a boxed `dyn Fn` would cost both derives. `None` ⇒ no
     /// observer (sub-agents and workflow children: their transcripts aren't the user's session).
     pub on_progress: Option<fn(&[Message])>,
+    /// Live step reporter for a delegated child: `(orchestration row id, callback)`. The loop
+    /// calls it with the step number and the tool names of each batch, so `/workflows` shows
+    /// `step 7 · file_edit` instead of only "running". `None` for a top-level turn.
+    pub step_note: Option<StepNote>,
+    /// One shared deadline/send allowance per delegated model step, including all retry layers.
+    pub delegated_call_cap: Option<std::time::Duration>,
     /// WALL-CLOCK ceiling for this whole run, checked at each loop boundary. `None` ⇒ steps only.
     ///
     /// Every other budget here counts STEPS, and steps are not time: `max_iters` + `auto_extend_to` +
@@ -659,9 +778,49 @@ pub struct AgentConfig {
     /// step completes, its result is recorded, and the run ends the same orderly way Esc does.
     /// Consequence to size for: overshoot is bounded by the longest single step, not by zero.
     pub deadline: Option<std::time::Instant>,
+    /// Explicit wire effort for this run: outer `None` keeps legacy resolution, `Some(None)`
+    /// omits it, and `Some(Some(tier))` pins it without mutating another run's override.
+    pub wire_reasoning_effort: Option<Option<String>>,
+    /// Explicit tool-image capability and approved destination for the effective endpoint/model.
+    pub tool_image_policy: crate::llm::media::VisionPolicy,
+    /// Frozen capability configuration shared by execution and transport for this dispatch.
+    pub image_config: Option<std::sync::Arc<crate::core::cli_config::CliConfig>>,
+    pub tool_image_destination: Option<String>,
+    pub tool_image_destination_label: Option<String>,
 }
 
 impl AgentConfig {
+    /// Give the reasoning-effort tier teeth in the HARNESS, not just on the wire. The five tiers
+    /// used to change only the `reasoning_effort` string — a no-op on every provider that ignores
+    /// the field — so `/effort low` and `/effort max` ran the identical loop. Now a tier sets the
+    /// step cap and its extension, how many fresh budgets a still-progressing run may claim, how
+    /// many verify-and-fix rounds a broken tree gets, whether the self-review pass runs before
+    /// Done (`xhigh`/`max` turn it on; lower tiers never turn a user-enabled review off), and how
+    /// much of a build/test log reaches the model. Unknown tiers (provider-specific strings) leave
+    /// the config untouched.
+    pub fn apply_effort(&mut self, tier: &str) {
+        // `continuations` is the knob that decides how long a STILL-PROGRESSING run keeps going past
+        // the step cap before it is handed back as `MaxIters` (see the loop's continuation branch).
+        // It was tuned so tight (3 on medium) that an ordinary long edit on the interactive surface
+        // hit the wall mid-task and made the user type "continue" — the exact annoyance this widens.
+        // A healthy run is still bounded: the stall ledger stops it the moment two turns in a row add
+        // no evidence, so more continuations only ever buy room for genuine progress, never a wander.
+        let (iters, extend, continuations, verify, review, log) = match tier {
+            "low" => (12, 24, 2, 1, false, 8_000),
+            "medium" => (25, 80, 8, 2, false, 16_000),
+            "high" => (40, 120, 12, 3, false, 16_000),
+            "xhigh" => (60, 180, 16, 4, true, 24_000),
+            "max" => (90, 300, 24, 5, true, 24_000),
+            _ => return,
+        };
+        self.max_iters = iters;
+        self.auto_extend_to = extend;
+        self.max_continuations = continuations;
+        self.max_verify_attempts = verify;
+        self.enable_self_review = self.enable_self_review || review;
+        self.max_log_result_chars = log;
+    }
+
     /// The directory this run resolves relative paths against and takes its writer lease on:
     /// `workspace_root` when a lane pinned one, else the process cwd. Canonicalized, because the
     /// lease keys workspaces by identity — two spellings of one path must not read as two repos.
@@ -680,27 +839,34 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_iters: 25,
-            auto_extend_to: 50,
+            auto_extend_to: 80,
             max_tool_result_chars: 4096,
             max_fetch_result_chars: 12_000,
+            max_log_result_chars: 16_000,
+            max_delegate_result_chars: 24_000,
+            nudge_role: NudgeRole::System,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
             exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
             workspace_root: None,
             quiet: false,
             enable_verify_gate: true,
-            verify_gate_timeout_secs: 90,
+            verify_gate_timeout_secs: 300,
             auto_checkpoint: true,
             checkpoint_each_edit: true,
             context_window: 0,
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
-            clear_at_pct: 60,
-            clear_target_pct: 45,
             clear_step_pct: 10,
             clear_cooldown_iters: 6,
+            collapse_after_observations: 8,
+            collapse_batch: 8,
+            collapse_min_chars: 800,
+            spill_result_over_chars: 16 * 1024,
+            harness_check_after_edits: 3,
             todo_reminder_every: 8,
             compact_at_pct: 80,
+            run_id: None,
             context_guard_pct: 90,
             max_verify_attempts: 2,
             enable_self_review: false,
@@ -708,6 +874,7 @@ impl Default for AgentConfig {
             lsp_request_timeout_secs: 20,
             enable_todo_poke: true,
             max_todo_poke_attempts: 2,
+            enable_plan_nudge: true,
             enable_confidence_gate: true,
             conf_high: 90,
             conf_spike_delta: 40,
@@ -715,12 +882,25 @@ impl Default for AgentConfig {
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
             max_transient_retries: 2, // survive a gateway blip mid-task instead of losing the work
-            max_continuations: 3,
+            // A still-progressing run gets this many fresh step budgets before it is cut off with
+            // `MaxIters` (see the loop's continuation branch). Kept generous on the interactive
+            // surface — where the user is present and can Esc — so a long but healthy task finishes
+            // on its own instead of stopping mid-work and asking the user to type "continue". The
+            // stall ledger still ends a run the moment it stops making progress, so this is room for
+            // real work, not a licence to wander.
+            max_continuations: 8,
             max_stall_recoveries: 1,
             goal: None,
             enable_steering: false,
             on_progress: None,
+            step_note: None,
+            delegated_call_cap: None,
             deadline: None,
+            wire_reasoning_effort: None,
+            tool_image_policy: crate::llm::media::VisionPolicy::Unknown,
+            image_config: None,
+            tool_image_destination: None,
+            tool_image_destination_label: None,
         }
     }
 }
@@ -735,11 +915,12 @@ pub enum StopReason {
     MaxIters,
     /// The verification gate ran and exhausted its repair budget without a passing result.
     VerificationFailed,
-    /// The model invoked `clarify` — the turn is PAUSED pending the user's answer (the carried
-    /// string is the user-facing question + options). The caller surfaces it and the next user
-    /// message re-enters the loop as the answer. History is left valid (the assistant tool-call
-    /// turn and its tool result are already appended).
-    AwaitingInput(String),
+    /// The model invoked `clarify` — the turn is PAUSED pending the user's answer. The carried
+    /// [`clarify::Ask`] holds one or more questions (with optional suggested options / multi-select).
+    /// The caller surfaces it (a picker under the retained UI, the rendered text everywhere else) and
+    /// the next user message re-enters the loop as the answer. History is left valid (the assistant
+    /// tool-call turn and its tool result are already appended).
+    AwaitingInput(crate::agent::clarify::Ask),
     /// The user cancelled mid-loop (Esc / cancel flag). Cooperative: no further model/tool work.
     /// Nested sub-agents (`task` / `workflow` children) observe the same process-global flag and
     /// stop at their next loop boundary instead of running to max_iters.
@@ -748,6 +929,30 @@ pub enum StopReason {
     /// "cancelled by user" would send the user looking for a keypress that never happened) and from
     /// `MaxIters` (a step-budget stop). Never automatically resumed.
     Deadline,
+    /// The model asked for a fresh thread: its final text opened with `REFRESH: <note>` — it judged
+    /// the conversation too long/drifted to keep steering and requested a context refresh. The REPL
+    /// distills a carry-over seed (smart: recent tail + touchpoints ledger, not the whole transcript)
+    /// and starts a new thread seeded with it, so the next turn continues the same work with a clean
+    /// context. Distinct from `Done` (the model did NOT finish the task — it asked to keep working
+    /// with a fresh context) and from `MaxIters` (a budget stop, not a model-initiated refresh).
+    Refresh,
+}
+
+impl StopReason {
+    /// The stop reason as one word — the `stop` field of the JSON `done` event and of the `stop`
+    /// hook's input. Stable: front-ends match on these.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Divergence => "divergence",
+            Self::MaxIters => "max_iters",
+            Self::VerificationFailed => "verification_failed",
+            Self::AwaitingInput(_) => "awaiting_input",
+            Self::Cancelled => "cancelled",
+            Self::Deadline => "deadline",
+            Self::Refresh => "refresh",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -757,6 +962,81 @@ pub struct AgentOutcome {
     pub final_text: Option<String>,
     pub iters: usize,
     pub stop: StopReason,
+    /// Snapshot from typed gate state, never inferred from the model's prose or image filenames.
+    pub verification: Option<serde_json::Value>,
+}
+
+fn design_verification(
+    cfg: &AgentConfig,
+    build_passed: bool,
+    edited: bool,
+) -> Option<serde_json::Value> {
+    let ctx = cfg.exec_ctx.design()?;
+    let state = ctx.snapshot();
+    if !state.active || !state.intent.is_visual() {
+        return None;
+    }
+    let (status, reason) = match ctx.gate() {
+        design::GateDecision::Disabled => ("disabled", None),
+        design::GateDecision::NotRequired => ("not_required", None),
+        design::GateDecision::Verified => ("verified", None),
+        design::GateDecision::Continue(reason) => ("pending", Some(reason)),
+        design::GateDecision::Unavailable(reason) => ("unavailable", Some(reason)),
+        design::GateDecision::Failed(reason) => ("failed", Some(reason)),
+        design::GateDecision::SkippedByUser(reason) => ("skipped_by_user", Some(reason)),
+    };
+    Some(serde_json::json!({
+        "build_test": if build_passed { "passed" } else if edited { "unverified" } else { "not_required" },
+        "visual": { "status": status, "reason": reason,
+            "task_id": first_line_clip(&state.task_id, 80), "revision": state.render_revision,
+            "operations": state.visual_operations, "repair_rounds": state.repairs,
+            "evidence": state.evidence.iter().map(|e| serde_json::json!({
+                "id": first_line_clip(&e.id, 128), "status": e.status,
+                "width": e.viewport.width, "height": e.viewport.height,
+                "revision": e.render_revision, "pixels_delivered": e.projected, "ready": e.ready,
+            })).collect::<Vec<_>>() },
+        "limitations": ["Visual review is not WCAG certification or proof of unobserved interactions."]
+    }))
+}
+
+fn design_evidence_summary(cfg: &AgentConfig, build_passed: bool, edited: bool) -> String {
+    let Some(ctx) = cfg.exec_ctx.design() else {
+        return String::new();
+    };
+    let state = ctx.snapshot();
+    if !state.active || !state.intent.is_visual() {
+        return String::new();
+    }
+    let build = if build_passed {
+        "passed"
+    } else if edited {
+        "not verified by the functional gate"
+    } else {
+        "not required by this run"
+    };
+    let mut out = format!(
+        "Verification: build/test {build}; visual {:?}.\nEvidence (task {}, revision {}):",
+        ctx.gate(),
+        first_line_clip(&state.task_id, 80),
+        state.render_revision
+    );
+    for evidence in &state.evidence {
+        out.push_str(&format!(
+            "\n- {} · {}×{} · {:?} · revision {} · pixels delivered={} · ready={}",
+            first_line_clip(&evidence.id, 128),
+            evidence.viewport.width,
+            evidence.viewport.height,
+            evidence.status,
+            evidence.render_revision,
+            evidence.projected,
+            evidence.ready
+        ));
+    }
+    if state.evidence.is_empty() {
+        out.push_str(" none");
+    }
+    out.push_str("\nVisual review is not WCAG certification or proof of unobserved interactions.");
+    out
 }
 
 /// Run the agent loop to completion.
@@ -876,12 +1156,70 @@ where
     O: Fn(Vec<Message>) -> OFut,
     OFut: Future<Output = Result<String>>,
 {
+    // Nudges are advice for one run. Whatever the previous run left behind is stale now — and
+    // on the Codex path it would be hoisted into the instructions blob for the rest of the
+    // conversation. Strip before the review request is captured, so a user-role nudge can never
+    // be mistaken for the request.
+    retire_nudges(messages);
+    let scoped = pin_placement_context(cfg)?;
+    let run = run_agent_loop_body(chat, summarize, oracle, &scoped, registry, messages);
+    #[cfg(test)]
+    let run = crate::core::workspace_txn::with_test_lock_namespace_future(
+        scoped.exec_ctx.test_lock_namespace().cloned(),
+        run,
+    );
+    run.await
+}
+
+fn pin_placement_context(cfg: &AgentConfig) -> Result<AgentConfig> {
+    let mut scoped = cfg.clone();
+    let root = cfg.effective_root();
+    let placement = match cfg.exec_ctx.placement() {
+        Some(context) => context.fork_for(root, &cfg.exec_ctx.resource_scope())?,
+        None => crate::core::file_placement::PlacementContext::new(
+            root.clone(),
+            crate::core::config::aizen_home(),
+        )?
+        .fork_for(root, &cfg.exec_ctx.resource_scope())?,
+    };
+    scoped.exec_ctx = cfg
+        .exec_ctx
+        .clone()
+        .with_placement(placement)
+        .with_deadline(cfg.deadline);
+    scoped.deadline = scoped.exec_ctx.deadline();
+    if scoped.exec_ctx.native_scope().is_some() {
+        // Capability state, not caller-selected booleans, decides whether global work is allowed.
+        scoped.auto_checkpoint = false;
+        scoped.checkpoint_each_edit = false;
+        scoped.enable_verify_gate = false;
+        scoped.enable_lsp = false;
+        scoped.enable_plan_nudge = false;
+    }
+    Ok(scoped)
+}
+
+async fn run_agent_loop_body<F, Fut, S, SFut, O, OFut>(
+    chat: F,
+    summarize: Option<S>,
+    oracle: Option<O>,
+    cfg: &AgentConfig,
+    registry: &ToolRegistry,
+    messages: &mut Vec<Message>,
+) -> Result<AgentOutcome>
+where
+    F: Fn(Vec<Message>, Vec<ToolDef>) -> Fut,
+    Fut: Future<Output = Result<ChatTurn>>,
+    S: Fn(Vec<Message>) -> SFut,
+    SFut: Future<Output = Result<String>>,
+    O: Fn(Vec<Message>) -> OFut,
+    OFut: Future<Output = Result<String>>,
+{
     // Capture the real request before verify/todo/goal gates can append synthetic user turns. Prefix
     // stripping keeps automatic memory/codebase retrieval out of the review contract.
     let mut review_request = capture_review_request(messages);
-    // Run-scoped Time Machine anchors (pre_edit / last_good / rewind budget). Must reset every loop
-    // entry so a prior task's safety net cannot be restored into this task by accident.
-    crate::features::timemachine::begin_agent_run();
+    // ExecutionContext owns this logical run's anchors. Continuations preserve the handle;
+    // fresh turns and delegated children explicitly create independent recovery.
     let defs = registry.defs();
     // Tool schemas ride on EVERY request but live in no message — count them once here so the
     // context guards below compare the real request size against the window.
@@ -908,6 +1246,11 @@ where
     // cause. Successful edits and completed todos are evidence too.
     let mut stall = StallLedger::new(todo_done_count());
     let mut verify_attempts = 0usize;
+    let mut visual_gate_prompts = 0usize;
+    // Once per run: when the gate has NOTHING to run (no recognised manifest, toolchain not
+    // installed) the model is asked to run the project's own check before finishing. Without this
+    // an edit in a Python or Go repo reached `Done` with no verification and no trace line.
+    let mut verify_absence_demanded = false;
     // The verify gate PASSED for the current tree state (W8). Set when a check comes back clean;
     // CLEARED by a fresh successful edit (new work must be re-verified). While false and edits
     // exist, the gate re-fires on every "done" claim until it passes or attempts exhaust — so a
@@ -916,12 +1259,17 @@ where
     // CUMULATIVE edit flag — set once any successful edit lands; arms the one-shot self-review AND
     // gates the verify gate (a run that never edited has nothing to verify).
     let mut made_any_edits = false;
+    // Successful edit-tool calls since the last harness check (see `harness_check_after_edits`).
+    let mut edits_since_check: usize = 0;
     // WHERE the most recent successful edit landed (a directory), so the verify gate can typecheck
     // the tree the edit actually touched rather than the process cwd. The two differ constantly — a
     // session launched from the home directory editing `Desktop/proj/src/x.js` — exactly the gap the
     // pre-edit checkpoint already discovers via `target_dir`; the gate must not lag behind it. `None`
     // (no path named, or the edit was `shell_run`) keeps the cwd-relative fallback.
     let mut last_edit_dir: Option<std::path::PathBuf> = None;
+    // Every file a successful edit named this run: the narrow rung of the Done ladder (the
+    // sibling test, the module filter) is derived from these.
+    let mut edited_paths: Vec<std::path::PathBuf> = Vec::new();
     // PRE-EDIT VERIFY BASELINE: captured on demand just before the first workspace mutation so the
     // gate can distinguish pre-existing compiler errors from regressions introduced by this run.
     // `None` = not yet captured; `Some` = immutable for the lifetime of the run.
@@ -949,26 +1297,32 @@ where
     // band change so the running budget `system` nudge stays cache-stable within a band. Reset when
     // history shrinks (clear/compact) so the signal re-arms honestly against the new, smaller size.
     let mut budget_band_shown: Option<u8> = None;
-    // P-ctx2: one-shot latch — the FIRST time history reaches the clearing threshold we warn the
-    // model to persist anything durable and SKIP that pass, so the eviction happens a turn later
-    // with the important content already saved. Never fires again (subsequent clears are silent).
-    let mut save_before_clear_warned = false;
     // Provider-reported prompt size at the last usage-carrying call (see `RealAnchor`) —
     // invalidated whenever history is mutated (clearing/compaction shrink what we'd send next).
     let mut real_anchor: Option<RealAnchor> = None;
-    // Clearing cadence: (pct-of-window after the last clear, iter at the last clear).
-    let mut last_clear: Option<(usize, usize)> = None;
     // Compaction cadence: (pct-of-window after the last compaction attempt, iter at that attempt).
-    // Mirrors `last_clear`. WITHOUT this, the compaction trigger below re-fires on every consecutive
-    // iteration once history is long enough — each pass re-splices mid-history and busts the prompt
-    // cache from the splice point. The guard makes compaction fire in big infrequent jumps (like
-    // clearing), not a per-turn cache-shredding trickle: it only re-arms when usage grows by
-    // `clear_step_pct` OR `clear_cooldown_iters` iterations have elapsed since the last attempt.
+    // WITHOUT this, the compaction trigger below re-fires on every consecutive iteration once
+    // history is long enough — each pass re-splices mid-history and busts the prompt cache from
+    // the splice point. The guard makes compaction fire in big infrequent jumps, not a per-turn
+    // cache-shredding trickle: it only re-arms when usage grows by `clear_step_pct` OR
+    // `clear_cooldown_iters` iterations have elapsed since the last attempt.
     let mut last_compact: Option<(usize, usize)> = None;
+    // Consecutive failed compaction attempts. One failure does not arm the cadence latch (the
+    // summarizer may just have blipped); two in a row do, so a dead summarizer costs two model
+    // round-trips per cooldown, not one per iteration.
+    let mut compact_failures: usize = 0;
     // Iter of the last todo-recitation reminder (0 = none yet).
     let mut last_todo_reminder = 0usize;
     // P0.1: incomplete-todo pokes this run (cap = max_todo_poke_attempts).
     let mut todo_poke_attempts = 0usize;
+    // Run-local advisory state; never infer this turn's intent from the widened conversation shape.
+    let mut planning = cfg
+        .enable_plan_nudge
+        .then(|| plan_nudge::PlanNudge::new(&review_request, &cfg.effective_root()));
+    // True when the PREVIOUS turn was the model's final answer (text, no tool call). A continuation
+    // that fires right after that is dragging the run onward AFTER the model already said it was
+    // done — block it (see the step-cap branch), unless the todo list still says work is open.
+    let mut last_turn_was_text_only = false;
     // P0.2: last confidence per todo content key; spike at Done arms a one-shot gate.
     let mut conf_last: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut confidence_gate_armed = false;
@@ -979,11 +1333,21 @@ where
     let mut last_hill_climb_reminder = 0usize;
     let mut iter = 0usize;
     // Identical-re-read short-circuit: sig(file_read args) → what that call answered last time.
-    // Cleared whenever history is rebuilt (compaction / emergency shrink) — the msg_index leg of
-    // the proof dies with the rebuild. Eviction blanks bodies IN PLACE, which the byte-level
-    // intact-check catches per entry, so no clear is needed there.
-    let mut read_cache: std::collections::HashMap<String, ReadCacheEntry> =
-        std::collections::HashMap::new();
+    // Lives in the process-global store under this scope so it survives into the NEXT user turn
+    // (same history, new loop invocation). Cleared per-scope whenever history is rebuilt
+    // (compaction / emergency shrink) — the msg_index leg of the proof dies with the rebuild.
+    // Eviction blanks bodies IN PLACE, which the byte-level intact-check catches per entry, so no
+    // clear is needed there.
+    let read_cache_scope = cfg.exec_ctx.resource_scope();
+    // Run-log (durable-run Phase 1): open the append-only event log for this run, if the caller
+    // gave us a run_id. The writer is opened once here and lives for the whole loop; every
+    // phase-checkpoint stamp below appends a `Note` event so a crash leaves a durable trace of
+    // which phases completed. `None` (the default for one-shot `aizen agent` calls) disables
+    // run-logging entirely.
+    let mut runlog: Option<crate::agent::runlog::RunLogWriter> =
+        cfg.run_id.as_deref().and_then(|id| {
+            crate::agent::runlog::RunLogWriter::open(&crate::agent::runlog::runs_dir(), id).ok()
+        });
     // Batch-coach streak (see NUDGE_BATCH): consecutive turns whose ONLY call was one read-only
     // retrieval. One-shot latch per run.
     let mut single_read_streak = 0usize;
@@ -993,7 +1357,18 @@ where
     // completion (→ Done, via the goal gate + verify gate). Ordinary turns keep `iter < cap`.
     let goal_mode = cfg.goal.is_some();
 
+    // Phase 2b (live blackboard): track how many sibling notes were on the board the last time we
+    // told the model. A sibling's report landing mid-run bumps the count → the model gets a fresh
+    // env_line as a collapsing system nudge (same cache-friendly shape as NUDGE_BUDGET).
+    let mut blackboard_seen: usize =
+        crate::agent::blackboard::list(&cfg.exec_ctx.resource_scope()).len();
+    // Phase 2c (coordinator signals): a `aizen signal <run-id> "instruction"` lands as a line in
+    // `<run_id>.signals.jsonl`; the loop drains the UNREAD tail each iteration and injects it as a
+    // nudge. Byte offset = high-water mark; a signal written mid-run is seen on the next turn.
+    let mut signal_offset: u64 = 0;
+
     loop {
+        check_background_effects()?;
         // COOPERATIVE CANCEL wins before any cap bookkeeping. Goal mode bypasses the cap exactly as
         // before; ordinary runs get one convergent extension at this single boundary, regardless of
         // whether the previous iteration reached it through a tool path or a Done-gate `continue`.
@@ -1001,8 +1376,56 @@ where
             return Ok(AgentOutcome {
                 final_text: None,
                 iters: iter,
+                verification: design_verification(cfg, verify_passed, made_any_edits),
                 stop: StopReason::Cancelled,
             });
+        }
+
+        // 2b: a sibling posted a new blackboard note since we last looked → refresh the pointer.
+        // Collapsing nudge (push_nudge replaces the same-kind one), so it costs one system message
+        // total, not one per turn.
+        let bb_now = crate::agent::blackboard::list(&cfg.exec_ctx.resource_scope()).len();
+        if bb_now > blackboard_seen {
+            blackboard_seen = bb_now;
+            let line = crate::agent::blackboard::env_line(&cfg.exec_ctx.resource_scope());
+            push_nudge_as(
+                messages,
+                cfg.nudge_role,
+                NUDGE_BLACKBOARD,
+                &format!("{NUDGE_BLACKBOARD} a sibling posted a new report. {line}"),
+            );
+        }
+
+        // 2c: drain unread coordinator signals for this run. Each line is one instruction;
+        // malformed lines are skipped, never fatal (the log is advice, not control flow).
+        if let Some(id) = cfg.run_id.as_deref() {
+            let sig_path = crate::agent::runlog::runs_dir().join(format!("{id}.signals.jsonl"));
+            if let Ok(meta) = std::fs::metadata(&sig_path) {
+                if meta.len() > signal_offset {
+                    if let Ok(text) = std::fs::read_to_string(&sig_path) {
+                        let unread = &text[signal_offset as usize..];
+                        signal_offset = meta.len();
+                        for line in unread.lines() {
+                            let instruction = serde_json::from_str::<serde_json::Value>(line)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("body").and_then(|b| b.as_str()).map(str::to_string)
+                                })
+                                .unwrap_or_else(|| line.trim().to_string());
+                            if !instruction.is_empty() {
+                                push_nudge_as(
+                                    messages,
+                                    cfg.nudge_role,
+                                    NUDGE_SIGNAL,
+                                    &format!(
+                                        "{NUDGE_SIGNAL} coordinator instruction: {instruction}"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         // WALL-CLOCK CEILING (`cfg.deadline`), checked beside the cancel flag because it is the same
         // kind of exit: the step that just finished is recorded, and no new work starts. NOT gated on
@@ -1018,6 +1441,7 @@ where
             return Ok(AgentOutcome {
                 final_text: None,
                 iters: iter,
+                verification: design_verification(cfg, verify_passed, made_any_edits),
                 stop: StopReason::Deadline,
             });
         }
@@ -1033,18 +1457,29 @@ where
             ) {
                 extended = true;
                 cap = cfg.auto_extend_to;
-                push_nudge(
+                push_nudge_as(
                     messages,
+                     cfg.nudge_role,
                     NUDGE_STEP_LIMIT,
                     "You are nearing the step limit. Finish the task now, or stop and state what is blocking you.",
                 );
-            } else if healthy && continuations < cfg.max_continuations {
+            } else if healthy
+                && (!last_turn_was_text_only || todo::has_incomplete())
+                && continuations < cfg.max_continuations
+            {
                 // CONTINUATION: the one-shot extension is spent, but this run is neither stalled nor
                 // looping — it is simply a big task still moving. Cutting it here is what made aizen
                 // hand back partial work and wait for the user to type "continue"; do that for it
                 // instead. A `user`-role message (not a soft system nudge) so the model cannot treat
                 // it as ambient noise, and the whole conversation is preserved, so this is a
                 // CONTINUATION of the work, not a restart of it.
+                //
+                // `last_turn_was_text_only && !todo::has_incomplete()`: a turn that just returned TEXT
+                // (its final answer) with NO open todos has already said "done" — dragging it onward
+                // is exactly the "it keeps running after it finished" behaviour, so block the
+                // continuation and let the run end. If the model SAID done but the todo list still
+                // shows open items, that claim is suspect: fall through (allow continuation), and the
+                // incomplete-todo gate will own the "you still have work" poke instead.
                 continuations += 1;
                 cap = cap.saturating_add(cfg.max_iters.max(1));
                 if !cfg.quiet {
@@ -1055,7 +1490,7 @@ where
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(&line);
                     } else {
-                        eprintln!("{line}");
+                        emit_trace(&line);
                     }
                 }
                 messages.push(Message::user(format!(
@@ -1103,123 +1538,68 @@ where
         // turn, so without this hook a terminal closed mid-turn persisted the user's question and
         // discarded every reply and tool result the turn had already produced.
         if let Some(publish) = cfg.on_progress {
-            publish(messages);
+            if let Some(ctx) = cfg.exec_ctx.design() {
+                crate::core::session_store::update_live_history_with_design(
+                    messages,
+                    Some(&ctx.snapshot()),
+                );
+            } else {
+                publish(messages);
+            }
         }
 
+        observe::retain_tool_images(messages);
+        // AGE-BASED OBSERVATION COLLAPSING (runs BEFORE the estimate so the guards see the slimmer
+        // history): tool results older than the newest `collapse_after_observations`, longer than
+        // `collapse_min_chars`, become one-line digests naming the scratch file with the full text.
+        // Independent of context % — the recent-window shape holds on every model — and batched
+        // (`collapse_batch`) so the provider prompt cache breaks once per batch, not per step. The
+        // percentage-gated clearing below stays as the second line of defense for what this leaves.
+        if cfg.collapse_after_observations > 0 {
+            let stats = observe::collapse_aged(
+                messages,
+                observe::CollapsePolicy {
+                    keep_recent: cfg.collapse_after_observations,
+                    batch: cfg.collapse_batch,
+                    min_chars: cfg.collapse_min_chars,
+                },
+                &mut observe::spill_to_scratch,
+            );
+            if stats.collapsed > 0 && !cfg.quiet {
+                emit_trace(&format!(
+                    "→ collapsed {} older tool result(s) to one line each (−{} chars; full text in scratch)",
+                    stats.collapsed, stats.chars_reclaimed
+                ));
+            }
+        }
+
+        cfg.exec_ctx.refresh_tool_images(messages);
         // Effective request size for ALL guards this iteration: estimate (messages + tool schemas)
         // corrected by the provider's last real usage report when we have one. Recomputed after any
         // guard mutates history.
         let mut est_now = effective_tokens(
-            estimate_tokens(messages) + schema_overhead,
+            estimate_request_tokens(messages, cfg) + schema_overhead,
             real_anchor.as_ref(),
         );
 
-        // TOOL-RESULT CLEARING (cheap, deterministic — runs BEFORE the model call): once history
-        // crosses `clear_at_pct` of the window, batch-evict stale tool-result bodies DOWN TO
-        // `clear_target_pct` in one pass. Big infrequent jumps, not a per-turn trickle — every
-        // mid-history rewrite invalidates the provider prompt cache from that byte onward, so the
-        // cadence (`clear_step_pct` growth or `clear_cooldown_iters`) is what keeps hit rates
-        // alive. Error-aware: bulky successes go first; failures are only trimmed (first line
-        // survives) when successes alone can't reach the floor. Off when context_window /
-        // keep_recent / clear_at_pct is 0.
-        if cfg.context_window > 0
-            && cfg.keep_recent_tool_results > 0
-            && cfg.clear_at_pct > 0
-            && est_now * 100 >= cfg.context_window * cfg.clear_at_pct as usize
-        {
-            let pct = est_now * 100 / cfg.context_window;
-            if clearing_due(
-                pct,
-                iter,
-                last_clear,
-                cfg.clear_step_pct,
-                cfg.clear_cooldown_iters,
-            ) {
-                // SAVE-BEFORE-CLEAR (P-ctx2): the first eviction of a run is the moment stale
-                // tool-result bodies leave context for good — the single biggest source of "it
-                // forgot the workaround we found" complaints. So the FIRST time we're due to clear,
-                // don't: warn the model to persist anything durable (memory files, todo_write) while
-                // the results are still here, then let THIS turn run with the warning + full context.
-                // The eviction happens next turn (latch set, cadence NOT armed → clearing_due stays
-                // true), by which point the important content is saved. One-shot; later clears are
-                // silent (the model has been told the rule once).
-                if !save_before_clear_warned {
-                    save_before_clear_warned = true;
-                    push_nudge(
-                        messages,
-                        NUDGE_SAVE_BEFORE_CLEAR,
-                        "Context is filling up, so older tool results will start being dropped from \
-                         history to make room. BEFORE that happens: if any earlier command output, \
-                         file content, fix, or workaround still matters for this task, save it now — \
-                         write it to a memory file or record it with todo_write. Details you don't \
-                         persist will be gone from context after this.",
-                    );
-                    // Skip the eviction this pass; do NOT arm the cadence, so the next iteration is
-                    // still "due" and actually clears — now that the model has had a turn to save.
-                } else {
-                    // The floor measures history in RAW estimate units (chars/4), but `est_now` — which
-                    // armed this pass — is anchor-corrected. With an active anchor, effective = raw + K
-                    // for a constant offset K (= real-minus-estimate at anchor time), so a target
-                    // expressed in window units must be shifted into raw space by that same K; otherwise
-                    // raw is already below the window target and the eviction loop no-ops every cadence
-                    // step (common once the provider reports more tokens than chars/4 — code, Vietnamese).
-                    // No anchor ⇒ est_now == raw ⇒ offset 0 ⇒ identical to the plain window target.
-                    let raw_now = estimate_tokens(messages) + schema_overhead;
-                    let anchor_offset = est_now.saturating_sub(raw_now);
-                    let target = (cfg.context_window * cfg.clear_target_pct as usize / 100)
-                        .saturating_sub(anchor_offset);
-                    let stats = clear_tool_results_to_floor(
-                        messages,
-                        cfg.keep_recent_tool_results,
-                        cfg.clear_tool_result_min_chars,
-                        target,
-                        schema_overhead,
-                    );
-                    if stats.cleared + stats.failures_trimmed > 0 {
-                        // History shrank under the anchor's feet — the next real usage report re-anchors.
-                        real_anchor = None;
-                        // Cleared result BODIES are gone from context, but their content hashes would
-                        // linger in the success ledger and mark a legitimate RE-READ of that now-evicted
-                        // content as stale. Forget success bodies alongside the cleared history.
-                        stall.forget_successes();
-                        est_now = estimate_tokens(messages) + schema_overhead;
-                        budget_band_shown = None; // history shrank — re-arm the running budget signal (P-ctx1)
-                        if !cfg.quiet {
-                            let line = format!(
-                            "→ context: cleared ~{} chars ({} result(s), {} failure(s) trimmed)",
-                            stats.chars_reclaimed, stats.cleared, stats.failures_trimmed
-                        );
-                            if crate::ui::tui::active() {
-                                crate::ui::tui::emit_line(&line);
-                            } else {
-                                eprintln!("{line}");
-                            }
-                        }
-                    }
-                    // Arm the cadence even when nothing was clearable — re-scanning the same
-                    // un-clearable history every iteration buys nothing.
-                    last_clear = Some((est_now * 100 / cfg.context_window, iter));
-                }
-            }
-        }
-
-        // MID-LOOP AUTO-COMPACTION (multi-turn callers only): once history crosses `compact_at_pct`
-        // of the window, summarize older turns in place (keeping the last KEEP_TURNS verbatim) —
-        // cheaper than overflowing, and it carries forward more than the wrap-up nudge. Falls through
-        // when the conversation is too short to cut (one user turn → clearing above is its defense)
-        // or when no summarizer was supplied (the plain `run_agent_loop` path).
+        // MID-LOOP AUTO-COMPACTION (callers that supplied a summarizer): once history crosses
+        // `compact_at_pct` of the window, summarize older turns in place — the last KEEP_TURNS user
+        // turns verbatim, or, in a single-turn run, the prompt plus the last KEEP_STEPS steps —
+        // cheaper than overflowing, and it carries forward more than the wrap-up nudge (the summary
+        // opens with the files and skills the summarized block touched). Falls through when there
+        // is nothing older to cut or when no summarizer was supplied (the plain `run_agent_loop`
+        // path).
         if let Some(ref summarize) = summarize {
             if cfg.compact_at_pct > 0
                 && cfg.context_window > 0
                 && est_now * 100 >= cfg.context_window * cfg.compact_at_pct as usize
             {
                 let pct = est_now * 100 / cfg.context_window;
-                // CADENCE GUARD (mirror of the clearing path): don't re-compact every iteration once
+                // CADENCE GUARD: don't re-compact every iteration once
                 // history sits above `compact_at_pct`. compact_history keeps the last KEEP_TURNS
                 // verbatim, so a single big turn can leave the result still above threshold — without
                 // this the condition stays true and re-splices (cache-busting) every turn. Re-arm only
-                // on `clear_step_pct` growth or after `clear_cooldown_iters` iters (same knobs as
-                // clearing — one cadence policy for both history-shrinking guards).
+                // on `clear_step_pct` growth or after `clear_cooldown_iters` iters.
                 if clearing_due(
                     pct,
                     iter,
@@ -1227,50 +1607,78 @@ where
                     cfg.clear_step_pct,
                     cfg.clear_cooldown_iters,
                 ) {
-                    match compact::compact_history(messages, summarize, compact::KEEP_TURNS).await {
+                    let arm = match compact::compact_history(
+                        messages,
+                        summarize,
+                        compact::KEEP_TURNS,
+                    )
+                    .await
+                    {
                         Ok((before, after)) => {
+                            compact_failures = 0;
                             context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
                             budget_band_shown = None; // …and the running budget signal (P-ctx1)
                             real_anchor = None; // spliced history invalidates the anchor
                             stall.forget_successes(); // summarized-away results must not mark a re-read as stale
-                            read_cache.clear(); // rebuilt indices — the short-circuit proof is void
-                            est_now = estimate_tokens(messages) + schema_overhead;
+                            read_cache_clear_scope(&read_cache_scope); // rebuilt indices — the short-circuit proof is void
+                            crate::ui::events::compact_boundary(before, after);
+                            est_now = estimate_request_tokens(messages, cfg) + schema_overhead;
                             if !cfg.quiet {
                                 let line =
                                     format!("→ context: auto-compacted ~{before} → ~{after} tok");
                                 if crate::ui::tui::active() {
                                     crate::ui::tui::emit_line(&line);
                                 } else {
-                                    eprintln!("{line}");
+                                    emit_trace(&line);
                                 }
                             }
+                            true
                         }
-                        // A failed compaction used to vanish without a trace: the cadence latch
-                        // still armed below, so a down summarizer endpoint meant compaction was
-                        // silently skipped for the rest of the run while context kept climbing.
-                        // Say so — the user can fix the summarizer; nobody can fix what is hidden.
+                        // A failed compaction used to vanish without a trace AND arm the cadence
+                        // latch, so one summarizer blip meant compaction was silently skipped for
+                        // the rest of the cooldown while context kept climbing. Say so — the user
+                        // can fix the summarizer — and latch only on the second failure in a row.
                         Err(e) => {
+                            compact_failures += 1;
                             if !cfg.quiet {
                                 let line = format!(
                                     "⚠ context: auto-compact failed ({e:#}) — continuing without \
-                                     it; history will rely on tool-result clearing only"
+                                     it; older results still collapse to digests and the overflow shrink stands"
                                 );
                                 if crate::ui::tui::active() {
                                     crate::ui::tui::emit_line(
                                         &crate::ui::theme::faint(line).to_string(),
                                     );
                                 } else {
-                                    eprintln!("{line}");
+                                    emit_trace(&line);
                                 }
                             }
+                            compact_failures >= COMPACT_FAILURES_BEFORE_LATCH
                         }
+                    };
+                    // Arm the cadence after a success (even one that barely dented size — the
+                    // history is now as short as summarizing can make it) or after repeated
+                    // failure; re-attempting every iteration buys nothing and each attempt is a
+                    // model round-trip. Recompute pct against the (possibly shrunk) history so
+                    // the latch reflects the post-compaction size.
+                    if arm {
+                        last_compact = Some((est_now * 100 / cfg.context_window, iter));
                     }
-                    // Arm the cadence even when compaction was a no-op (history too short to cut) or
-                    // barely dented size — re-attempting the same summarize every iteration buys
-                    // nothing and each attempt is a model round-trip. Recompute pct against the
-                    // (possibly shrunk) history so the latch reflects the post-compaction size.
-                    last_compact = Some((est_now * 100 / cfg.context_window, iter));
                 }
+            }
+        }
+
+        // Advice rides the next normal request, after compaction so it cannot be folded away
+        // before the model sees it. No tool interception or extra Done round-trip.
+        if let Some(planning) = &mut planning {
+            if let Some(reminder) =
+                planning.take_reminder(edited_paths.len(), !todo::snapshot().is_empty())
+            {
+                push_nudge_as(messages, cfg.nudge_role, PLAN_NUDGE_PREFIX, &reminder);
+                est_now = effective_tokens(
+                    estimate_request_tokens(messages, cfg) + schema_overhead,
+                    real_anchor.as_ref(),
+                );
             }
         }
 
@@ -1286,8 +1694,9 @@ where
             if let Some(band) = budget_band(est_now, cfg.context_window) {
                 if budget_band_shown != Some(band) {
                     budget_band_shown = Some(band);
-                    push_nudge(
+                    push_nudge_as(
                         messages,
+                        cfg.nudge_role,
                         NUDGE_BUDGET,
                         &budget_nudge_text(est_now, cfg.context_window),
                     );
@@ -1309,8 +1718,9 @@ where
             && est_now * 100 >= cfg.context_window * cfg.context_guard_pct as usize
         {
             context_warned = true;
-            push_nudge(
+            push_nudge_as(
                 messages,
+                 cfg.nudge_role,
                 NUDGE_CONTEXT,
                 &format!(
                     "Context is nearly full (~{}% of the window). Wrap up now: stop gathering more, act \
@@ -1337,7 +1747,10 @@ where
         // One emergency overflow shrink per iteration: the provider rejecting the request as too
         // big is deterministic, so a second identical failure after a shrink means shrinking is
         // not the answer — surface the error instead of thrashing.
-        let mut overflow_shrunk = false;
+        let mut overflow_shrinks: usize = 0;
+        let call_control = cfg.delegated_call_cap.map(|cap| {
+            crate::llm::delegated::Control::new(cap, cfg.deadline, cfg.step_note.map(|s| s.0))
+        });
 
         let mut turn = if cfg.goal.is_some() {
             const GOAL_PERMANENT_RETRIES: u32 = 3;
@@ -1349,6 +1762,7 @@ where
             let mut attempt: u32 = 0;
             let mut permanent_tries: u32 = 0;
             loop {
+                check_background_effects()?;
                 // The loop-top deadline check is unreachable while we spin here — honor it here
                 // too, with the same shape (no synthesis call on an already-elapsed ceiling).
                 if cfg.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -1358,11 +1772,18 @@ where
                     return Ok(AgentOutcome {
                         final_text: None,
                         iters: iter,
+                        verification: design_verification(cfg, verify_passed, made_any_edits),
                         stop: StopReason::Deadline,
                     });
                 }
-                match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone()))
-                    .await
+                match crate::core::cancel::race(
+                    &cfg.cancel,
+                    crate::llm::delegated::run(
+                        call_control.as_ref(),
+                        chat(messages.clone(), defs.clone()),
+                    ),
+                )
+                .await
                 {
                     None => {
                         if nudge_pushed {
@@ -1371,6 +1792,7 @@ where
                         return Ok(AgentOutcome {
                             final_text: None,
                             iters: iter,
+                            verification: design_verification(cfg, verify_passed, made_any_edits),
                             stop: StopReason::Cancelled,
                         });
                     }
@@ -1393,22 +1815,52 @@ where
                                 if nudge_pushed {
                                     messages.pop();
                                 }
+                                // The bounded raw body, for the same reason as the ordinary
+                                // branch: the note alone cannot tell "parser missed a key" from
+                                // "provider sent nothing" — the raw capture can, and it is printed
+                                // exactly once, here, never per retry.
+                                let raw_note = t
+                                    .empty_wire_raw
+                                    .as_deref()
+                                    .map(|r| format!("\n  raw body: {r}"))
+                                    .unwrap_or_default();
                                 return Err(anyhow::anyhow!(
                                     "provider returned {} empty response(s) in a row (HTTP 200 \
-                                     with no text and no tool call) — giving up this /goal turn",
+                                     with no text and no tool call) — giving up this /goal turn{raw_note}",
                                     attempt + 1
                                 ));
                             }
                             let delay = crate::llm::client::goal_backoff_ms(attempt);
                             attempt += 1;
-                            goal_retry_line(&format!("empty response; retry #{attempt}"), delay);
-                            if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                            // The wire note rides the retry line — a silent provider storm must be
+                            // diagnosable from the trace alone (the ordinary branch does the same).
+                            goal_retry_line(
+                                &format!(
+                                    "empty response; retry #{attempt}{}",
+                                    t.empty_wire_note
+                                        .as_deref()
+                                        .map(|n| format!(" — {n}"))
+                                        .unwrap_or_default()
+                                ),
+                                delay,
+                            );
+                            if goal_sleep_or_cancel(
+                                &cfg.cancel,
+                                crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                            )
+                            .await
+                            {
                                 if nudge_pushed {
                                     messages.pop();
                                 }
                                 return Ok(AgentOutcome {
                                     final_text: None,
                                     iters: iter,
+                                    verification: design_verification(
+                                        cfg,
+                                        verify_passed,
+                                        made_any_edits,
+                                    ),
                                     stop: StopReason::Cancelled,
                                 });
                             }
@@ -1416,25 +1868,40 @@ where
                         }
                         break t;
                     }
+                    Some(Err(e)) if e.is::<crate::llm::delegated::Failure>() => {
+                        if nudge_pushed {
+                            messages.pop();
+                        }
+                        return Err(e);
+                    }
                     Some(Err(e)) => match crate::llm::client::classify_api_error(&e) {
                         crate::llm::client::ApiErrorKind::ContextOverflow => {
                             // The request outgrew the window — retrying it unchanged 4xxes
                             // identically, and giving up abandons a run the transcript can save.
                             // Shrink once, then retry immediately (the failure was deterministic,
                             // not load — no backoff owed).
-                            if overflow_shrunk
-                                || !emergency_overflow_shrink(messages, &cfg, schema_overhead)
+                            if overflow_shrinks >= MAX_OVERFLOW_SHRINKS
+                                || !emergency_overflow_shrink(messages, cfg, schema_overhead)
                             {
                                 if nudge_pushed {
                                     messages.pop();
                                 }
                                 return Err(e);
                             }
-                            overflow_shrunk = true;
+                            overflow_shrinks += 1;
                             real_anchor = None; // history shrank under the anchor's feet
                             stall.forget_successes(); // evicted bodies must not mark re-reads stale
-                            est_now = estimate_tokens(messages) + schema_overhead;
+                            est_now = estimate_request_tokens(messages, cfg) + schema_overhead;
                             goal_retry_line("context overflow — cleared old tool results", 0);
+                        }
+                        // No budget, no backoff: the credential this call used is already gone
+                        // from disk, so every retry is a request that cannot be built, and the
+                        // sentence waiting behind them names the command that fixes it.
+                        crate::llm::client::ApiErrorKind::SignedOut => {
+                            if nudge_pushed {
+                                messages.pop();
+                            }
+                            return Err(e);
                         }
                         crate::llm::client::ApiErrorKind::Permanent => {
                             permanent_tries += 1;
@@ -1450,13 +1917,23 @@ where
                                     &format!("client error; retry {permanent_tries}/{GOAL_PERMANENT_RETRIES}"),
                                     delay,
                                 );
-                            if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                            if goal_sleep_or_cancel(
+                                &cfg.cancel,
+                                crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                            )
+                            .await
+                            {
                                 if nudge_pushed {
                                     messages.pop();
                                 }
                                 return Ok(AgentOutcome {
                                     final_text: None,
                                     iters: iter,
+                                    verification: design_verification(
+                                        cfg,
+                                        verify_passed,
+                                        made_any_edits,
+                                    ),
                                     stop: StopReason::Cancelled,
                                 });
                             }
@@ -1471,13 +1948,23 @@ where
                             let delay = crate::llm::client::goal_backoff_ms(attempt);
                             attempt += 1;
                             goal_retry_line(&format!("API error; retry #{attempt}"), delay);
-                            if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                            if goal_sleep_or_cancel(
+                                &cfg.cancel,
+                                crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                            )
+                            .await
+                            {
                                 if nudge_pushed {
                                     messages.pop();
                                 }
                                 return Ok(AgentOutcome {
                                     final_text: None,
                                     iters: iter,
+                                    verification: design_verification(
+                                        cfg,
+                                        verify_passed,
+                                        made_any_edits,
+                                    ),
                                     stop: StopReason::Cancelled,
                                 });
                             }
@@ -1542,6 +2029,7 @@ where
             let mut attempt: u32 = 0;
             let mut empty_nudges: usize = 0;
             loop {
+                check_background_effects()?;
                 // Same reason as the goal branch: the loop-top deadline check cannot fire while
                 // this retry loop spins, so a run that is out of time must stop HERE, not after
                 // the budget's worth of further 300s calls.
@@ -1550,17 +2038,25 @@ where
                     return Ok(AgentOutcome {
                         final_text: None,
                         iters: iter,
+                        verification: design_verification(cfg, verify_passed, made_any_edits),
                         stop: StopReason::Deadline,
                     });
                 }
-                match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone()))
-                    .await
+                match crate::core::cancel::race(
+                    &cfg.cancel,
+                    crate::llm::delegated::run(
+                        call_control.as_ref(),
+                        chat(messages.clone(), defs.clone()),
+                    ),
+                )
+                .await
                 {
                     None => {
                         rollback(messages, empty_nudges, nudge_pushed);
                         return Ok(AgentOutcome {
                             final_text: None,
                             iters: iter,
+                            verification: design_verification(cfg, verify_passed, made_any_edits),
                             stop: StopReason::Cancelled,
                         });
                     }
@@ -1577,29 +2073,66 @@ where
                         // Report that as the failure it is — never as a finished run.
                         if attempt as usize >= cfg.max_transient_retries {
                             rollback(messages, empty_nudges, nudge_pushed);
+                            // Name what the wire actually carried: `finish_reason=stop, usage
+                            // prompt=… completion=…, no unknown keys` means the provider really went
+                            // silent; `message keys [content]` means it answered in a shape we did
+                            // not read (the parts-array `content` recovery runs in the client, so a
+                            // `content` key still listed here is a NEW shape gap, not that one).
+                            let note = t
+                                .empty_wire_note
+                                .as_deref()
+                                .map(|n| format!(" — wire carried: {n}"))
+                                .unwrap_or_default();
+                            // …and the bounded raw body, the one piece of evidence that settles
+                            // "billed completion but no text anywhere" — either the reply sits in a
+                            // key the parser has never read (visible right here → fix the parser)
+                            // or the provider truly sent nothing (→ provider-side). This is the
+                            // only place it is ever printed: once, when the turn is already lost.
+                            let raw_note = t
+                                .empty_wire_raw
+                                .as_deref()
+                                .map(|r| format!("\n  raw body: {r}"))
+                                .unwrap_or_default();
                             return Err(anyhow::anyhow!(
                                 "provider returned {} empty response(s) in a row (HTTP 200 with no \
-                                 text and no tool call) — the model never answered this turn",
+                                 text and no tool call) — the model never answered this turn{note}{raw_note}",
                                 attempt + 1
                             ));
                         }
                         let delay = backoff(attempt);
                         attempt += 1;
-                        if !cfg.quiet {
-                            retry_line(
-                                "empty",
-                                &format!(
-                                    "empty response; retry {attempt}/{}",
-                                    cfg.max_transient_retries
-                                ),
-                                delay,
-                            );
-                        }
-                        if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                        // One status line per retry carries the wire note, quiet or not: the note
+                        // is the evidence that turns a retry storm into a bug report, and printing
+                        // it on its own line (ungated, in the client) used to flood the transcript
+                        // — a quiet workflow child's every retry surfaced as an unattributed
+                        // "empty response — …" with no retry number beside it.
+                        retry_line(
+                            "empty",
+                            &format!(
+                                "empty response; retry {attempt}/{}{}",
+                                cfg.max_transient_retries,
+                                t.empty_wire_note
+                                    .as_deref()
+                                    .map(|n| format!(" — {n}"))
+                                    .unwrap_or_default()
+                            ),
+                            delay,
+                        );
+                        if goal_sleep_or_cancel(
+                            &cfg.cancel,
+                            crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                        )
+                        .await
+                        {
                             rollback(messages, empty_nudges, nudge_pushed);
                             return Ok(AgentOutcome {
                                 final_text: None,
                                 iters: iter,
+                                verification: design_verification(
+                                    cfg,
+                                    verify_passed,
+                                    made_any_edits,
+                                ),
                                 stop: StopReason::Cancelled,
                             });
                         }
@@ -1614,23 +2147,30 @@ where
                         continue;
                     }
                     Some(Err(e)) => {
+                        // A typed delegated failure (deadline, exhausted send budget, foreign
+                        // protocol) is terminal: no retry layer above this one may reopen it.
+                        if e.is::<crate::llm::delegated::Failure>() {
+                            rollback(messages, empty_nudges, nudge_pushed);
+                            return Err(e);
+                        }
                         // Overflow first: it is deterministic (retrying unchanged 4xxes
-                        // identically) but recoverable (the transcript can be shrunk). One shrink,
-                        // one immediate retry, no backoff — then the error is real.
+                        // identically) but recoverable (the transcript can be shrunk). Shrink and
+                        // retry immediately, no backoff, up to `MAX_OVERFLOW_SHRINKS` times or
+                        // until nothing is left to evict — then the error is real.
                         if matches!(
                             crate::llm::client::classify_api_error(&e),
                             crate::llm::client::ApiErrorKind::ContextOverflow
                         ) {
-                            if overflow_shrunk
-                                || !emergency_overflow_shrink(messages, &cfg, schema_overhead)
+                            if overflow_shrinks >= MAX_OVERFLOW_SHRINKS
+                                || !emergency_overflow_shrink(messages, cfg, schema_overhead)
                             {
                                 rollback(messages, empty_nudges, nudge_pushed);
                                 return Err(e);
                             }
-                            overflow_shrunk = true;
+                            overflow_shrinks += 1;
                             real_anchor = None;
                             stall.forget_successes();
-                            est_now = estimate_tokens(messages) + schema_overhead;
+                            est_now = estimate_request_tokens(messages, cfg) + schema_overhead;
                             if !cfg.quiet {
                                 retry_line(
                                     "overflow",
@@ -1660,11 +2200,21 @@ where
                                 delay,
                             );
                         }
-                        if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                        if goal_sleep_or_cancel(
+                            &cfg.cancel,
+                            crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                        )
+                        .await
+                        {
                             rollback(messages, empty_nudges, nudge_pushed);
                             return Ok(AgentOutcome {
                                 final_text: None,
                                 iters: iter,
+                                verification: design_verification(
+                                    cfg,
+                                    verify_passed,
+                                    made_any_edits,
+                                ),
                                 stop: StopReason::Cancelled,
                             });
                         }
@@ -1672,6 +2222,53 @@ where
                 }
             }
         };
+
+        // Run-log: record the completed LLM turn (durable-run Phase 1). `request_hash` is a stable
+        // hash of the message count + tool-call count — enough for a resume to detect "the context
+        // changed since the crash" without storing the full prompt (which would double the log's
+        // size for no replay benefit, since the loop re-derives messages from history anyway).
+        if let Some(log) = runlog.as_mut() {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            messages.len().hash(&mut h);
+            turn.tool_calls.len().hash(&mut h);
+            let _ = log.record(crate::agent::runlog::Event::Llm {
+                seq: 0, // writer stamps the real seq
+                request_hash: h.finish(),
+                response: turn.content.clone().unwrap_or_default(),
+                usage: turn
+                    .usage
+                    .as_ref()
+                    .map(|u| crate::agent::runlog::TokenUsage {
+                        prompt: u.prompt_tokens.unwrap_or(0),
+                        completion: u.completion_tokens.unwrap_or(0),
+                    }),
+            });
+        }
+
+        // LENIENT TOOL-CALL RECOVERY: a provider that put the call in the TEXT — `<tool_call>` tags,
+        // a ```json fence, or a bare `{"name": …}` object — and sent an empty `tool_calls` array
+        // used to read as a final answer (the model's "call" echoed to the user) or, with nothing
+        // else in the text, as an empty-200. Lift it into a real call ONLY when the native array is
+        // empty and every name is a registered tool; prose with no such block is left alone. The
+        // arguments go through the same `parse_call_args` repair as native calls.
+        if turn.tool_calls.is_empty() {
+            if let Some(text) = turn.content.as_deref() {
+                if let Some((calls, rest)) =
+                    lenient::extract_text_tool_calls(text, |n| registry.get(n).is_some())
+                {
+                    if !cfg.quiet {
+                        emit_trace(&format!(
+                            "→ recovered {} tool call(s) written as text",
+                            calls.len()
+                        ));
+                    }
+                    turn.tool_calls = calls;
+                    turn.content = rest;
+                }
+            }
+        }
 
         // REAL-USAGE ANCHOR: when the provider reports how many prompt tokens THIS request really
         // was, trust that over chars/4 — the guards then track growth as (estimate delta) on top of
@@ -1707,7 +2304,7 @@ where
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(&line);
                     } else {
-                        eprintln!("{line}");
+                        emit_trace(&line);
                     }
                 }
             }
@@ -1726,6 +2323,54 @@ where
             // the goal gate's `take_pending` drain must only happen at a real Done decision, and a
             // steer left in the mailbox is picked up by the top-of-loop drain for free anyway.
             let mut demands: Vec<String> = Vec::new();
+            let mut visual_incomplete = None;
+            if let Some(ctx) = cfg.exec_ctx.design() {
+                let snapshot = ctx.snapshot();
+                if snapshot.active && snapshot.intent.is_visual() {
+                    if cfg.tool_image_policy != crate::llm::media::VisionPolicy::Supported {
+                        ctx.mark_unavailable(
+                            "the effective endpoint/model has no confirmed tool-image support",
+                        );
+                    } else if registry.get("browser_screenshot").is_none() {
+                        ctx.mark_unavailable(
+                            "browser screenshot tools are disabled or unavailable",
+                        );
+                    }
+                }
+                match ctx.gate() {
+                    design::GateDecision::Continue(note) if visual_gate_prompts < 3 => {
+                        visual_gate_prompts += 1;
+                        if snapshot.evidence.iter().any(|e| {
+                            e.status == design::EvidenceStatus::Failed
+                                && e.render_revision == snapshot.render_revision
+                                && e.pass == snapshot.repairs
+                        }) {
+                            if let Err(error) = ctx.begin_repair() {
+                                visual_incomplete =
+                                    Some(format!("Visual review incomplete: {error}"));
+                            }
+                        }
+                        if visual_incomplete.is_none() {
+                            demands.push(format!("Visual acceptance gate: {note}\nUse the same approval-gated screenshot tools. Do not install/launch a browser or send images without permission. If setup, image approval or render freshness is unavailable, report that limitation rather than claiming visual success."));
+                        }
+                    }
+                    verdict if verdict.blocks_completion() => {
+                        let note = verdict
+                            .message()
+                            .unwrap_or("visual verification remains incomplete");
+                        visual_incomplete = Some(note.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            // ASYNC FOLDS THAT FINISHED SINCE THE LAST TOOL RESULT: a new error in the edited file,
+            // or in a caller it broke, is a demand — the model fixes it before Done, in the same
+            // combined round-trip as the other gates.
+            for fold in crate::agent::lsp::LSP.take_ready_feedback() {
+                if fold.has_error {
+                    demands.push(format!("{}\nFix these before finishing.", fold.text));
+                }
+            }
             // Set when THIS round's verify ran and failed — self-review must not spend its
             // once-per-run oracle call reviewing code that is known-broken.
             let mut verify_failed_now = false;
@@ -1756,11 +2401,35 @@ where
                     .as_deref()
                     .and_then(verify_gate::verify_root)
                     .unwrap_or(cwd);
-                if let Some(result) =
-                    verify_gate::run_verify_gate(&gate_dir, cfg.verify_gate_timeout_secs).await
-                {
+                // The Done ladder: the typecheck, then the narrowest test the edited files name,
+                // then — on a multi-file change that fits the budget — the suite.
+                let gate = verify_gate::run_verify_ladder_in_context(
+                    &gate_dir,
+                    cfg.verify_gate_timeout_secs,
+                    &edited_paths,
+                    cfg.quiet,
+                    &cfg.exec_ctx,
+                )
+                .await;
+                if gate.is_none() && !verify_absence_demanded && !cfg.cancel.is_cancelled() {
+                    verify_absence_demanded = true;
                     if !cfg.quiet {
-                        if result.passed {
+                        crate::ui::tui::verify_line(
+                            "verify",
+                            "no build/test command could run here — asking the model to run the project's own check",
+                        );
+                    }
+                    demands.push(verify_gate::ABSENCE_DEMAND.to_string());
+                }
+                if let Some(result) = gate {
+                    if result.effect_state != tools::ToolEffectState::Settled {
+                        return Err(anyhow::Error::new(tools::ToolEffectsUnsettled(
+                            result.effect_state,
+                        ))
+                        .context(result.output));
+                    }
+                    if !cfg.quiet {
+                        if result.accepted() {
                             crate::ui::tui::verify_line(&result.command, "verify gate passed");
                         } else {
                             let line = format!(
@@ -1772,7 +2441,7 @@ where
                             if crate::ui::tui::active() {
                                 crate::ui::tui::emit_line(&line);
                             } else {
-                                eprintln!("{line}");
+                                emit_trace(&line);
                             }
                         }
                     }
@@ -1792,7 +2461,7 @@ where
                             (false, verify_gate::format_delta_failure(&result, &delta))
                         }
                     } else {
-                        (result.passed, verify_gate::format_gate_failure(&result))
+                        (result.accepted(), verify_gate::format_gate_failure(&result))
                     };
                     if !gate_passed {
                         verify_attempts += 1;
@@ -1813,7 +2482,8 @@ where
                         // new state, just surfacing an option the model already has.
                         let mut failure_msg = failure_msg_body;
                         if verify_attempts * 2 >= cfg.max_verify_attempts {
-                            if let Some(hint) = crate::features::timemachine::recovery_hint() {
+                            if let Some(hint) = cfg.exec_ctx.recovery().hint(&cfg.effective_root())
+                            {
                                 failure_msg.push_str("\n\n");
                                 failure_msg.push_str(&hint);
                             }
@@ -1833,10 +2503,17 @@ where
                         // tree so it's free when the last todo boundary already captured this tree.
                         if cfg.checkpoint_each_edit && made_edits_in_phase {
                             phase_counter += 1;
-                            stamp_phase_checkpoint(
-                                cfg.quiet,
-                                &format!("phase {phase_counter} verified"),
-                            );
+                            let label = format!("phase {phase_counter} verified");
+                            stamp_phase_checkpoint(cfg, last_edit_dir.as_deref(), &label);
+                            // Run-log: record the phase boundary so a crash leaves a durable trace
+                            // of which phases completed (durable-run Phase 1).
+                            if let Some(log) = runlog.as_mut() {
+                                let _ = log.record(crate::agent::runlog::Event::Note {
+                                    seq: 0, // writer stamps the real seq
+                                    label: label.clone(),
+                                    body: String::new(),
+                                });
+                            }
                             made_edits_in_phase = false;
                             phase_todos_before = crate::agent::todo::snapshot();
                         }
@@ -1852,14 +2529,24 @@ where
                 && !verify_failed_now
                 && verify_attempts >= cfg.max_verify_attempts
             {
-                if let Some(t) = &turn.content {
+                let summary = design_evidence_summary(cfg, verify_passed, made_any_edits);
+                let final_text = if summary.is_empty() {
+                    turn.content
+                } else {
+                    Some(format!(
+                        "{}\n\n{summary}",
+                        turn.content.as_deref().unwrap_or("")
+                    ))
+                };
+                if let Some(t) = &final_text {
                     if !t.trim().is_empty() {
                         messages.push(Message::assistant(t.clone()));
                     }
                 }
                 return Ok(AgentOutcome {
-                    final_text: turn.content,
+                    final_text,
                     iters: iter + 1,
+                    verification: design_verification(cfg, verify_passed, made_any_edits),
                     stop: StopReason::VerificationFailed,
                 });
             }
@@ -1900,6 +2587,25 @@ where
                 }
             }
 
+            // REFRESH: — the model's final text opens with `REFRESH: <note>` when it judges the
+            // conversation too long/drifted to keep steering and asks for a fresh thread. Parse it
+            // here (before any gate can drag the run onward) and stop with a dedicated reason; the
+            // REPL distills a carry-over seed (smart: recent tail + touchpoints ledger) and reseeds.
+            if let Some(text) = turn.content.as_deref() {
+                let trimmed = text.trim_start();
+                if trimmed.starts_with("REFRESH:") {
+                    if !cfg.quiet {
+                        emit_trace("→ model requested a thread refresh (REFRESH:)");
+                    }
+                    return Ok(AgentOutcome {
+                        final_text: turn.content,
+                        iters: iter + 1,
+                        verification: design_verification(cfg, verify_passed, made_any_edits),
+                        stop: StopReason::Refresh,
+                    });
+                }
+            }
+
             // P0.1 INCOMPLETE-TODO GATE: text-only while session todos still open → poke, don't Done.
             // Empty list is a no-op (trivial tasks / model never used todos). Exhausted budget → Done.
             // Sub-agents leave enable_todo_poke false (process-global list ≠ ScopedTodo).
@@ -1917,7 +2623,7 @@ where
                         if crate::ui::tui::active() {
                             crate::ui::tui::emit_line(&line);
                         } else {
-                            eprintln!("{line}");
+                            emit_trace(&line);
                         }
                     }
                     demands.push(format!(
@@ -1939,7 +2645,7 @@ where
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(line);
                     } else {
-                        eprintln!("{line}");
+                        emit_trace(line);
                     }
                 }
                 demands.push(format!(
@@ -1963,6 +2669,7 @@ where
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                     images: Vec::new(),
+                    tool_images: Vec::new(),
                     cache_control: None,
                 });
                 let combined = if demands.len() == 1 {
@@ -1975,8 +2682,29 @@ where
                     )
                 };
                 messages.push(Message::user(combined));
+                // This turn returned TEXT (a "done" claim) and a gate is dragging the run onward —
+                // latch that, so the step-cap branch can tell "hit the cap mid-work" apart from
+                // "hit the cap right after saying done". Reset at the tool path (work continues).
+                last_turn_was_text_only = true;
                 iter += 1;
                 continue;
+            }
+
+            // Build/test demands above still run when visual setup is unavailable. The verdicts
+            // are independent; absence of screenshots must never skip functional verification.
+            if let Some(note) = visual_incomplete {
+                let text = format!(
+                    "{}\n\nVisual verification incomplete: {note}\n{}",
+                    turn.content.as_deref().unwrap_or(""),
+                    design_evidence_summary(cfg, verify_passed, made_any_edits)
+                );
+                messages.push(Message::assistant(text.clone()));
+                return Ok(AgentOutcome {
+                    final_text: Some(text),
+                    iters: iter + 1,
+                    verification: design_verification(cfg, verify_passed, made_any_edits),
+                    stop: StopReason::VerificationFailed,
+                });
             }
 
             // GOAL GATE (`/goal <text>`): the second key of goal mode's completion handshake. A turn
@@ -1995,7 +2723,7 @@ where
                         if crate::ui::tui::active() {
                             crate::ui::tui::emit_line(line);
                         } else {
-                            eprintln!("{line}");
+                            emit_trace(line);
                         }
                     }
                     // Record the premature stop (content or "") so history stays coherent, then poke.
@@ -2005,6 +2733,7 @@ where
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         images: Vec::new(),
+                        tool_images: Vec::new(),
                         cache_control: None,
                     });
                     messages.push(Message::user(format!(
@@ -2048,6 +2777,7 @@ where
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         images: Vec::new(),
+                        tool_images: Vec::new(),
                         cache_control: None,
                     });
                     messages.push(Message::user(crate::core::steer::format_injection(&steers)));
@@ -2056,19 +2786,33 @@ where
                 }
             }
 
+            let mut final_text = turn.content;
+            let evidence = design_evidence_summary(cfg, verify_passed, made_any_edits);
+            if !evidence.is_empty() {
+                let text = final_text.get_or_insert_with(String::new);
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&evidence);
+            }
             // Push the final assistant text so a multi-turn caller (REPL) keeps context.
-            if let Some(t) = &turn.content {
+            if let Some(t) = &final_text {
                 if !t.trim().is_empty() {
                     messages.push(Message::assistant(t.clone()));
                 }
             }
             return Ok(AgentOutcome {
-                final_text: turn.content,
+                final_text,
                 iters: iter + 1,
+                verification: design_verification(cfg, verify_passed, made_any_edits),
                 stop: StopReason::Done,
             });
         }
 
+        // Reaching the tool path means this turn HAS tool calls, i.e. work is genuinely continuing —
+        // reset the "said done" latch so a later text-only turn can re-arm it. (A tool turn may still
+        // carry content, so we cannot key the reset off `turn.content` being empty.)
+        last_turn_was_text_only = false;
         // DIVERGENCE (W1): a turn whose canonical signature exactly repeats the previous turn
         // (A,A) or completes a 2-cycle (A,B,A,B) is a SUSPECTED loop. On the FIRST flagged
         // occurrence we nudge but still EXECUTE the call, so its result novelty is judged by the
@@ -2094,18 +2838,21 @@ where
                     "Your recent attempts stopped producing new information. Give your best answer \
                      now from what you already established — including the cause you identified, if \
                      any — and say explicitly what is unverified or unfinished.",
+                    cfg,
                 )
                 .await;
                 return Ok(AgentOutcome {
-                    final_text,
+                    final_text: final_text.answer,
                     iters: iter + 1,
-                    stop: StopReason::Divergence,
+                    verification: design_verification(cfg, verify_passed, made_any_edits),
+                    stop: final_text.stop.unwrap_or(StopReason::Divergence),
                 });
             }
             // First flag for this signature: nudge, then fall through to execute so the progress
             // block can judge whether the repeat actually produced new information.
-            push_nudge(
+            push_nudge_as(
                 messages,
+                 cfg.nudge_role,
                 NUDGE_DIVERGENCE,
                 "You repeated the same tool call(s). If this is not producing NEW information, take a DIFFERENT approach or stop and explain what is blocking you.",
             );
@@ -2117,12 +2864,14 @@ where
         // `assistant.tool_calls` (strict gateways 400 on that). Real results overwrite the
         // placeholders as they land inside `execute_calls`.
         let calls = turn.tool_calls.clone();
+        let planned_calls = plan_execution_calls(registry, &calls, cfg);
         messages.push(Message {
             role: "assistant".to_string(),
             content: turn.content.clone(),
             tool_calls: calls.clone(),
             tool_call_id: None,
             images: Vec::new(),
+            tool_images: Vec::new(),
             cache_control: None,
         });
         let base = messages.len();
@@ -2133,94 +2882,129 @@ where
             ));
         }
 
-        // BASELINE CAPTURE: just before the first workspace mutation of this run, capture the
-        // current compiler state. The baseline is immutable; later turns only compare against it.
-        // Run only when the verify gate is armed, a baseline has not yet been taken, and the turn
-        // actually contains a write-capable call (skip for read-only turns to avoid paying the
-        // compiler invocation cost on every model turn).
-        if cfg.enable_verify_gate
-            && verify_baseline.is_none()
-            && calls.iter().any(|tc| {
-                if let Some(t) = registry.get(&tc.function.name) {
-                    let args = parse_call_args(&tc.function.arguments)
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    t.workspace_effect(&args).needs_checkpoint() || t.recovery_effect(&args)
-                } else {
-                    false
+        // Cache candidates only identify surviving history here. Filesystem validation happens at
+        // each read's boundary, after any preceding mutations; never inject a stale eager answer.
+        let cache_candidates: Vec<_> = calls
+            .iter()
+            .map(|tc| {
+                if tc.function.name != "file_read" {
+                    return None;
                 }
-            })
-        {
-            let cwd = cfg.effective_root();
-            let gate_dir = verify_gate::verify_root(&cwd).unwrap_or(cwd);
-            if let Some(result) =
-                verify_gate::run_verify_gate(&gate_dir, cfg.verify_gate_timeout_secs).await
-            {
-                verify_baseline = Some(verify_gate::baseline_from_result(&result));
-            }
-        }
-
-        // EXECUTE the call(s): barrier-partitioned — consecutive read-only calls run concurrently
-        // (spawn_blocking, raced against Esc); each write/shell call is a barrier executed alone
-        // with approval on THIS future. Eager starts from the streaming path are adopted by
-        // position. Results land in ORIGINAL call order. (A DISCARDED turn — divergence/error —
-        // simply drops its eager handles: detached, read-only, harmless.)
-        let mut eager = std::mem::take(&mut turn.eager);
-        // IDENTICAL-RE-READ SHORT-CIRCUIT: a `file_read` whose canonical args exactly match an
-        // earlier call this run, whose file bytes are unchanged, and whose earlier result is still
-        // verbatim in history would return byte-identical content the model already has. Answer it
-        // with a one-line pointer instead — injected through the eager-adoption path so traces,
-        // ordering and cancellation stay uniform. (Measured sessions: 30% of tool calls re-hit a
-        // target already hit; the byte-identical subset is pure history bloat.) A real eager start
-        // for the same slot wins — its body already ran and its result is at least as good.
-        for (k, tc) in calls.iter().enumerate() {
-            if tc.function.name != "file_read" || eager.iter().any(|(i, _)| *i == k) {
-                continue;
-            }
-            let Some(entry) = read_cache.get(&canonical_args(&tc.function.arguments)) else {
-                continue;
-            };
-            let intact = messages.get(entry.msg_index).is_some_and(|m| {
-                m.role == "tool"
-                    && m.tool_call_id.as_deref() == Some(entry.call_id.as_str())
-                    && m.content.as_deref().is_some_and(|c| {
-                        c.chars().count() == entry.result_chars
-                            && c.starts_with(&entry.result_prefix)
+                read_cache_get(&read_cache_key(
+                    &read_cache_scope,
+                    &canonical_args(&tc.function.arguments),
+                ))
+                .filter(|entry| {
+                    messages.get(entry.msg_index).is_some_and(|m| {
+                        m.role == "tool"
+                            && m.tool_call_id.as_deref() == Some(entry.call_id.as_str())
+                            && m.content.as_deref().is_some_and(|c| {
+                                c.chars().count() == entry.result_chars
+                                    && c.starts_with(&entry.result_prefix)
+                            })
                     })
-            });
-            if !intact {
-                continue;
-            }
-            let unchanged = std::fs::read(&entry.path)
-                .map(|b| crate::core::persist::FileFingerprint::for_bytes(&b) == entry.fingerprint)
-                .unwrap_or(false);
-            if !unchanged {
-                continue;
-            }
-            let canned = format!(
-                "[unchanged] {} — identical to your earlier file_read this run; that result is \
-                 still in context above and the file has not changed since. Use what you already \
-                 have, or pass a different start/end for another slice.",
-                entry.path.display()
-            );
-            eager.push((k, tokio::task::spawn(async move { canned })));
-        }
+                })
+            })
+            .collect();
+        let eager = std::mem::take(&mut turn.eager);
         crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::ExecutingTools);
-        let results = execute_calls(
+        if let Some((row, note)) = cfg.step_note {
+            let names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+            note(row, iter, &names.join("+"));
+        }
+        let executions = execute_execution_calls(
             registry,
             &calls,
+            &planned_calls,
+            true,
             cfg,
             &mut messages[base..],
             eager,
             &mut auto_checkpointed,
             &mut writer_lease,
+            &mut verify_baseline,
+            &cache_candidates,
         )
         .await;
+        let results: Vec<_> = executions
+            .iter()
+            .map(|r| (r.call_id.clone(), r.outcome.text.clone()))
+            .collect();
         crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::WaitingModel);
 
-        // Arm the verify gate only if a destructive tool actually SUCCEEDED this turn — a
-        // denied/errored edit changed nothing, so it must not make the gate blame the tree.
-        let edited_this_turn = turn_made_edits(registry, &calls, &results);
+        // The typed outcome was classified before hooks/truncation. A successful empty body is
+        // still a success; call identity is never mistaken for the body or error.
+        if let Some(log) = runlog.as_mut() {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            for (tc, execution) in calls.iter().zip(&executions) {
+                let mut h = DefaultHasher::new();
+                tc.function.arguments.hash(&mut h);
+                let (result, error) = execution.log_result();
+                let _ = log.record(crate::agent::runlog::Event::Tool {
+                    seq: 0, // writer stamps the real seq
+                    name: tc.function.name.clone(),
+                    args_hash: h.finish(),
+                    result,
+                    error,
+                });
+            }
+        }
+
+        if let Some(execution) = executions
+            .iter()
+            .find(|execution| execution.effect_state != tools::ToolEffectState::Settled)
+        {
+            return Err(anyhow::Error::new(tools::ToolEffectsUnsettled(execution.effect_state))
+                .context(format!("call {} retained its actual tool result; the coordinating parent must inspect eventual effects", execution.call_id)));
+        }
+
+        check_background_effects()?;
+
+        if let Some(planning) = &mut planning {
+            for (call, execution) in calls.iter().zip(&executions) {
+                if call.function.name != "file_read" || execution.outcome.failure.is_some() {
+                    continue;
+                }
+                if let Some(prepared) = &execution.prepared {
+                    if let Some(path) = prepared
+                        .args
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        planning.observe_path(&cfg.effective_root(), std::path::Path::new(path));
+                    }
+                    if let Some(files) = prepared
+                        .args
+                        .get("files")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        for file in files {
+                            if let Some(path) = file.get("path").and_then(serde_json::Value::as_str)
+                            {
+                                planning.observe_path(
+                                    &cfg.effective_root(),
+                                    std::path::Path::new(path),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Settled actual mutations arm verification, including a delegated write followed by a
+        // failed child step. Denied/no-op calls without recorded changes do not arm it.
+        let edited_this_turn = calls.iter().zip(&executions).any(|(call, execution)| {
+            call.function.name != "native_owner_undo"
+                && registry
+                    .get(&call.function.name)
+                    .is_some_and(|tool| execution.changed_workspace(tool))
+        });
         if edited_this_turn {
+            if let Some(ctx) = cfg.exec_ctx.design() {
+                ctx.mark_render_changed();
+            }
             made_any_edits = true;
             // Fresh work invalidates any prior clean check — the gate must re-verify (W8).
             verify_passed = false;
@@ -2229,19 +3013,26 @@ where
             // same successful-op filter `turn_made_edits` used — matching the checkpoint's
             // `target_dir` discovery. A named path yields its parent dir; `None` (e.g. `shell_run`)
             // leaves the previous value, so the gate falls back to cwd only when nothing better exists.
-            for (tc, (_, result)) in calls.iter().zip(&results) {
+            for (tc, execution) in calls.iter().zip(&executions) {
+                let Some(prepared) = execution.prepared.as_ref() else {
+                    continue;
+                };
                 let Some(t) = registry.get(&tc.function.name) else {
                     continue;
                 };
-                if result.starts_with("error:")
-                    || result.starts_with(crate::agent::builtin::NOOP_WRITE_PREFIX)
-                {
+                if !execution.changed_workspace(t) {
                     continue;
                 }
-                let args = parse_call_args(&tc.function.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                if let Some(dir) = t.workspace_target(&args) {
+                if let Some(dir) = t.workspace_target_prepared(prepared) {
                     last_edit_dir = Some(dir);
+                }
+                for p in prepared_edit_paths(&cfg.effective_root(), &tc.function.name, prepared) {
+                    if let Some(planning) = &mut planning {
+                        planning.observe_path(&cfg.effective_root(), &p);
+                    }
+                    if !edited_paths.contains(&p) {
+                        edited_paths.push(p);
+                    }
                 }
             }
             // A successful edit belongs to the CURRENT phase. The checkpoint is no longer stamped
@@ -2250,6 +3041,95 @@ where
             // flag gates that stamp: a phase that only talked (todo flipped, no file change) captures
             // nothing.
             made_edits_in_phase = true;
+        }
+
+        // ASYNC DIAGNOSTICS FOLD + HARNESS CHECK. (1) Post-edit diagnostics jobs that outran their
+        // own edit result (the edit no longer waits more than 300 ms for them) land on this turn's
+        // LAST tool result, callers included. (2) Once `harness_check_after_edits` successful edits
+        // have landed, the loop runs the project's fast check itself and appends the verdict, so
+        // the model does not spend a round-trip on `cargo check` before continuing; a pass latches
+        // `verify_passed` (the done gate then skips its own run), a failure is shown and the gate
+        // stays armed. Both ride an existing tool result: a fresh message here would sit between
+        // an assistant `tool_calls` and its results, which strict gateways reject.
+        {
+            let mut extra: Vec<String> = crate::agent::lsp::LSP
+                .take_ready_feedback()
+                .into_iter()
+                .map(|f| f.text)
+                .collect();
+            if edited_this_turn {
+                edits_since_check += calls
+                    .iter()
+                    .zip(&executions)
+                    .filter(|(call, execution)| {
+                        call.function.name != "native_owner_undo"
+                            && registry
+                                .get(&call.function.name)
+                                .is_some_and(|t| execution.changed_workspace(t))
+                    })
+                    .count();
+            }
+            if cfg.enable_verify_gate
+                && cfg.harness_check_after_edits > 0
+                && edits_since_check >= cfg.harness_check_after_edits
+            {
+                edits_since_check = 0;
+                let cwd = cfg.effective_root();
+                let gate_dir = last_edit_dir
+                    .as_deref()
+                    .and_then(verify_gate::verify_root)
+                    .unwrap_or(cwd);
+                if let Some(result) = verify_gate::run_verify_gate_in_context(
+                    &gate_dir,
+                    cfg.verify_gate_timeout_secs,
+                    &cfg.exec_ctx,
+                )
+                .await
+                {
+                    if result.effect_state != tools::ToolEffectState::Settled {
+                        return Err(anyhow::Error::new(tools::ToolEffectsUnsettled(
+                            result.effect_state,
+                        ))
+                        .context(result.output));
+                    }
+                    let (ok, failure) = match &verify_baseline {
+                        Some(b) => {
+                            let d = verify_gate::compare_to_baseline(b, &result);
+                            if d.passed {
+                                (true, String::new())
+                            } else if d.new_diagnostics.is_empty() {
+                                (false, verify_gate::format_gate_failure(&result))
+                            } else {
+                                (false, verify_gate::format_delta_failure(&result, &d))
+                            }
+                        }
+                        None => (result.accepted(), verify_gate::format_gate_failure(&result)),
+                    };
+                    if !cfg.quiet {
+                        crate::ui::tui::verify_line(
+                            &result.command,
+                            if ok {
+                                "harness check passed after the edit batch"
+                            } else {
+                                "harness check FAILED after the edit batch"
+                            },
+                        );
+                    }
+                    if ok {
+                        verify_passed = true;
+                        extra.push(format!(
+                            "[harness check] `{}` passed after this edit batch — no separate check call is needed",
+                            result.command
+                        ));
+                    } else {
+                        extra.push(format!(
+                            "[harness check] `{}` FAILED after this edit batch:\n{failure}",
+                            result.command
+                        ));
+                    }
+                }
+            }
+            append_to_last_tool_result(&mut messages[base..], &extra);
         }
 
         // PHASE CHECKPOINT (replaces the old per-edit-turn snapshot). A "phase" is a unit of work the
@@ -2269,7 +3149,20 @@ where
                     &phase_todos_before,
                     &phase_todos_after,
                 ) {
-                    stamp_phase_checkpoint(cfg.quiet, &format!("phase: {label}"));
+                    stamp_phase_checkpoint(
+                        cfg,
+                        last_edit_dir.as_deref(),
+                        &format!("phase: {label}"),
+                    );
+                    // Run-log: record the phase boundary so a crash leaves a durable trace
+                    // of which phases completed (durable-run Phase 1).
+                    if let Some(log) = runlog.as_mut() {
+                        let _ = log.record(crate::agent::runlog::Event::Note {
+                            seq: 0, // writer stamps the real seq
+                            label: format!("phase: {label}"),
+                            body: String::new(),
+                        });
+                    }
                     made_edits_in_phase = false;
                 }
             }
@@ -2299,34 +3192,59 @@ where
                 let Ok(args) = parse_call_args(&tc.function.arguments) else {
                     continue;
                 };
-                // The batch (`files:[…]`) form mixes several files in one result — one fingerprint
-                // cannot attest to it. Only the single-path form is cached.
-                if args.get("files").is_some() {
+                // Both forms record: the single-path form as one (path, fingerprint) pair, the
+                // batch (`files:[…]`) form as one pair PER file — a later byte-identical repeat of
+                // the whole call is unchanged iff every file still matches. (The batch form used
+                // to be skipped outright, which made batched reads — the shape the coach pushes
+                // models toward — the one shape the short-circuit never helped.)
+                let mut raw_paths: Vec<&str> = Vec::new();
+                if let Some(files) = args.get("files").and_then(|v| v.as_array()) {
+                    for f in files {
+                        match f.get("path").and_then(|v| v.as_str()) {
+                            Some(p) => raw_paths.push(p),
+                            None => {
+                                raw_paths.clear();
+                                break;
+                            }
+                        }
+                    }
+                } else if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                    raw_paths.push(p);
+                }
+                if raw_paths.is_empty() {
                     continue;
                 }
-                let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let Ok(resolved) =
-                    crate::agent::builtin::confine(&cfg.effective_root(), path, true)
-                else {
-                    continue;
-                };
-                let Ok(bytes) = std::fs::read(&resolved) else {
-                    continue;
-                };
-                if read_cache.len() >= 512 {
-                    read_cache.clear(); // bounded; a dropped entry only costs a re-read
+                let mut files: Vec<(std::path::PathBuf, crate::core::persist::FileFingerprint)> =
+                    Vec::with_capacity(raw_paths.len());
+                for p in raw_paths {
+                    let Ok(resolved) =
+                        crate::agent::builtin::confine(&cfg.effective_root(), p, true)
+                    else {
+                        files.clear();
+                        break;
+                    };
+                    let Ok(bytes) = std::fs::read(&resolved) else {
+                        files.clear();
+                        break;
+                    };
+                    files.push((
+                        resolved,
+                        crate::core::persist::FileFingerprint::for_bytes(&bytes),
+                    ));
                 }
-                read_cache.insert(
-                    canonical_args(&tc.function.arguments),
+                if files.is_empty() {
+                    continue;
+                }
+                read_cache_insert(
+                    read_cache_key(&read_cache_scope, &canonical_args(&tc.function.arguments)),
                     ReadCacheEntry {
-                        path: resolved,
-                        fingerprint: crate::core::persist::FileFingerprint::for_bytes(&bytes),
+                        files,
+                        windows: read_windows(&args),
                         msg_index: base + k,
                         call_id: call_id.clone(),
                         result_chars: result.chars().count(),
                         result_prefix: result.chars().take(48).collect(),
+                        seq: READ_CACHE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     },
                 );
             }
@@ -2345,6 +3263,7 @@ where
                     | "codebase_search"
                     | "read_symbol"
                     | "memory_search"
+                    | "session_recall"
                     | "web_fetch"
                     | "web_search"
             ) || name.starts_with("lsp_")
@@ -2356,8 +3275,9 @@ where
         }
         if !batch_nudged && single_read_streak >= BATCH_COACH_AFTER {
             batch_nudged = true;
-            push_nudge(
+            push_nudge_as(
                 messages,
+                cfg.nudge_role,
                 NUDGE_BATCH,
                 "[batch] Your last few turns each made a single read-only call. Batch independent \
                  reads/searches into ONE turn as parallel tool calls — file_read takes \
@@ -2424,7 +3344,7 @@ where
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(&line);
                     } else {
-                        eprintln!("{line}");
+                        emit_trace(&line);
                     }
                 }
                 let open_block = if cfg.enable_todo_poke {
@@ -2453,18 +3373,21 @@ where
                 "Your recent attempts stopped producing new information. Give your best answer now \
                  from what you already established — including the cause you identified, if any — \
                  and say explicitly what is unverified or unfinished.",
+                cfg,
             )
             .await;
             return Ok(AgentOutcome {
-                final_text,
+                final_text: final_text.answer,
                 iters: iter + 1,
-                stop: StopReason::Divergence,
+                verification: design_verification(cfg, verify_passed, made_any_edits),
+                stop: final_text.stop.unwrap_or(StopReason::Divergence),
             });
         }
         if stall.should_nudge() {
             stall.mark_nudged();
-            push_nudge(
+            push_nudge_as(
                 messages,
+                 cfg.nudge_role,
                 NUDGE_STUCK,
                 "Recent turns added no new evidence (no new result, failure class, completed todo, \
                  or successful edit). STOP retrying variations. Re-read the exact state, take a \
@@ -2483,13 +3406,13 @@ where
                 cfg.conf_high,
                 cfg.conf_spike_delta,
             );
-            if cfg.enable_hill_climb {
-                if todo::snapshot().iter().any(|t| {
+            if cfg.enable_hill_climb
+                && todo::snapshot().iter().any(|t| {
                     t.status != todo::Status::Done
                         && t.hill_climbable.is_some_and(|h| h < cfg.hill_climb_gate)
-                }) {
-                    hill_climb_on = true;
-                }
+                })
+            {
+                hill_climb_on = true;
             }
         }
 
@@ -2498,8 +3421,9 @@ where
             if !hill_climb_reframed {
                 hill_climb_reframed = true;
                 last_hill_climb_reminder = iter;
-                push_nudge(
+                push_nudge_as(
                     messages,
+                    cfg.nudge_role,
                     NUDGE_HILL_CLIMB,
                     "[hill-climb] This goal looks quantifiable. Before more edits, state:\n\
                      1) metric (e.g. ns/op, pass count, binary KB),\n\
@@ -2512,8 +3436,9 @@ where
                 && todo::has_incomplete()
             {
                 last_hill_climb_reminder = iter;
-                push_nudge(
+                push_nudge_as(
                     messages,
+                     cfg.nudge_role,
                     NUDGE_HILL_CLIMB,
                     "[hill-climb] Re-measure the metric before claiming progress. No metric delta → \
                      try a different approach or stop.",
@@ -2529,11 +3454,12 @@ where
         // Gated on a clarify call actually firing this turn (not just "is the cell non-empty") so a
         // turn that never asked can't drain a stale value.
         if calls.iter().any(|c| c.function.name == clarify::NAME) {
-            if let Some(question) = clarify::take_pending() {
+            if let Some(ask) = clarify::take_pending() {
                 return Ok(AgentOutcome {
                     final_text: None,
                     iters: iter,
-                    stop: StopReason::AwaitingInput(question),
+                    verification: design_verification(cfg, verify_passed, made_any_edits),
+                    stop: StopReason::AwaitingInput(ask),
                 });
             }
         }
@@ -2562,7 +3488,7 @@ where
                         break;
                     }
                 }
-                push_nudge(messages, NUDGE_TODO, text.trim_end());
+                push_nudge_as(messages, cfg.nudge_role, NUDGE_TODO, text.trim_end());
                 last_todo_reminder = iter;
             }
         }
@@ -2577,37 +3503,66 @@ where
         "You have reached the step limit and cannot call any more tools. Summarize what you \
          accomplished and give your best final answer now from what you already have; explicitly \
          flag anything you could not verify or finish.",
+        cfg,
     )
     .await;
     Ok(AgentOutcome {
-        final_text,
+        final_text: final_text.answer,
         iters: iter,
-        stop: StopReason::MaxIters,
+        verification: design_verification(cfg, verify_passed, made_any_edits),
+        stop: final_text.stop.unwrap_or(StopReason::MaxIters),
     })
 }
 
 /// Spend one tool-free call on a best-effort answer. The reason prompt lives only on a throwaway
 /// clone; only a non-empty answer is appended to real history, preserving tool-call pairing.
+#[derive(Debug)]
+struct SynthesisOutcome {
+    answer: Option<String>,
+    stop: Option<StopReason>,
+}
+
 async fn synthesize_final<F, Fut>(
     chat: &F,
     messages: &mut Vec<Message>,
     why: &str,
-) -> Option<String>
+    cfg: &AgentConfig,
+) -> SynthesisOutcome
 where
     F: Fn(Vec<Message>, Vec<ToolDef>) -> Fut,
     Fut: Future<Output = Result<ChatTurn>>,
 {
+    if cfg.cancel.is_cancelled() {
+        return SynthesisOutcome {
+            answer: None,
+            stop: Some(StopReason::Cancelled),
+        };
+    }
+    let ceiling = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let deadline = cfg.deadline.map_or(ceiling, |d| d.min(ceiling));
+    if std::time::Instant::now() >= deadline {
+        return SynthesisOutcome {
+            answer: None,
+            stop: Some(StopReason::Deadline),
+        };
+    }
     let mut synth = messages.clone();
     synth.push(Message::user(why));
-    let answer = chat(synth, Vec::new())
-        .await
+    let turn = tokio::select! {
+        biased;
+        _ = cfg.cancel.cancelled() => return SynthesisOutcome { answer: None, stop: Some(StopReason::Cancelled) },
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) =>
+            return SynthesisOutcome { answer: None, stop: Some(StopReason::Deadline) },
+        result = chat(synth, Vec::new()) => result,
+    };
+    let answer = turn
         .ok()
         .and_then(|turn| turn.content)
         .filter(|text| !text.trim().is_empty());
     if let Some(ref text) = answer {
         messages.push(Message::assistant(text.clone()));
     }
-    answer
+    SynthesisOutcome { answer, stop: None }
 }
 
 /// Hard cap on concurrent tool executions in a parallel run. Conservative for a single-binary
@@ -2630,9 +3585,18 @@ fn safe_tool_ceiling() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+fn safe_tool_deadline(cfg: &AgentConfig) -> tokio::time::Instant {
+    let ceiling = tokio::time::Instant::now() + safe_tool_ceiling();
+    cfg.deadline
+        .map(tokio::time::Instant::from_std)
+        .map_or(ceiling, |d| d.min(ceiling))
+}
+
 /// The pre-fill placeholder for a tool result whose call never completed (the turn future was
 /// dropped mid-batch by Esc). Honest AND pairing-valid — strict gateways accept the history.
 const INTERRUPTED_TOOL_PLACEHOLDER: &str = "error: interrupted before completion";
+const UNSETTLED_TOOL_SKIP: &str =
+    "error: tool was not started because earlier worker effects remain unsettled";
 
 /// Execute a turn's tool calls, returning `(tool_call_id, result_text)` in ORIGINAL call order,
 /// writing each result into `sink` (the pre-filled placeholder messages, one per call) the moment
@@ -2649,15 +3613,212 @@ const INTERRUPTED_TOOL_PLACEHOLDER: &str = "error: interrupted before completion
 /// observed, every remaining call reports "cancelled" without executing — the results vec is
 /// always complete and position-aligned (deliberately NOT id-keyed: gateways emit duplicate/empty
 /// ids).
+#[cfg(test)]
 async fn execute_calls(
     registry: &ToolRegistry,
     calls: &[ToolCall],
     cfg: &AgentConfig,
     sink: &mut [Message],
-    eager: Vec<(usize, tokio::task::JoinHandle<String>)>,
+    eager: Vec<(usize, tools::StartedSafeCall)>,
     auto_checkpointed: &mut bool,
     writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
 ) -> Vec<(String, String)> {
+    let scoped = match pin_placement_context(cfg) {
+        Ok(scoped) => scoped,
+        Err(error) => {
+            let text = format!("error: file placement unavailable: {error}");
+            for message in sink.iter_mut() {
+                message.content = Some(text.clone());
+            }
+            return calls
+                .iter()
+                .map(|call| (call.id.clone(), text.clone()))
+                .collect();
+        }
+    };
+    let planned = plan_execution_calls(registry, calls, &scoped);
+    execute_execution_calls(
+        registry,
+        calls,
+        &planned,
+        true,
+        &scoped,
+        sink,
+        eager,
+        auto_checkpointed,
+        writer_lease,
+        &mut None,
+        &[],
+    )
+    .await
+    .into_iter()
+    .map(|r| (r.call_id, r.outcome.observation.text))
+    .collect()
+}
+
+fn unstarted_tool_error(cfg: &AgentConfig) -> Option<&'static str> {
+    if cfg.cancel.is_cancelled() {
+        Some("error: cancelled by user")
+    } else if cfg.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        Some("error: absolute run deadline elapsed; tool was not started")
+    } else {
+        None
+    }
+}
+
+fn plan_execution_calls(
+    registry: &ToolRegistry,
+    calls: &[ToolCall],
+    cfg: &AgentConfig,
+) -> Vec<Result<tools::PreparedToolCall, String>> {
+    calls
+        .iter()
+        .map(|call| {
+            let (args, repair) = prepare_call_args(registry, call)?;
+            if let Some(what) = repair {
+                if !cfg.quiet {
+                    emit_trace(&format!("→ {}: {what}", call.function.name));
+                }
+            }
+            match registry.get(&call.function.name) {
+                Some(tool) => tool
+                    .plan_call(&args, &cfg.exec_ctx)
+                    .map_err(|error| format!("error: {error}")),
+                None => Ok(tools::PreparedToolCall::new(args)),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn prepare_execution_calls(
+    registry: &ToolRegistry,
+    calls: &[ToolCall],
+    cfg: &AgentConfig,
+) -> Vec<Result<tools::PreparedToolCall, String>> {
+    calls
+        .iter()
+        .map(|call| {
+            let (args, repair) = prepare_call_args(registry, call)?;
+            if let Some(what) = repair {
+                if !cfg.quiet {
+                    emit_trace(&format!("→ {}: {what}", call.function.name));
+                }
+            }
+            match registry.get(&call.function.name) {
+                Some(tool) => tool
+                    .prepare_call(&args, &cfg.exec_ctx)
+                    .map_err(|error| format!("error: {error}")),
+                None => Ok(tools::PreparedToolCall::new(args)),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn effective_calls(
+    calls: &[ToolCall],
+    prepared: &[Result<tools::PreparedToolCall, String>],
+) -> Vec<ToolCall> {
+    calls
+        .iter()
+        .zip(prepared)
+        .map(|(call, prepared)| {
+            let mut effective = call.clone();
+            if let Ok(prepared) = prepared {
+                effective.function.arguments = prepared.args.to_string();
+            }
+            effective
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Regression adapter mirrors the production dispatch boundary"
+)]
+async fn execute_prepared_calls(
+    registry: &ToolRegistry,
+    calls: &[ToolCall],
+    parsed: &[Result<tools::PreparedToolCall, String>],
+    cfg: &AgentConfig,
+    sink: &mut [Message],
+    eager: Vec<(usize, tools::StartedSafeCall)>,
+    auto_checkpointed: &mut bool,
+    writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
+) -> Vec<(String, String)> {
+    execute_execution_calls(
+        registry,
+        calls,
+        parsed,
+        false,
+        cfg,
+        sink,
+        eager,
+        auto_checkpointed,
+        writer_lease,
+        &mut None,
+        &[],
+    )
+    .await
+    .into_iter()
+    .map(|r| (r.call_id, r.outcome.observation.text))
+    .collect()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Dispatch keeps cancellation, writer authority, history and verification state explicit"
+)]
+async fn execute_execution_calls(
+    registry: &ToolRegistry,
+    calls: &[ToolCall],
+    planned: &[Result<tools::PreparedToolCall, String>],
+    bind_at_boundary: bool,
+    cfg: &AgentConfig,
+    sink: &mut [Message],
+    eager: Vec<(usize, tools::StartedSafeCall)>,
+    auto_checkpointed: &mut bool,
+    writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
+    verify_baseline: &mut Option<verify_gate::VerifyBaseline>,
+    cache_candidates: &[Option<ReadCacheEntry>],
+) -> Vec<tools::ToolExecution> {
+    execute_execution_calls_with_policy(
+        registry,
+        calls,
+        planned,
+        bind_at_boundary,
+        cfg,
+        sink,
+        eager,
+        auto_checkpointed,
+        writer_lease,
+        verify_baseline,
+        cache_candidates,
+        crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the production dispatch inputs explicit with one internal scheduling policy"
+)]
+async fn execute_execution_calls_with_policy(
+    registry: &ToolRegistry,
+    calls: &[ToolCall],
+    planned: &[Result<tools::PreparedToolCall, String>],
+    bind_at_boundary: bool,
+    cfg: &AgentConfig,
+    sink: &mut [Message],
+    eager: Vec<(usize, tools::StartedSafeCall)>,
+    auto_checkpointed: &mut bool,
+    writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
+    verify_baseline: &mut Option<verify_gate::VerifyBaseline>,
+    cache_candidates: &[Option<ReadCacheEntry>],
+    scoped_native_parallel: bool,
+) -> Vec<tools::ToolExecution> {
     debug_assert_eq!(
         sink.len(),
         calls.len(),
@@ -2669,61 +3830,315 @@ async fn execute_calls(
     let mut adopted: std::collections::HashSet<usize> = std::collections::HashSet::new();
     // The tool-call line `seq` opened at adoption, so the result can update THAT line in place.
     let mut adopted_seq: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
-    let mut eager: std::collections::HashMap<usize, tokio::task::JoinHandle<String>> =
+    let mut eager: std::collections::HashMap<usize, tools::StartedSafeCall> =
         eager.into_iter().collect();
-    // Parse every call's arguments ONCE — used for the safety partition, the gate, and the body.
-    //
-    // Argument-shape slips are repaired HERE, before anything reads the arguments. That ordering
-    // matters: `safe`, `workspace_effect` and `workspace_target` all inspect the arguments, so a
-    // `{"file": …}` corrected to `{"path": …}` after the partition would be classified — and
-    // checkpointed — against arguments the tool never saw. One chokepoint, both execution arms, so
-    // every tool in the registry is covered by the same repair. Fixes are traced, not silent.
-    let parsed: Vec<Result<serde_json::Value, String>> = calls
-        .iter()
-        .map(|tc| match prepare_call_args(registry, tc) {
-            Ok((args, repair)) => {
-                if let Some(what) = repair {
-                    if !cfg.quiet {
-                        if let Some(tool) = registry.get(&tc.function.name) {
-                            emit_trace(&format!("→ {}: {what}", tool.name()));
-                        }
-                    }
-                }
-                Ok(args)
-            }
-            Err(e) => Err(e),
-        })
-        .collect();
+    // Intent planning does not bind filesystem state. Each body keeps the exact preparation
+    // made at its execution boundary; original provider calls remain untouched.
+
+    let mut parsed = planned.to_vec();
+    for (&position, started) in &eager {
+        if let Some(prepared) = parsed.get_mut(position) {
+            *prepared = Ok(started.prepared().clone());
+        }
+    }
     let safe: Vec<bool> = calls
         .iter()
         .zip(&parsed)
         .map(|(tc, args)| match (registry.get(&tc.function.name), args) {
             // Unknown tool / bad args → barrier (the error string surfaces on the serial path).
-            (Some(t), Ok(a)) => !t.is_destructive() && t.is_concurrency_safe_for(a),
+            (Some(t), Ok(a)) => {
+                !t.is_destructive_prepared(a)
+                    && !t.may_return_images(a)
+                    && if a.delegation.is_some() {
+                        t.is_concurrency_safe_prepared(a)
+                    } else {
+                        t.is_concurrency_safe_for(a)
+                    }
+            }
             _ => false,
         })
         .collect();
 
     let n = calls.len();
-    let mut results: Vec<Option<String>> = (0..n).map(|_| None).collect();
-    let land = |k: usize, out: String, results: &mut Vec<Option<String>>, sink: &mut [Message]| {
-        sink[k].content = Some(out.clone());
+    let mut results: Vec<Option<tools::ToolOutcome>> = (0..n).map(|_| None).collect();
+    let land = |k: usize,
+                out: tools::ToolOutcome,
+                results: &mut Vec<Option<tools::ToolOutcome>>,
+                sink: &mut [Message]| {
+        sink[k].content = Some(out.observation.text.clone());
+        sink[k].tool_images = out.observation.images.clone();
         results[k] = Some(out);
     };
 
     let mut i = 0usize;
     let mut cancelled = false;
+    let mut background_stop = None;
     while i < n {
-        if cancelled || cfg.cancel.is_cancelled() {
+        if !cancelled {
+            if let Err(error) = check_background_effects() {
+                background_stop =
+                    Some((format!("error: {error:#}"), tool_error_effect_state(&error)));
+                cancelled = true;
+            }
+        }
+        if cancelled || unstarted_tool_error(cfg).is_some() {
             cancelled = true;
-            land(
-                i,
-                "error: cancelled by user".to_string(),
-                &mut results,
-                sink,
-            );
+            if let Some(started) = eager.remove(&i) {
+                let record = started.await.unwrap_or_else(|_| tools::ToolExecution {
+                    call_id: calls[i].id.clone(),
+                    prepared: None,
+                    outcome: tools::ToolOutcome::failed_with_effect_state(
+                        "error: tool watcher panicked or was cancelled; actual worker effects are unknown",
+                        tools::ToolEffectState::UnknownWorker,
+                    ),
+                });
+                if let Some(prepared) = record.prepared {
+                    parsed[i] = Ok(prepared);
+                }
+                land(i, record.outcome, &mut results, sink);
+            } else {
+                let outcome = if let Some((message, effect_state)) = &background_stop {
+                    tools::ToolOutcome::failed_with_effect_state(message.clone(), *effect_state)
+                } else {
+                    tools::ToolOutcome::failed(
+                        unstarted_tool_error(cfg).unwrap_or(UNSETTLED_TOOL_SKIP),
+                    )
+                };
+                land(i, outcome, &mut results, sink);
+            }
             i += 1;
             continue;
+        }
+        // Speculative scopes may overlap only inside a controller-seated common-base cohort.
+        // Direct native calls below retain their existing read/write conflict barriers.
+        let mut speculative = Vec::new();
+        for k in i..n.min(i + MAX_PARALLEL) {
+            let Some(tool) = registry.get_arc(&calls[k].function.name) else {
+                break;
+            };
+            if tool.name() != "task" || eager.contains_key(&k) {
+                break;
+            }
+            if bind_at_boundary && parsed[k].as_ref().is_ok_and(|p| p.delegation.is_none()) {
+                parsed[k] = tool
+                    .prepare_call(
+                        &planned[k]
+                            .as_ref()
+                            .expect("parsed task has planned args")
+                            .args,
+                        &cfg.exec_ctx,
+                    )
+                    .map_err(|error| format!("error: {error}"));
+            }
+            let Ok(prepared) = &parsed[k] else { break };
+            if task_tool::speculative_scope(prepared).is_none() {
+                break;
+            }
+            speculative.push((k, tool, prepared.clone()));
+        }
+        if !speculative.is_empty() {
+            let end = i + speculative.len();
+            let mut approved = Vec::new();
+            for (k, tool, prepared) in speculative {
+                if let Some(denied) = gate_prepared_and_approve(tool.as_ref(), &prepared, cfg) {
+                    land(
+                        k,
+                        note_unrun_prepared_call(tool.name(), &prepared, denied, cfg).into(),
+                        &mut results,
+                        sink,
+                    );
+                } else {
+                    approved.push((k, tool, prepared));
+                }
+            }
+            if !approved.is_empty() && cfg.enable_verify_gate && verify_baseline.is_none() {
+                let root = cfg.effective_root();
+                let gate_dir = verify_gate::verify_root(&root).unwrap_or(root);
+                if let Some(baseline) = verify_gate::run_verify_gate_in_context(
+                    &gate_dir,
+                    cfg.verify_gate_timeout_secs,
+                    &cfg.exec_ctx,
+                )
+                .await
+                {
+                    if baseline.effect_state != tools::ToolEffectState::Settled {
+                        for (k, tool, prepared) in approved.drain(..) {
+                            land(
+                                k,
+                                tools::ToolOutcome::failed_with_effect_state(
+                                    note_unrun_prepared_call(
+                                        tool.name(),
+                                        &prepared,
+                                        baseline.output.clone(),
+                                        cfg,
+                                    ),
+                                    baseline.effect_state,
+                                ),
+                                &mut results,
+                                sink,
+                            );
+                        }
+                        cancelled = true;
+                    } else {
+                        *verify_baseline = Some(verify_gate::baseline_from_result(&baseline));
+                    }
+                }
+            }
+            if !approved.is_empty() {
+                for (k, prepared, outcome) in speculation::run_task_cohort(approved, cfg).await {
+                    parsed[k] = Ok(prepared);
+                    if outcome.effect_state != tools::ToolEffectState::Settled {
+                        cancelled = true;
+                    }
+                    land(k, outcome, &mut results, sink);
+                }
+            }
+            i = end;
+            continue;
+        }
+        if scoped_native_parallel {
+            let mut batch = Vec::new();
+            let mut occupied: Vec<crate::core::native_scope::NativeWriteScope> = Vec::new();
+            for k in i..n.min(i + MAX_PARALLEL) {
+                let Some(tool) = registry.get_arc(&calls[k].function.name) else {
+                    break;
+                };
+                if tool.name() == "task"
+                    && bind_at_boundary
+                    && parsed[k]
+                        .as_ref()
+                        .is_ok_and(|prepared| prepared.delegation.is_none())
+                {
+                    parsed[k] = tool
+                        .prepare_call(
+                            &planned[k]
+                                .as_ref()
+                                .expect("parsed task has planned args")
+                                .args,
+                            &cfg.exec_ctx,
+                        )
+                        .map_err(|error| format!("error: {error}"));
+                }
+                let Ok(prepared) = &parsed[k] else {
+                    break;
+                };
+                let Some(scope) = tool.parallel_native_scope_prepared(prepared) else {
+                    break;
+                };
+                if eager.contains_key(&k)
+                    || tool.may_return_images(&prepared.args)
+                    || scope.check_narrowing(&scope).is_err()
+                    || occupied.iter().any(|other| scope.conflicts(other))
+                {
+                    break;
+                }
+                occupied.push(scope);
+                batch.push((k, tool, prepared.clone()));
+            }
+            if !batch.is_empty() {
+                // Separate destructive admission: every frozen scope passes hooks/approval BEFORE
+                // any mutation launch. Do not put writers through the abandoning read watcher.
+                let end = i + batch.len();
+                let mut started = Vec::new();
+                let mut approved = Vec::new();
+                for (k, tool, prepared) in batch {
+                    if let Some(denied) = gate_prepared_and_approve(tool.as_ref(), &prepared, cfg) {
+                        land(
+                            k,
+                            note_unrun_prepared_call(tool.name(), &prepared, denied, cfg).into(),
+                            &mut results,
+                            sink,
+                        );
+                    } else {
+                        approved.push((k, tool, prepared));
+                    }
+                }
+                let first_writer = approved
+                    .iter()
+                    .position(|(_, tool, prepared)| tool.is_destructive_prepared(prepared));
+                if let Some(writer) =
+                    first_writer.filter(|_| cfg.enable_verify_gate && verify_baseline.is_none())
+                {
+                    let root = approved[writer]
+                        .1
+                        .workspace_target_prepared(&approved[writer].2)
+                        .unwrap_or_else(|| cfg.effective_root());
+                    let gate_dir = verify_gate::verify_root(&root).unwrap_or(root);
+                    if let Some(result) = verify_gate::run_verify_gate_in_context(
+                        &gate_dir,
+                        cfg.verify_gate_timeout_secs,
+                        &cfg.exec_ctx,
+                    )
+                    .await
+                    {
+                        if result.effect_state != tools::ToolEffectState::Settled {
+                            for (k, tool, prepared) in approved.drain(..) {
+                                land(
+                                    k,
+                                    tools::ToolOutcome::failed_with_effect_state(
+                                        note_unrun_prepared_call(
+                                            tool.name(),
+                                            &prepared,
+                                            result.output.clone(),
+                                            cfg,
+                                        ),
+                                        result.effect_state,
+                                    ),
+                                    &mut results,
+                                    sink,
+                                );
+                            }
+                            cancelled = true;
+                        } else {
+                            *verify_baseline = Some(verify_gate::baseline_from_result(&result));
+                        }
+                    }
+                }
+                for (k, tool, prepared) in approved {
+                    let cancel = cfg.cancel.clone();
+                    let exec_ctx = cfg.exec_ctx.clone();
+                    let body_args = prepared.clone();
+                    let quiet = cfg.quiet && !crate::ui::events::on();
+                    let budgets = cfg.result_budgets();
+                    started.push((
+                        k,
+                        tools::StartedSafeCall::start_settling_mutation(
+                            calls[k].id.clone(),
+                            prepared,
+                            cancel.clone(),
+                            safe_tool_deadline(cfg),
+                            cfg.exec_ctx.tool_workers(),
+                            move || {
+                                crate::core::cancel::with_current(cancel, || {
+                                    crate::core::exec_ctx::with_current(exec_ctx, || {
+                                        run_prepared_tool_body(
+                                            tool, &body_args, quiet, budgets, None,
+                                        )
+                                    })
+                                })
+                            },
+                        ),
+                    ));
+                }
+                for (k, handle) in started {
+                    let record = handle.await.unwrap_or_else(|_| tools::ToolExecution {
+                        call_id: calls[k].id.clone(), prepared: None,
+                        outcome: tools::ToolOutcome::failed_with_effect_state(
+                            "error: mutation watcher failed; actual effects may be applied; inspect journal before retrying",
+                            tools::ToolEffectState::UnknownWorker,
+                        ),
+                    });
+                    if let Some(prepared) = record.prepared {
+                        parsed[k] = Ok(prepared);
+                    }
+                    if record.outcome.effect_state != tools::ToolEffectState::Settled {
+                        cancelled = true;
+                    }
+                    land(k, record.outcome, &mut results, sink);
+                }
+                i = end;
+                continue;
+            }
         }
         if safe[i] {
             // A concurrent run of consecutive safe calls, windowed at MAX_PARALLEL.
@@ -2733,74 +4148,151 @@ async fn execute_calls(
             }
             'windows: for start in (i..j).step_by(MAX_PARALLEL) {
                 let end = (start + MAX_PARALLEL).min(j);
-                let handles: Vec<(usize, tokio::task::JoinHandle<String>)> = (start..end)
-                    .map(|k| {
-                        // ADOPT an eager start when the streaming path already launched this call
-                        // (its body ran quiet — emit the standard trace here so the UX is uniform).
-                        if let Some(h) = eager.remove(&k) {
-                            adopted.insert(k);
-                            if !cfg.quiet {
-                                if let (Some(tool), Ok(args)) =
-                                    (registry.get(&calls[k].function.name), &parsed[k])
-                                {
-                                    adopted_seq.insert(k, emit_tool_call(tool.name(), args));
-                                }
+                let mut handles = Vec::new();
+                for k in start..end {
+                    if let Some(h) = eager.remove(&k) {
+                        parsed[k] = Ok(h.prepared().clone());
+                        adopted.insert(k);
+                        if !cfg.quiet || crate::ui::events::on() {
+                            if let (Some(tool), Ok(args)) =
+                                (registry.get(&calls[k].function.name), &parsed[k])
+                            {
+                                let dispatch = cfg.exec_ctx.dispatch_label();
+                                adopted_seq.insert(
+                                    k,
+                                    emit_prepared_tool_call(tool.name(), args, dispatch.as_deref()),
+                                );
                             }
-                            return (k, h);
                         }
-                        let tool = registry
-                            .get_arc(&calls[k].function.name)
-                            .expect("safe ⇒ known");
-                        let args = parsed[k].clone().expect("safe ⇒ parsed");
-                        let quiet = cfg.quiet;
-                        let max = cfg.max_tool_result_chars;
-                        let max_fetch = cfg.max_fetch_result_chars;
-                        let cancel = cfg.cancel.clone();
-                        let exec_ctx = cfg.exec_ctx.clone();
-                        (
-                            k,
-                            tokio::task::spawn_blocking(move || {
-                                crate::core::cancel::with_current(cancel, || {
-                                    crate::core::exec_ctx::with_current(exec_ctx, || {
-                                        run_tool_body(tool, &args, quiet, max, max_fetch)
-                                    })
-                                })
-                            }),
-                        )
-                    })
-                    .collect();
-                for (k, h) in handles {
-                    let out = tokio::select! {
-                        r = h => r.unwrap_or_else(|_| "error: tool thread panicked".to_string()),
-                        _ = cfg.cancel.cancelled() => {
-                            // The blocking body keeps running detached; safe calls are read-only,
-                            // so discarding the result is harmless.
-                            "error: cancelled by user".to_string()
-                        }
-                        // FLOOR CEILING for tools with no wall clock of their own (a hung network
-                        // file read, a stalled index lock). Same discard rationale as the cancel
-                        // arm: this path holds only read-only bodies, so abandoning the thread
-                        // loses nothing but the answer. Destructive tools run on the barrier path,
-                        // which stays deliberately un-raced — their real outcome must be recorded.
-                        _ = tokio::time::sleep(safe_tool_ceiling()) => {
-                            format!(
-                                "error: tool call exceeded {}s and was abandoned (set \
-                                 AIZEN_TOOL_CALL_SECS to raise the ceiling)",
-                                safe_tool_ceiling().as_secs()
+                        handles.push((k, h));
+                        continue;
+                    }
+                    if let Some(error) = unstarted_tool_error(cfg) {
+                        land(k, tools::ToolOutcome::failed(error), &mut results, sink);
+                        continue;
+                    }
+                    let tool = registry
+                        .get_arc(&calls[k].function.name)
+                        .expect("safe ⇒ known");
+                    if bind_at_boundary && parsed[k].as_ref().is_ok_and(|p| p.delegation.is_none())
+                    {
+                        parsed[k] = tool
+                            .prepare_call(
+                                &planned[k].as_ref().expect("safe ⇒ planned").args,
+                                &cfg.exec_ctx,
                             )
+                            .map_err(|e| format!("error: {e}"));
+                    }
+                    let args = match &parsed[k] {
+                        Ok(args) => args.clone(),
+                        Err(error) => {
+                            land(k, tools::ToolOutcome::failed(error), &mut results, sink);
+                            continue;
                         }
                     };
-                    if adopted.contains(&k) && !cfg.quiet {
+                    // Preparation cannot widen the read-only scheduling grant.
+                    if tool.is_destructive_prepared(&args)
+                        || tool.may_return_images(&args.args)
+                        || !tool.is_concurrency_safe_prepared(&args)
+                    {
+                        land(
+                            k,
+                            tools::ToolOutcome::failed(
+                                "error: prepared capability changed; dispatch again as a barrier",
+                            ),
+                            &mut results,
+                            sink,
+                        );
+                        continue;
+                    }
+                    let quiet = cfg.quiet && !crate::ui::events::on();
+                    let budgets = cfg.result_budgets();
+                    let deadline = safe_tool_deadline(cfg);
+                    let delegated = args.delegation.is_some();
+                    let cancel = if delegated {
+                        cfg.cancel.child()
+                    } else {
+                        cfg.cancel.clone()
+                    };
+                    let exec_ctx = if delegated {
+                        cfg.exec_ctx
+                            .clone()
+                            .with_deadline(Some(deadline.into_std()))
+                    } else {
+                        cfg.exec_ctx.clone()
+                    };
+                    let body_args = args.clone();
+                    let cache = cache_candidates
+                        .get(k)
+                        .cloned()
+                        .flatten()
+                        .map(|entry| (entry, cfg.effective_root()));
+                    let body_cancel = cancel.clone();
+                    let body = move || {
+                        crate::core::cancel::with_current(body_cancel, || {
+                            crate::core::exec_ctx::with_current(exec_ctx, || {
+                                run_prepared_tool_body_cached(
+                                    tool, &body_args, quiet, budgets, None, cache,
+                                )
+                            })
+                        })
+                    };
+                    let started = if delegated {
+                        tools::StartedSafeCall::start_delegated(
+                            calls[k].id.clone(),
+                            args,
+                            cancel,
+                            deadline,
+                            cfg.exec_ctx.tool_workers(),
+                            body,
+                        )
+                    } else {
+                        tools::StartedSafeCall::start(
+                            calls[k].id.clone(),
+                            args,
+                            cancel,
+                            deadline,
+                            cfg.exec_ctx.tool_workers(),
+                            body,
+                        )
+                    };
+                    handles.push((k, started));
+                }
+                for (k, h) in handles {
+                    let record = h.await.unwrap_or_else(|_| tools::ToolExecution {
+                        call_id: calls[k].id.clone(),
+                        prepared: None,
+                        outcome: tools::ToolOutcome::failed_with_effect_state(
+                            "error: tool watcher panicked or was cancelled; actual worker effects are unknown",
+                            tools::ToolEffectState::UnknownWorker,
+                        ),
+                    });
+                    if let Some(prepared) = record.prepared {
+                        parsed[k] = Ok(prepared);
+                    }
+                    let out = record.outcome;
+                    if adopted.contains(&k) && (!cfg.quiet || crate::ui::events::on()) {
                         // Eager body ran quiet; close the line opened at adoption (matched by seq).
                         let seq = adopted_seq.get(&k).copied().unwrap_or(0);
                         if let Ok(args) = &parsed[k] {
                             // Eager-adopted parallel body: no per-call wall-clock to attribute here.
-                            emit_tool_result(seq, &calls[k].function.name, args, &out, None);
+                            let dispatch = cfg.exec_ctx.dispatch_label();
+                            emit_prepared_tool_result(
+                                seq,
+                                &calls[k].function.name,
+                                args,
+                                &out.text,
+                                None,
+                                dispatch.as_deref(),
+                            );
                         }
+                    }
+                    if out.effect_state != tools::ToolEffectState::Settled {
+                        cancelled = true;
                     }
                     land(k, out, &mut results, sink);
                 }
-                if cfg.cancel.is_cancelled() {
+                if cancelled || unstarted_tool_error(cfg).is_some() {
                     cancelled = true;
                     break 'windows;
                 }
@@ -2810,7 +4302,9 @@ async fn execute_calls(
                 if results[k].is_none() {
                     land(
                         k,
-                        "error: cancelled by user".to_string(),
+                        tools::ToolOutcome::failed(
+                            unstarted_tool_error(cfg).unwrap_or(UNSETTLED_TOOL_SKIP),
+                        ),
                         &mut results,
                         sink,
                     );
@@ -2818,41 +4312,121 @@ async fn execute_calls(
             }
             i = j;
         } else {
-            // BARRIER: gate + approve on this future, body un-raced in spawn_blocking.
+            // BARRIER: bind after earlier calls have completed, before approval or effects.
+            let name = calls[i].function.name.as_str();
+            if bind_at_boundary {
+                if let (Some(tool), Ok(intent)) = (registry.get(name), &planned[i]) {
+                    if intent.delegation.is_none() {
+                        parsed[i] = tool
+                            .prepare_call(&intent.args, &cfg.exec_ctx)
+                            .map_err(|e| format!("error: {e}"));
+                    }
+                }
+            }
             let out = match &parsed[i] {
-                Err(e) => e.clone(),
-                Ok(args) => match registry.get_arc(&calls[i].function.name) {
-                    None => format!("error: unknown tool '{}'", calls[i].function.name),
-                    Some(tool) => match gate_and_approve(tool.as_ref(), args, cfg) {
-                        Some(denied) => denied,
-                        None => {
-                            let effect = tool.workspace_effect(args);
-                            // WHERE the write lands (a directory), when the tool names a path. The
-                            // checkpoint gate below discovers the repository from here rather than
-                            // from cwd; see the comment at its `save_protected_change_in` call.
-                            let target_dir = tool.workspace_target(args);
-                            let lease_error = if writer_lease.is_none()
-                                && (matches!(
-                                    effect,
-                                    crate::agent::tools::WorkspaceEffect::Paths
-                                        | crate::agent::tools::WorkspaceEffect::OpaqueWorkspace
-                                ) || crate::features::timemachine::is_rewind_call(
-                                    tool.name(),
-                                    args,
-                                )) {
-                                // The lane's own root, not the process cwd: `serve` runs lanes
-                                // concurrently, so a cwd read here would take the lease on whichever
-                                // directory another lane happened to be working in.
-                                let cwd = cfg.effective_root();
-                                // 15s, not 5: transient contention (another aizen instance, an
-                                // autosave, the parallel test suite) must WAIT, not fail the edit
-                                // with a lease error the user can't act on. Esc still interrupts —
-                                // the cancel token is threaded into the wait loop.
-                                match crate::core::workspace_txn::WorkspaceWriterLease::acquire(
+                Err(e) => note_unrun_call(name, &serde_json::Value::Null, e.clone(), cfg).into(),
+                Ok(args) => match registry.get_arc(name) {
+                    None => note_unrun_prepared_call(
+                        name,
+                        args,
+                        format!("error: unknown tool '{name}'"),
+                        cfg,
+                    )
+                    .into(),
+                    Some(tool) => {
+                        match gate_prepared_and_approve(tool.as_ref(), args, cfg) {
+                            Some(denied) => {
+                                note_unrun_prepared_call(name, args, denied, cfg).into()
+                            }
+                            None => {
+                                let effect = tool.workspace_effect_prepared(args);
+                                // Only after approval: create pinned managed parents before resolving
+                                // the target lease or our stores create AIZEN_HOME as an ancestor.
+                                let mut baseline_effect = tools::ToolEffectState::Settled;
+                                let mut placement_error = unstarted_tool_error(cfg).map(str::to_owned)
+                                .or_else(|| if cfg.exec_ctx.native_scope().is_some() {
+                                    Ok(())
+                                } else {
+                                    ensure_approved_managed_destination(tool.as_ref(), args, &cfg.cancel)
+                                }.err().map(|error| {
+                                    format!("error: approved managed destination unavailable: {error}")
+                                }));
+                                // WHERE the write lands (a directory), when the tool names a path. The
+                                // checkpoint gate below discovers the repository from here rather than
+                                // from cwd; see the comment at its `save_protected_change_in` call.
+                                let target_dir = tool.workspace_target_prepared(args);
+                                let resource_only = cfg.exec_ctx.native_scope().is_some()
+                                    || tool.name() == "native_owner_undo"
+                                    || (args.delegation.is_some()
+                                        && matches!(tool.name(), "task" | "workflow"));
+                                if placement_error.is_none()
+                                    && cfg.exec_ctx.native_scope().is_none()
+                                    && tool.name() != "native_owner_undo"
+                                    && cfg.enable_verify_gate
+                                    && verify_baseline.is_none()
+                                    && effect.needs_checkpoint()
+                                {
+                                    let root =
+                                        target_dir.clone().unwrap_or_else(|| cfg.effective_root());
+                                    let gate_dir = verify_gate::verify_root(&root).unwrap_or(root);
+                                    if let Some(result) = verify_gate::run_verify_gate_in_context(
+                                        &gate_dir,
+                                        cfg.verify_gate_timeout_secs,
+                                        &cfg.exec_ctx,
+                                    )
+                                    .await
+                                    {
+                                        if result.effect_state != tools::ToolEffectState::Settled {
+                                            baseline_effect = result.effect_state;
+                                            placement_error = Some(result.output);
+                                        } else {
+                                            *verify_baseline =
+                                                Some(verify_gate::baseline_from_result(&result));
+                                        }
+                                    }
+                                }
+                                let needs_lease = !resource_only
+                                    && (matches!(
+                                        effect,
+                                        tools::WorkspaceEffect::Paths
+                                            | tools::WorkspaceEffect::OpaqueWorkspace
+                                    ) || (effect == tools::WorkspaceEffect::External
+                                        && target_dir.is_some()));
+                                let lease_root =
+                                    target_dir.clone().unwrap_or_else(|| cfg.effective_root());
+                                let additional_lease = if placement_error.is_none() && needs_lease && writer_lease.as_ref().is_some_and(|lease| {
+                                crate::core::workspace_txn::WorkspaceIdentity::discover_cached(&lease_root)
+                                    .map_or(true, |identity| identity.worktree_id != lease.identity().worktree_id)
+                            }) {
+                                Some(crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
+                                    &lease_root, std::time::Duration::from_secs(15), Some(&cfg.cancel),
+                                    tool.name(), &cfg.exec_ctx.resource_scope(),
+                                ))
+                            } else { None };
+                                let additional_lease_error = additional_lease.as_ref().and_then(|result| result.as_ref().err())
+                                .map(|error| format!("error: target worktree writer lease unavailable: {error:#}"));
+                                let lease_error = if placement_error.is_some() {
+                                    placement_error
+                                } else if additional_lease_error.is_some() {
+                                    additional_lease_error
+                                } else if writer_lease.is_none() && needs_lease {
+                                    // The lane's own root, not the process cwd: `serve` runs lanes
+                                    // concurrently, so a cwd read here would take the lease on whichever
+                                    // directory another lane happened to be working in.
+                                    let cwd =
+                                        target_dir.clone().unwrap_or_else(|| cfg.effective_root());
+                                    // 15s, not 5: transient contention (another aizen instance, an
+                                    // autosave, the parallel test suite) must WAIT, not fail the edit
+                                    // with a lease error the user can't act on. Esc still interrupts —
+                                    // the cancel token is threaded into the wait loop.
+                                    // Under THIS run's scope: a delegated child (a descendant
+                                    // scope) reenters it, a sibling lane or dispatch waits.
+                                    match crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
                                     &cwd,
                                     std::time::Duration::from_secs(15),
                                     Some(&cfg.cancel),
                                     tool.name(),
+                                    &cfg.exec_ctx.resource_scope(),
                                 ) {
                                     Ok(lease) => {
                                         *writer_lease = Some(lease);
@@ -2862,35 +4436,48 @@ async fn execute_calls(
                                         "error: workspace writer lease was not acquired: {e}"
                                     )),
                                 }
-                            } else {
-                                None
-                            };
-                            // `checkpoint` action=rewind IS the recovery path — never nest a pre-edit
-                            // snapshot of the broken tree before undoing it.
-                            let skip_pre_checkpoint =
-                                crate::features::timemachine::is_rewind_call(tool.name(), args);
-                            let checkpoint_error = if let Some(error) = lease_error {
-                                Some(error)
-                            } else if skip_pre_checkpoint {
-                                None
-                            } else if cfg.auto_checkpoint
-                                && !*auto_checkpointed
-                                && (effect.needs_checkpoint() || target_dir.is_some())
-                            {
-                                // Discover the work tree from WHERE THE WRITE LANDS, not from the
-                                // process's cwd. The two differ constantly — a session launched from
-                                // the home directory editing `Desktop/proj/src/x.js` — and asking the
-                                // wrong one produced both of this turn's failures: no repo at cwd
-                                // meant `External`, whose old arm refused the call outright with
-                                // "narrow the path" (meaningless when the sibling project IS the
-                                // target; and because the refusal was DETERMINISTIC the model
-                                // retried until the divergence guard killed the run), while the
-                                // fallback advice was to `git init` — in the user's HOME DIRECTORY,
-                                // with the real `.git` sitting one level down. Asked from the target
-                                // instead, that same write is an ordinary in-repo edit with full
-                                // rewind coverage. `None` (no path named, e.g. `shell_run`) keeps
-                                // the cwd-relative behavior.
-                                match crate::features::timemachine::save_protected_change_in(crate::features::timemachine::PRE_EDIT_LABEL, target_dir.as_deref()) {
+                                } else {
+                                    None
+                                };
+                                // `checkpoint` action=rewind IS the recovery path — never nest a pre-edit
+                                // snapshot of the broken tree before undoing it.
+                                let skip_pre_checkpoint = resource_only
+                                    || crate::features::timemachine::is_rewind_call(
+                                        tool.name(),
+                                        args,
+                                    );
+                                let checkpoint_error = if let Some(error) = lease_error {
+                                    Some(error)
+                                } else if skip_pre_checkpoint {
+                                    None
+                                } else if cfg.auto_checkpoint
+                                    && (effect.needs_checkpoint()
+                                        || (target_dir.is_some()
+                                            && !args.file.as_ref().is_some_and(|file| {
+                                                (file.destination.is_managed()
+                                                    || file.source_managed)
+                                                    && effect == tools::WorkspaceEffect::External
+                                            })))
+                                {
+                                    // Discover the work tree from WHERE THE WRITE LANDS, not from the
+                                    // process's cwd. The two differ constantly — a session launched from
+                                    // the home directory editing `Desktop/proj/src/x.js` — and asking the
+                                    // wrong one produced both of this turn's failures: no repo at cwd
+                                    // meant `External`, whose old arm refused the call outright with
+                                    // "narrow the path" (meaningless when the sibling project IS the
+                                    // target; and because the refusal was DETERMINISTIC the model
+                                    // retried until the divergence guard killed the run), while the
+                                    // fallback advice was to `git init` — in the user's HOME DIRECTORY,
+                                    // with the real `.git` sitting one level down. Asked from the target
+                                    // instead, that same write is an ordinary in-repo edit with full
+                                    // rewind coverage. `None` (no path named, e.g. `shell_run`) keeps
+                                    // the cwd-relative behavior.
+                                    let checkpoint_root =
+                                        target_dir.clone().unwrap_or_else(|| cfg.effective_root());
+                                    match crate::features::timemachine::save_for_in_context(
+                                    cfg.exec_ctx.recovery(), &checkpoint_root,
+                                    crate::features::timemachine::PRE_EDIT_LABEL, true, true, &cfg.exec_ctx,
+                                ) {
                                     Ok(None) => {
                                         // Two benign shapes, two honest messages: "not a repo" and
                                         // "no git executable" behave the same (checkpoints off, the
@@ -2918,7 +4505,6 @@ async fn execute_calls(
                                     }
                                     Ok(Some(snap)) => {
                                         *auto_checkpointed = true;
-                                        crate::features::timemachine::note_pre_edit(snap.id);
                                         crate::core::recovery::set_checkpoint(Some(snap.id));
                                         // Same snapshot, second reader: this is the tree THIS
                                         // session's changes are measured from, so another window can
@@ -2938,45 +4524,107 @@ async fn execute_calls(
                                         crate::features::timemachine::checkpoint_failure_hint(&e)
                                     )),
                                 }
-                            } else {
-                                None
-                            };
-                            if let Some(error) = checkpoint_error {
-                                error
-                            } else {
-                                let args = args.clone();
-                                let quiet = cfg.quiet;
-                                let max = cfg.max_tool_result_chars;
-                                let max_fetch = cfg.max_fetch_result_chars;
-                                let cancel = cfg.cancel.clone();
-                                let exec_ctx = cfg.exec_ctx.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    crate::core::cancel::with_current(cancel, || {
-                                        crate::core::exec_ctx::with_current(exec_ctx, || {
-                                            run_tool_body(tool, &args, quiet, max, max_fetch)
-                                        })
-                                    })
-                                })
-                                .await
-                                .unwrap_or_else(|_| "error: tool thread panicked".to_string())
+                                } else {
+                                    None
+                                };
+                                if let Some(error) = checkpoint_error {
+                                    tools::ToolOutcome::failed_with_effect_state(
+                                        note_unrun_prepared_call(name, args, error, cfg),
+                                        baseline_effect,
+                                    )
+                                } else {
+                                    let args = args.clone();
+                                    // A child's body is quiet on the transcript and loud on the JSON
+                                    // stream, where its calls are wanted and wear its label.
+                                    let quiet = cfg.quiet && !crate::ui::events::on();
+                                    let budgets = cfg.result_budgets();
+                                    let cancel = cfg.cancel.clone();
+                                    let exec_ctx = cfg.exec_ctx.clone();
+                                    let worker_lease = writer_lease.clone();
+                                    let worker_additional_lease = additional_lease
+                                        .as_ref()
+                                        .and_then(|result| result.as_ref().ok())
+                                        .cloned();
+                                    let image_destination = (tool.may_return_images(&args)
+                                        && cfg.tool_image_policy
+                                            == crate::llm::media::VisionPolicy::Supported)
+                                        .then(|| cfg.tool_image_destination.clone())
+                                        .flatten();
+                                    let launch_prepared = args.clone();
+                                    let worker = tools::workers::launch_prepared(
+                                        cfg.exec_ctx.tool_workers(),
+                                        &launch_prepared,
+                                        move || {
+                                            let _leases = (worker_lease, worker_additional_lease);
+                                            crate::core::cancel::with_current(cancel, || {
+                                                crate::core::exec_ctx::with_current(
+                                                    exec_ctx,
+                                                    || {
+                                                        run_prepared_tool_body(
+                                                            tool,
+                                                            &args,
+                                                            quiet,
+                                                            budgets,
+                                                            image_destination,
+                                                        )
+                                                    },
+                                                )
+                                            })
+                                        },
+                                        tools::ToolEffectState::PossiblyApplied(None),
+                                    );
+                                    match worker {
+                                        Ok(worker) => worker.await.map(|joined| joined.outcome)
+                                            .unwrap_or_else(|_| tools::ToolOutcome::failed_with_effect_state(
+                                                "error: tool-body supervisor stopped; effects may be applied",
+                                                tools::ToolEffectState::UnknownWorker,
+                                            )),
+                                        Err(error) => tools::ToolOutcome::failed(format!(
+                                            "error: tool launch refused; nothing started: {error:#}"
+                                        )),
+                                    }
+                                }
                             }
                         }
-                    },
+                    }
                 },
             };
+            if out.effect_state != tools::ToolEffectState::Settled {
+                cancelled = true;
+            }
             land(i, out, &mut results, sink);
             i += 1;
         }
     }
 
+    // Settled pre-start failures (cancel/deadline, admission or worker-side guards) still close
+    // their own approval question. Never consume a live uncertain worker's token here: only its
+    // actual body may publish a start later. Normal body/refusal emission already took the token.
+    if crate::ui::events::on() {
+        for (k, prepared) in parsed.iter().enumerate() {
+            if let (Ok(prepared), Some(outcome)) = (prepared, &results[k]) {
+                if outcome.effect_state == tools::ToolEffectState::Settled
+                    && prepared.approval_identity.is_pending()
+                {
+                    note_unrun_prepared_call(
+                        &calls[k].function.name,
+                        prepared,
+                        outcome.observation.text.clone(),
+                        cfg,
+                    );
+                }
+            }
+        }
+    }
     calls
         .iter()
+        .zip(parsed)
         .zip(results)
-        .map(|(tc, r)| {
-            (
-                tc.id.clone(),
-                r.unwrap_or_else(|| INTERRUPTED_TOOL_PLACEHOLDER.to_string()),
-            )
+        .map(|((tc, prepared), outcome)| tools::ToolExecution {
+            call_id: tc.id.clone(),
+            prepared: prepared.ok(),
+            outcome: outcome
+                .unwrap_or_else(|| tools::ToolOutcome::failed(INTERRUPTED_TOOL_PLACEHOLDER)),
         })
         .collect()
 }
@@ -2985,6 +4633,113 @@ async fn execute_calls(
 /// edit (result starts with `error:`) changed nothing, so it must NOT arm — otherwise the gate
 /// would run a typecheck and blame the agent for pre-existing breakage. `results` is in `calls`
 /// order (the `execute_calls` contract).
+/// Successful edit-tool calls among this turn's results: an error, a no-op and a dry-run wrote
+/// nothing, so they do not count toward the harness check.
+#[cfg(test)]
+fn successful_edit_calls(calls: &[ToolCall], results: &[(String, String)]) -> usize {
+    calls
+        .iter()
+        .zip(results)
+        .filter(|(tc, (_, r))| {
+            is_edit_tool(&tc.function.name)
+                && !r.starts_with("error:")
+                && !r.starts_with(builtin::NOOP_WRITE_PREFIX)
+                && !r.starts_with(builtin::DRY_RUN_PREFIX)
+        })
+        .count()
+}
+
+/// The file a successful edit call named, absolute: `path` as given when absolute, else under
+/// `root`. `None` for calls without a `path` (a patch, a move).
+fn edit_target_file(
+    root: &std::path::Path,
+    args: &serde_json::Value,
+) -> Option<std::path::PathBuf> {
+    let raw = args.get("path").and_then(|v| v.as_str())?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(raw);
+    Some(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    })
+}
+
+fn prepared_edit_paths(
+    root: &std::path::Path,
+    name: &str,
+    prepared: &tools::PreparedToolCall,
+) -> Vec<std::path::PathBuf> {
+    if name == "file_move" {
+        let Some(file) = prepared.file.as_ref() else {
+            return Vec::new();
+        };
+        let mut paths = Vec::new();
+        if !file.source_managed {
+            if let Some(source) = &file.source {
+                if source.actual_path().starts_with(root) {
+                    paths.push(source.actual_path().to_path_buf());
+                }
+            }
+        }
+        if !file.destination.is_managed() && file.destination.actual_path().starts_with(root) {
+            let destination = file.destination.actual_path().to_path_buf();
+            if !paths.contains(&destination) {
+                paths.push(destination);
+            }
+        }
+        paths
+    } else if let Some(changes) = &prepared.workspace_changes {
+        changes.paths()
+    } else if is_edit_tool(name) {
+        edit_target_file(root, &prepared.args).into_iter().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Append `extra` blocks to the LAST tool result of `turn` (this turn's messages after the
+/// assistant turn). Nothing is inserted between an assistant `tool_calls` and its results.
+fn append_to_last_tool_result(turn: &mut [Message], extra: &[String]) {
+    if extra.is_empty() {
+        return;
+    }
+    if let Some(m) = turn.iter_mut().rev().find(|m| m.role == "tool") {
+        let mut c = m.content.take().unwrap_or_default();
+        for e in extra {
+            c.push_str("\n\n");
+            c.push_str(e);
+        }
+        m.content = Some(c);
+    }
+}
+
+#[cfg(test)]
+fn turn_made_prepared_edits(
+    registry: &ToolRegistry,
+    calls: &[ToolCall],
+    prepared: &[Result<tools::PreparedToolCall, String>],
+    results: &[(String, String)],
+) -> bool {
+    calls
+        .iter()
+        .zip(prepared)
+        .zip(results)
+        .any(|((call, prepared), (_, result))| {
+            let (Some(tool), Ok(prepared)) = (registry.get(&call.function.name), prepared) else {
+                return false;
+            };
+            tool.workspace_effect_prepared(prepared).needs_checkpoint()
+                && !result.starts_with("error:")
+                && !result.starts_with(builtin::NOOP_WRITE_PREFIX)
+                && !result.starts_with(builtin::DRY_RUN_PREFIX)
+                && (call.function.name != "shell_run" || result.starts_with("exit 0"))
+        })
+}
+
+#[cfg(test)]
 fn turn_made_edits(
     registry: &ToolRegistry,
     calls: &[ToolCall],
@@ -3001,7 +4756,9 @@ fn turn_made_edits(
         }
         // A write tool that no-op'd (target already held identical content) wrote nothing to disk,
         // so it must not arm the verify gate (an unchanged tree can't have broken) — W16.
-        if result.starts_with(crate::agent::builtin::NOOP_WRITE_PREFIX) {
+        if result.starts_with(crate::agent::builtin::NOOP_WRITE_PREFIX)
+            || result.starts_with(crate::agent::builtin::DRY_RUN_PREFIX)
+        {
             return false;
         }
         // `shell_run` returns Ok("exit N\n…") even when the command FAILED (non-zero exit), so a
@@ -3024,15 +4781,14 @@ fn turn_made_edits(
 pub fn eager_starter<'a>(
     registry: &'a ToolRegistry,
     cfg: &'a AgentConfig,
-) -> impl Fn(usize, &ToolCall) -> Option<tokio::task::JoinHandle<String>> + Send + Sync + 'a {
+) -> impl Fn(usize, &ToolCall) -> Option<tools::StartedSafeCall> + Send + Sync + 'a {
     let barrier_hit = std::sync::atomic::AtomicBool::new(false);
     let started = std::sync::atomic::AtomicUsize::new(0);
-    let max_chars = cfg.max_tool_result_chars;
-    let max_fetch_chars = cfg.max_fetch_result_chars;
+    let budgets = cfg.result_budgets();
     let cancel = cfg.cancel.clone();
     move |_slot, tc| {
         use std::sync::atomic::Ordering::Relaxed;
-        if barrier_hit.load(Relaxed) {
+        if barrier_hit.load(Relaxed) || unstarted_tool_error(cfg).is_some() {
             return None;
         }
         // Eager execution is an OPTIMIZATION, never an obligation. Empty arguments here are almost
@@ -3052,7 +4808,10 @@ pub fn eager_starter<'a>(
         // normal path and unrepaired here).
         let ok = prepare_call_args(registry, tc).ok().and_then(|(args, _)| {
             let tool = registry.get_arc(&tc.function.name)?;
-            (!tool.is_destructive() && tool.is_concurrency_safe_for(&args)).then_some((tool, args))
+            (!tool.is_destructive()
+                && !tool.may_return_images(&args)
+                && tool.is_concurrency_safe_for(&args))
+            .then_some((tool, args))
         });
         let Some((tool, args)) = ok else {
             // First unsafe/unknown/unparseable call = the barrier: nothing after it starts early.
@@ -3069,30 +4828,86 @@ pub fn eager_starter<'a>(
         if started.fetch_add(1, Relaxed) >= MAX_PARALLEL {
             return None; // over the cap: run normally at execution time
         }
-        let turn_cancel = cancel.clone();
-        let turn_ctx = cfg.exec_ctx.clone();
-        Some(tokio::task::spawn_blocking(move || {
-            // Seed BOTH thread-locals, exactly like the two normal execution arms. Cancel alone
-            // used to be seeded here, so an eager-started body saw `exec_ctx::current() == None`
-            // and resolved its conversation identity from the process-global slot — the same
-            // tool body could answer under two identities depending on whether its arguments
-            // finished streaming early enough for a head start.
-            crate::core::exec_ctx::with_current(turn_ctx, || {
-                crate::core::cancel::with_current(turn_cancel, || {
-                    run_tool_body(tool, &args, true, max_chars, max_fetch_chars)
-                })
-            })
-        }))
+        let prepared = tool.prepare_call(&args, &cfg.exec_ctx).ok()?;
+        if tool.is_destructive_prepared(&prepared) || !tool.is_concurrency_safe_prepared(&prepared)
+        {
+            barrier_hit.store(true, Relaxed);
+            return None;
+        }
+        // A delegated (read-only `task`) eager call gets the SAME alignment as the parallel
+        // launcher: its own cancellation token and an execution context clamped to the observer
+        // deadline, so an expired observer stops this child instead of leaving it running unnoticed.
+        let deadline = safe_tool_deadline(cfg);
+        let delegated = prepared.delegation.is_some();
+        let turn_cancel = if delegated {
+            cancel.child()
+        } else {
+            cancel.clone()
+        };
+        let turn_ctx = if delegated {
+            cfg.exec_ctx
+                .clone()
+                .with_deadline(Some(deadline.into_std()))
+        } else {
+            cfg.exec_ctx.clone()
+        };
+        let body_args = prepared.clone();
+        let started = if delegated {
+            tools::StartedSafeCall::start_delegated(
+                tc.id.clone(),
+                prepared,
+                turn_cancel.clone(),
+                deadline,
+                cfg.exec_ctx.tool_workers(),
+                move || {
+                    crate::core::exec_ctx::with_current(turn_ctx, || {
+                        crate::core::cancel::with_current(turn_cancel, || {
+                            run_prepared_tool_body(tool, &body_args, true, budgets, None)
+                        })
+                    })
+                },
+            )
+        } else {
+            tools::StartedSafeCall::start(
+                tc.id.clone(),
+                prepared,
+                turn_cancel.clone(),
+                deadline,
+                cfg.exec_ctx.tool_workers(),
+                move || {
+                    crate::core::exec_ctx::with_current(turn_ctx, || {
+                        crate::core::cancel::with_current(turn_cancel, || {
+                            run_prepared_tool_body(tool, &body_args, true, budgets, None)
+                        })
+                    })
+                },
+            )
+        };
+        Some(started)
     }
 }
 
 /// Parse a call's STRINGIFIED arguments; empty → `{}`. Pure — shared by the safety partition and
 /// both execution paths (parsed exactly once per call).
 fn parse_call_args(raw: &str) -> Result<serde_json::Value, String> {
+    parse_call_args_traced(raw).map(|(v, _)| v)
+}
+
+/// `parse_call_args` plus a note when the strict parse failed and `lenient::repair_json_object`
+/// rescued it (trailing comma, raw newline in a string, brace cut by `max_tokens`, Python quotes).
+/// The note is traced by the executor so a repaired call is never silent; junk that no repair turns
+/// into an object keeps the strict error verbatim.
+fn parse_call_args_traced(raw: &str) -> Result<(serde_json::Value, Option<String>), String> {
     if raw.trim().is_empty() {
-        return Ok(serde_json::json!({}));
+        return Ok((serde_json::json!({}), None));
     }
-    serde_json::from_str(raw).map_err(|e| format!("error: invalid JSON arguments: {e}"))
+    match serde_json::from_str(raw) {
+        Ok(v) => Ok((v, None)),
+        Err(e) => match lenient::repair_json_object(raw) {
+            Some(v) => Ok((v, Some(format!("repaired malformed JSON arguments ({e})")))),
+            None => Err(format!("error: invalid JSON arguments: {e}")),
+        },
+    }
 }
 
 /// Parse and repair one model tool call before any safety classification or execution. The repaired
@@ -3103,13 +4918,24 @@ fn prepare_call_args(
     registry: &ToolRegistry,
     tc: &ToolCall,
 ) -> Result<(serde_json::Value, Option<String>), String> {
-    let args = parse_call_args(&tc.function.arguments)?;
+    let (args, json_note) = parse_call_args_traced(&tc.function.arguments)?;
     let Some(tool) = registry.get(&tc.function.name) else {
-        return Ok((args, None));
+        return Ok((args, json_note));
     };
+    // Image sources and reference IDs carry distinct authority. Never infer one from an alias,
+    // unwrap it from another object or coerce its value before the tool validates the request.
+    if tool.may_return_images(&args) || tool.transmits_images(&args) {
+        return Ok((args, json_note));
+    }
     match tools::repair_args(&tool.parameters(), &args) {
-        Some((fixed, what)) => Ok((fixed, Some(what))),
-        None => Ok((args, None)),
+        Some((fixed, what)) => Ok((
+            fixed,
+            Some(match json_note {
+                Some(j) => format!("{j}; {what}"),
+                None => what,
+            }),
+        )),
+        None => Ok((args, json_note)),
     }
 }
 
@@ -3118,11 +4944,173 @@ fn prepare_call_args(
 /// the loop's own future (never inside `spawn_blocking`): the approval prompt runs via
 /// `block_in_place`, which keeps the future busy — the REPL's `select!` cannot drop it mid-prompt
 /// and orphan the pending approval (byte-identical semantics to the old serial path).
-fn gate_and_approve(
+const IMAGE_APPROVAL_ONCE: &str =
+    "Only this invocation is approved; an existing file/tool grant does not approve model uploads.";
+
+fn ensure_approved_managed_destination(
     tool: &dyn tools::Tool,
-    args: &serde_json::Value,
+    prepared: &tools::PreparedToolCall,
+    cancel: &crate::core::cancel::TurnCancel,
+) -> Result<()> {
+    let Some(file) = prepared
+        .file
+        .as_ref()
+        .filter(|file| file.destination.is_managed())
+    else {
+        return Ok(());
+    };
+    if let Some(source) = &file.source {
+        source.verify()?;
+    }
+    file.destination.verify()?;
+    if tool.recovery_effect(&prepared.args) {
+        crate::core::recovery::mark_side_effects_possible();
+    }
+    crate::core::cancel::with_current(cancel.clone(), || file.destination.ensure())
+}
+
+fn prepared_preview(
+    tool: &dyn tools::Tool,
+    call: &tools::PreparedToolCall,
+) -> Option<tools::ApprovalPreview> {
+    let mut preview = call.preview.clone().or_else(|| tool.preview(&call.args));
+    if !call.preview_lines.is_empty() {
+        let preview = preview.get_or_insert_with(|| tools::ApprovalPreview {
+            title: tool.name().into(),
+            diff: None,
+            lines: Vec::new(),
+        });
+        preview.lines.extend(call.preview_lines.iter().cloned());
+    }
+    preview
+}
+
+fn check_native_capability(
+    ctx: &crate::core::exec_ctx::ExecutionContext,
+    tool: &dyn tools::Tool,
+    prepared: &tools::PreparedToolCall,
+) -> anyhow::Result<()> {
+    let overlay = ctx.overlay();
+    if overlay.is_some() {
+        hooks::check_speculative_policy()?;
+    }
+    let Some(scope) = ctx.native_scope() else {
+        anyhow::ensure!(overlay.is_none(), "overlay lost its exact native authority");
+        anyhow::ensure!(
+            !matches!(
+                prepared.footprint,
+                Some(tools::PreparedFootprint::Overlay { .. })
+            ),
+            "private overlay call cannot execute in a live context"
+        );
+        return Ok(());
+    };
+    if !matches!(tool.name(), "file_read" | "file_edit" | "file_write")
+        || tool.command_to_guard(&prepared.args).is_some()
+    {
+        anyhow::bail!("native child capability is outside its approved file-only allowlist");
+    }
+    if let Some(active) = overlay {
+        let Some(tools::PreparedFootprint::Overlay { handle, files }) = &prepared.footprint else {
+            anyhow::bail!("private overlay requires sealed private resources; no live fallback");
+        };
+        anyhow::ensure!(
+            active.same_handle(handle),
+            "prepared overlay context changed"
+        );
+        active.check_owner_scope(&ctx.resource_scope(), scope)?;
+        anyhow::ensure!(!files.is_empty(), "private overlay has no approved files");
+        let root = ctx
+            .placement()
+            .ok_or_else(|| anyhow::anyhow!("private overlay lost its workspace binding"))?
+            .workspace_root();
+        for (file, mode) in files {
+            active.check_file(file)?;
+            let bound = active.resolve(root, file.logical_path())?;
+            anyhow::ensure!(
+                bound.key() == file.key(),
+                "private resource binding changed"
+            );
+            anyhow::ensure!(
+                scope.resources().iter().any(|r| r.key() == file.key()),
+                "private read exceeds sealed native scope"
+            );
+            if *mode == crate::core::repo_lock::LockMode::Exclusive {
+                anyhow::ensure!(
+                    file.is_writable() && scope.write_keys().iter().any(|k| k == file.key()),
+                    "private write exceeds sealed native scope"
+                );
+            }
+        }
+        let worker = builtin::prepared_native_worker(prepared)?
+            .ok_or_else(|| anyhow::anyhow!("private overlay lost its frozen native operation"))?;
+        worker.check_attempt(active, scope)?;
+        let kind = match tool.name() {
+            "file_read" => crate::core::speculation::workers::NativeWorkerKind::Read,
+            "file_edit" => crate::core::speculation::workers::NativeWorkerKind::Edit,
+            "file_write" => crate::core::speculation::workers::NativeWorkerKind::Write,
+            _ => unreachable!("native file allowlist checked above"),
+        };
+        anyhow::ensure!(
+            worker.kind() == kind,
+            "prepared private operation belongs to another tool"
+        );
+        return Ok(());
+    }
+    let Some(tools::PreparedFootprint::Native(resources)) = &prepared.footprint else {
+        anyhow::bail!("native child requires verified exact prepared resources; nothing executed");
+    };
+    if resources.is_empty() {
+        anyhow::bail!("native child has no verified prepared resources; nothing executed");
+    }
+    for (resource, mode) in resources {
+        resource.verify()?;
+        if *mode == crate::core::repo_lock::LockMode::Exclusive {
+            scope.check_resource(resource)?;
+        } else {
+            scope.check_read(resource)?;
+        }
+    }
+    Ok(())
+}
+
+fn pre_tool_hook_in_body(tool: &dyn tools::Tool, prepared: &tools::PreparedToolCall) -> bool {
+    !tool.is_destructive_prepared(prepared)
+        && !tool.may_return_images(&prepared.args)
+        && tool.is_concurrency_safe_prepared(prepared)
+}
+
+fn gate_prepared_and_approve(
+    tool: &dyn tools::Tool,
+    prepared: &tools::PreparedToolCall,
     cfg: &AgentConfig,
 ) -> Option<String> {
+    let args = &prepared.args;
+    if let Err(error) = check_native_capability(&cfg.exec_ctx, tool, prepared) {
+        return Some(format!("error: {error}"));
+    }
+    if !cfg.exec_ctx.can_restore_workspace() && tool.name() == "native_owner_undo" {
+        return Some("error: delegated children cannot undo workspace mutations".into());
+    }
+    if let Some(file) = &prepared.file {
+        if let Err(error) = file.destination.verify().and_then(|_| match &file.source {
+            Some(source) => source.verify(),
+            None => Ok(()),
+        }) {
+            return Some(format!("error: approved file target changed: {error}"));
+        }
+    }
+    if tool.transmits_images(args)
+        && (cfg.tool_image_policy != crate::llm::media::VisionPolicy::Supported
+            || cfg.tool_image_destination.is_none())
+    {
+        let state = match cfg.tool_image_policy {
+            crate::llm::media::VisionPolicy::Unknown => "unknown; open /config → Vision and declare support for the resolved endpoint/model",
+            crate::llm::media::VisionPolicy::Unsupported => "configured unsupported; choose an explicitly vision-capable route or change its declaration in /config → Vision",
+            crate::llm::media::VisionPolicy::Supported => "supported, but the dispatch has no destination binding",
+        };
+        return Some(format!("error: tool-image transmission unavailable: vision support is {state}. Capture-only (transmit:false) can still save pixels; no pixels were delivered for visual review."));
+    }
     // Shell commands pass the hard safety floor FIRST — before any `/yolo` bypass. A categorically
     // catastrophic command (rm -rf /, mkfs, dd to a raw device, fork bomb, curl|sh) is refused with
     // no override; `smart` mode may auto-clear a read-only command past the approval prompt.
@@ -3132,6 +5120,13 @@ fn gate_and_approve(
     // identically so going background can't sidestep the floor). A hand-written match on two
     // names used to fail OPEN for any future command-running tool.
     let guarded_command: Option<String> = tool.command_to_guard(args);
+    if !cfg.exec_ctx.can_restore_workspace()
+        && guarded_command
+            .as_deref()
+            .is_some_and(cmd_guard::delegated_restore_command)
+    {
+        return Some("error: delegated children cannot restore or undo workspace state; this command is refused before hooks or approval, including /yolo. Retain partial changes and report them to the coordinating parent.".into());
+    }
     // `network: true` is a CAPABILITY ESCALATION, not a normal argument: the sandbox denies child
     // network by default (kernel-enforced where the platform can), so asking for it must always be
     // visible. `smart` never auto-clears it (only read-only-shaped commands are auto-cleared, and a
@@ -3148,11 +5143,12 @@ fn gate_and_approve(
             style("⚠ network").color256(crate::ui::theme::WARN).bold(),
             style("this command requests network access (sandbox default is deny)").dim()
         );
-        if crate::ui::tui::active() {
-            crate::ui::tui::emit_line(&line);
-        } else if !cfg.quiet {
-            eprintln!("{line}");
-        }
+        emit_warning(
+            "network",
+            "network: this command requests network access (sandbox default is deny)",
+            &line,
+            cfg.quiet,
+        );
     }
     if let Some(command) = guarded_command.as_deref() {
         match cmd_guard::classify(command) {
@@ -3165,11 +5161,12 @@ fn gate_and_approve(
                     ))
                     .dim()
                 );
-                if crate::ui::tui::active() {
-                    crate::ui::tui::emit_line(&line);
-                } else if !cfg.quiet {
-                    eprintln!("{line}");
-                }
+                emit_warning(
+                    "blocked",
+                    &format!("blocked: {reason} — refused (hard safety floor, not overridable)"),
+                    &line,
+                    cfg.quiet,
+                );
                 return Some(format!(
                     "error: blocked by the hard safety floor: {reason}. This command is refused \
                      unconditionally (even under /yolo). Choose a narrower, safer command."
@@ -3185,11 +5182,7 @@ fn gate_and_approve(
                     style("⚠ caution").color256(crate::ui::theme::WARN).bold(),
                     style(&reason).dim()
                 );
-                if crate::ui::tui::active() {
-                    crate::ui::tui::emit_line(&line);
-                } else if !cfg.quiet {
-                    eprintln!("{line}");
-                }
+                emit_warning("caution", &format!("caution: {reason}"), &line, cfg.quiet);
             }
             cmd_guard::Verdict::Ask => {}
         }
@@ -3200,34 +5193,369 @@ fn gate_and_approve(
     if network_requested {
         smart_allow = false;
     }
-    if tool.is_destructive()
+    // Hooks for safe readers run in the body, including exact readers admitted beside writers.
+    // Other calls run theirs here, after the hard floor and before approval, never twice.
+    let mut hook_allow = false;
+    if !pre_tool_hook_in_body(tool, prepared) {
+        let hook_ctx = hooks::Context::from_cfg(cfg);
+        match hooks::run_blocking(|| hooks::pre_tool(tool.name(), args, &hook_ctx)) {
+            hooks::PreToolVerdict::Deny { run, reason } => {
+                return Some(format!("error: blocked by hook `{run}`: {reason}"));
+            }
+            hooks::PreToolVerdict::Allow { .. } => hook_allow = true,
+            hooks::PreToolVerdict::Pass => {}
+        }
+    }
+    // A file/tool grant is not permission to transmit private pixels to a model. Media approval
+    // names the effective destination and bypasses ordinary tool-only grants and hook auto-allows.
+    let media_approval = tool.may_return_images(args)
+        && cfg.tool_image_policy == crate::llm::media::VisionPolicy::Supported
+        && cfg.tool_image_destination.is_some();
+    if media_approval {
+        if !cfg.approval_mode.approves_all() {
+            let mut preview = prepared_preview(tool, prepared).unwrap_or(tools::ApprovalPreview {
+                title: tool.name().to_string(),
+                diff: None,
+                lines: Vec::new(),
+            });
+            preview.lines.push(format!(
+                "Image transmission to {}",
+                cfg.tool_image_destination_label
+                    .as_deref()
+                    .unwrap_or("the effective configured endpoint/model")
+            ));
+            preview.lines.push(IMAGE_APPROVAL_ONCE.into());
+            if !approve(tool.name(), prepared, cfg, Some(&preview), None) {
+                return Some("error: the user declined this image transmission".into());
+            }
+        }
+    } else if tool.is_destructive_prepared(prepared)
         && !cfg.approval_mode.approves_all()
         && !smart_allow
-        && !approve(tool.name(), args, cfg)
+        && !hook_allow
     {
-        return Some("error: the user declined this action".to_string());
+        // A standing grant (the menu's `always for <tool> [under <dir>]`, or the project's
+        // `.aizen/approvals.json`) answers without asking — narrower than allow-all, and named
+        // in the transcript so an auto-approval is never silent.
+        let target = tool.workspace_target_prepared(prepared);
+        if let Some(g) = crate::core::approval::granted(tool.name(), target.as_deref()) {
+            let line = format!(
+                "  {} {}",
+                crate::ui::theme::faint("│"),
+                crate::ui::theme::faint(&format!("auto-approved by grant: {}", g.describe()))
+            );
+            if crate::ui::tui::active() {
+                crate::ui::tui::emit_line(&line);
+            } else if !cfg.quiet {
+                emit_trace(&line);
+            }
+        } else {
+            // Pre-flight: what the call WILL do, computed before it does anything — a patch
+            // for an edit, the full command and its cwd for a shell — so the user approves
+            // the change, not a basename. Computed only when a question is about to be asked.
+            let preview = prepared_preview(tool, prepared);
+            if !approve(
+                tool.name(),
+                prepared,
+                cfg,
+                preview.as_ref(),
+                target.as_deref(),
+            ) {
+                return Some("error: the user declined this action".to_string());
+            }
+        }
     }
-    None
+    reserve_visual_operation(tool, args, cfg)
+}
+
+fn reserve_visual_operation(
+    tool: &dyn tools::Tool,
+    args: &serde_json::Value,
+    cfg: &AgentConfig,
+) -> Option<String> {
+    if tool.name() != "browser_set_viewport" && !tool.transmits_images(args) {
+        return None;
+    }
+    let ctx = cfg.exec_ctx.design()?;
+    let state = ctx.snapshot();
+    if state.mode == design::DesignMode::Off || !state.active || !state.intent.is_visual() {
+        return None;
+    }
+    ctx.reserve_visual_operation()
+        .err()
+        .map(|e| format!("error: {e}"))
+}
+
+/// Select only explicitly requested evidence from one child namespace. Never relay user attachments
+/// or a discarded attempt's whole history; request caps apply before copying any payload.
+pub fn selected_evidence_images(
+    messages: &[Message],
+    ids: &[String],
+    scope: &str,
+) -> Vec<crate::core::tool_media::ToolImage> {
+    use crate::core::tool_media::{MAX_REQUEST_IMAGES, MAX_REQUEST_IMAGE_BYTES};
+    let mut selected = Vec::new();
+    let mut bytes = 0usize;
+    let complete = crate::llm::media::completed_tool_image_occurrences(messages);
+    for id in ids.iter().take(MAX_REQUEST_IMAGES) {
+        let image = complete
+            .iter()
+            .rev()
+            .filter_map(|occurrence| {
+                let message = messages.get(occurrence.message_index)?;
+                if is_failure_result(message.content.as_deref().unwrap_or("")) {
+                    return None;
+                }
+                message.tool_images.get(occurrence.image_index)
+            })
+            .find(|image| {
+                let p = &image.metadata().provenance;
+                image.is_available()
+                    && p.approved_destination.is_some()
+                    && p.design_scope.as_deref() == Some(scope)
+                    && p.evidence_id.as_deref() == Some(id.as_str())
+            });
+        if let Some(image) = image {
+            if selected
+                .iter()
+                .any(|old: &crate::core::tool_media::ToolImage| {
+                    old.metadata().provenance.evidence_id.as_deref() == Some(id.as_str())
+                })
+            {
+                continue;
+            }
+            if bytes.saturating_add(image.metadata().byte_len) > MAX_REQUEST_IMAGE_BYTES {
+                continue;
+            }
+            bytes += image.metadata().byte_len;
+            selected.push(image.clone());
+        }
+    }
+    selected
+}
+
+/// Called after successful live delivery, using exact occurrences from the request projector.
+/// Identical pixels in another record do not prove that record's evidence was transmitted.
+pub fn mark_projected_evidence(
+    messages: &[Message],
+    selected: &[crate::llm::media::ProjectedToolImage],
+    ctx: &design::DesignContext,
+) {
+    let scope = ctx.evidence_scope();
+    let complete = crate::llm::media::completed_tool_image_occurrences(messages);
+    for occurrence in selected {
+        if !complete.contains(occurrence)
+            || messages
+                .get(occurrence.message_index)
+                .is_none_or(|m| is_failure_result(m.content.as_deref().unwrap_or("")))
+        {
+            continue;
+        }
+        let Some(image) = messages
+            .get(occurrence.message_index)
+            .and_then(|message| message.tool_images.get(occurrence.image_index))
+        else {
+            continue;
+        };
+        let metadata = image.metadata();
+        if image.is_available()
+            && metadata.sha256 == occurrence.sha256
+            && metadata.provenance.source != "reference_read"
+            && metadata.provenance.source != crate::core::reference_media::REFERENCE_SOURCE
+            && metadata.provenance.approved_destination.is_some()
+            && metadata.provenance.design_scope.as_deref() == Some(scope.as_str())
+        {
+            if let Some(id) = &metadata.provenance.evidence_id {
+                let _ = ctx.mark_projected(id);
+            }
+        }
+    }
+}
+
+/// Credit only occurrences from the successful frozen wire request, never a fresh projection.
+/// Delivery proves request inclusion, not that the model understood the image.
+pub fn mark_image_delivery(
+    messages: &[Message],
+    receipt: &crate::llm::media::ImageDeliveryReceipt,
+    ctx: &design::DesignContext,
+) {
+    use crate::core::reference_media::REFERENCE_SOURCE;
+    use design::ReferenceObservationKind;
+    mark_projected_evidence(messages, &receipt.tool_images, ctx);
+    for sent in &receipt.user_images {
+        let Some(message) = messages
+            .get(sent.message_index)
+            .filter(|m| m.role == "user")
+        else {
+            continue;
+        };
+        let Some(url) = message.images.get(sent.image_index) else {
+            continue;
+        };
+        if crate::core::tool_media::sha256(url.as_bytes()) != sent.source_sha256
+            || (sent.original && sent.source_sha256 != sent.wire_sha256)
+        {
+            continue;
+        }
+        for image in &message.tool_images {
+            let metadata = image.metadata();
+            let p = &metadata.provenance;
+            if p.source != REFERENCE_SOURCE
+                || p.crop.is_some()
+                || p.parent_sha256.is_some()
+                || p.locator.as_deref() != Some(format!("attachment:{}", sent.image_index).as_str())
+            {
+                continue;
+            }
+            if let Some(id) = &p.evidence_id {
+                let kind = if sent.original {
+                    ReferenceObservationKind::Original
+                } else {
+                    ReferenceObservationKind::Preview
+                };
+                let _ = ctx.record_reference_observation(id, &metadata.sha256, kind);
+            }
+        }
+    }
+    let complete = crate::llm::media::completed_tool_image_occurrences(messages);
+    for sent in &receipt.tool_images {
+        if !complete.contains(sent) {
+            continue;
+        }
+        let Some(image) = messages
+            .get(sent.message_index)
+            .filter(|m| !is_failure_result(m.content.as_deref().unwrap_or("")))
+            .and_then(|m| m.tool_images.get(sent.image_index))
+        else {
+            continue;
+        };
+        let metadata = image.metadata();
+        let p = &metadata.provenance;
+        if !image.is_available()
+            || metadata.sha256 != sent.sha256
+            || p.source != "reference_read"
+            || p.approved_destination.is_none()
+        {
+            continue;
+        }
+        if let (Some(id), Some(original)) = (&p.locator, &p.parent_sha256) {
+            let kind = p.crop.map_or(
+                ReferenceObservationKind::Original,
+                ReferenceObservationKind::Crop,
+            );
+            let _ = ctx.record_reference_observation(id, original, kind);
+        }
+    }
 }
 
 /// The body of one tool call: trace → execute → result marker → truncate. Never panics upward
 /// (failures become feedback strings). This is the `spawn_blocking` payload — the existing tool
 /// bridges (`block_in_place` + `Handle::block_on`) work unchanged on blocking threads (pinned by
 /// `tools::tests::bridge_works_inside_spawn_blocking`).
+/// The per-kind result budgets a tool body is cut to, snapshotted from [`AgentConfig`] so the
+/// blocking executor threads carry four numbers instead of a config reference.
+#[derive(Clone, Copy, Debug)]
+pub struct ResultBudgets {
+    /// Everything not named below (`max_tool_result_chars`).
+    pub default: usize,
+    /// Document tools cut by relevance, and the self-budgeted `file_read` safety net.
+    pub fetch: usize,
+    /// Build/test/process logs (`max_log_result_chars`).
+    pub log: usize,
+    /// Sub-agent and workflow reports (`max_delegate_result_chars`).
+    pub delegate: usize,
+    /// Spill a raw result longer than this many bytes to the scratch dir (`0` = never).
+    pub spill_over: usize,
+}
+
+impl AgentConfig {
+    /// The result budgets this config applies — see [`ResultBudgets`].
+    pub fn result_budgets(&self) -> ResultBudgets {
+        ResultBudgets {
+            default: self.max_tool_result_chars,
+            fetch: self.max_fetch_result_chars,
+            log: self.max_log_result_chars,
+            delegate: self.max_delegate_result_chars,
+            spill_over: self.spill_result_over_chars,
+        }
+    }
+}
+
+#[cfg(test)]
 fn run_tool_body(
     tool: std::sync::Arc<dyn tools::Tool>,
     args: &serde_json::Value,
     quiet: bool,
-    max_chars: usize,
-    max_fetch_chars: usize,
-) -> String {
+    budgets: ResultBudgets,
+    image_destination: Option<String>,
+) -> ToolObservation {
+    let ctx = crate::core::exec_ctx::current().unwrap_or_default();
+    match tool.prepare_call(args, &ctx) {
+        Ok(prepared) => {
+            run_prepared_tool_body(tool, &prepared, quiet, budgets, image_destination).observation
+        }
+        Err(error) => ToolObservation::text(format!("error: {error}")),
+    }
+}
+
+fn run_prepared_tool_body(
+    tool: std::sync::Arc<dyn tools::Tool>,
+    prepared: &tools::PreparedToolCall,
+    quiet: bool,
+    budgets: ResultBudgets,
+    image_destination: Option<String>,
+) -> tools::ToolOutcome {
+    let exec_ctx = crate::core::exec_ctx::current().unwrap_or_default();
+    if let Some(changes) = &prepared.workspace_changes {
+        let delegated_ctx = exec_ctx.with_workspace_changes(changes.clone());
+        return crate::core::exec_ctx::with_current(delegated_ctx, || {
+            run_prepared_tool_body_cached(tool, prepared, quiet, budgets, image_destination, None)
+        });
+    }
+    run_prepared_tool_body_cached(tool, prepared, quiet, budgets, image_destination, None)
+}
+
+fn run_prepared_tool_body_cached(
+    tool: std::sync::Arc<dyn tools::Tool>,
+    prepared: &tools::PreparedToolCall,
+    quiet: bool,
+    budgets: ResultBudgets,
+    image_destination: Option<String>,
+    cache: Option<(ReadCacheEntry, std::path::PathBuf)>,
+) -> tools::ToolOutcome {
+    let args = &prepared.args;
+    if let Err(error) = check_background_effects() {
+        return tools::ToolOutcome::failed_with_effect_state(
+            format!("error: {error:#}"),
+            tool_error_effect_state(&error),
+        );
+    }
+    let exec_ctx = crate::core::exec_ctx::current().unwrap_or_default();
+    if let Err(error) = check_native_capability(&exec_ctx, tool.as_ref(), prepared) {
+        return tools::ToolOutcome::failed(format!("error: {error}"));
+    }
+    if !exec_ctx.can_restore_workspace() && tool.name() == "native_owner_undo" {
+        return tools::ToolOutcome::failed(
+            "error: delegated children cannot undo workspace mutations",
+        );
+    }
+    if !exec_ctx.can_restore_workspace()
+        && tool
+            .command_to_guard(args)
+            .as_deref()
+            .is_some_and(cmd_guard::delegated_restore_command)
+    {
+        return tools::ToolOutcome::failed(
+            "error: delegated children cannot restore or undo workspace state",
+        );
+    }
     if tool.recovery_effect(args) {
         crate::core::recovery::mark_side_effects_possible();
     }
     // Open the tool-call line (mockup shape: `⚙ <name>   <target>`, digest filled in on completion).
     // The `seq` ties the result back to this same line so retained updates it in place.
     let seq = if !quiet {
-        emit_tool_call(tool.name(), args)
+        emit_prepared_tool_call(tool.name(), prepared, dispatch_here().as_deref())
     } else {
         0
     };
@@ -3237,18 +5565,262 @@ fn run_tool_body(
     // name the key without saying what the tool actually accepts or what it just sent. Checked here,
     // at the one point every tool's execution passes through, so the improvement is uniform.
     let missing = tools::missing_required_strings(&tool.parameters(), args);
-    let out = if !missing.is_empty() {
-        tools::missing_args_error(tool.name(), &tool.parameters(), args, &missing)
+    // Safe readers run their pre hook here; barrier calls already ran it ahead of approval.
+    let hook_ctx = hooks::Context::here(quiet);
+    let hook_denied = if pre_tool_hook_in_body(tool.as_ref(), prepared) {
+        match hooks::pre_tool(tool.name(), args, &hook_ctx) {
+            hooks::PreToolVerdict::Deny { run, reason } => {
+                Some(format!("error: blocked by hook `{run}`: {reason}"))
+            }
+            _ => None,
+        }
     } else {
-        match tool.execute(args) {
-            Ok(out) => out,
-            Err(e) => format!("error: {e}"),
+        None
+    };
+    let execution = if let Err(error) = check_background_effects() {
+        Err(error)
+    } else if let Some(denied) = hook_denied.clone() {
+        Err(anyhow::anyhow!(denied))
+    } else if !missing.is_empty() {
+        Err(anyhow::anyhow!(tools::missing_args_error(
+            tool.name(),
+            &tool.parameters(),
+            args,
+            &missing,
+        )))
+    } else {
+        // Hooks and approval have completed. Resource ownership ends before post hooks, output
+        // formatting and spill storage; only the actual read/apply runs under these locks.
+        (|| -> anyhow::Result<ToolObservation> {
+            let root = match exec_ctx.placement() {
+                Some(placement) => placement.workspace_root().to_path_buf(),
+                None => std::env::current_dir()?,
+            };
+            let cancel = crate::core::cancel::current();
+            let scope = exec_ctx.resource_scope();
+            let _native_lease = match &prepared.footprint {
+                Some(tools::PreparedFootprint::Native(resources)) => {
+                    Some(crate::core::workspace_txn::NativeResourceLease::acquire(
+                        &root,
+                        resources,
+                        std::time::Duration::from_secs(15),
+                        cancel.as_ref(),
+                        &scope,
+                    )?)
+                }
+                _ => None,
+            };
+            let self_managed = matches!(
+                tool.name(),
+                "task"
+                    | "workflow"
+                    | "shell_run"
+                    | "process"
+                    | "checkpoint"
+                    | "checkpoint_view"
+                    | "symbol_replace"
+                    | "symbol_insert"
+            ) || tool.name().starts_with("lsp_")
+                || tool.name().starts_with("mcp_");
+            let opaque = crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED
+                && (matches!(prepared.footprint, Some(tools::PreparedFootprint::Global))
+                    || (prepared.footprint.is_none() && !self_managed));
+            let _global_lease = if opaque {
+                Some(
+                    crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
+                        &root,
+                        std::time::Duration::from_secs(15),
+                        cancel.as_ref(),
+                        tool.name(),
+                        &scope,
+                    )?,
+                )
+            } else {
+                None
+            };
+            let _global_physical = if opaque {
+                Some(crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+                    std::time::Duration::from_secs(15),
+                    cancel.as_ref(),
+                    tool.name(),
+                    &scope,
+                )?)
+            } else {
+                None
+            };
+            check_native_capability(&exec_ctx, tool.as_ref(), prepared)?;
+            if let Some(cached) = cache.as_ref().and_then(|(entry, root)| {
+                (tool.name() == "file_read" && exec_ctx.native_scope().is_none())
+                    .then(|| unchanged_read_result(entry, root, args))
+                    .flatten()
+            }) {
+                Ok(ToolObservation::text(cached))
+            } else {
+                tool.execute_prepared(prepared)
+            }
+        })()
+    };
+    let (observation, mut failure, mut effect_state) = match execution {
+        Ok(observation) => {
+            let failure = tool
+                .result_is_error(&observation.text)
+                .unwrap_or_else(|| is_failure_result(&observation.text))
+                .then(|| observation.text.clone());
+            (observation, failure, tools::ToolEffectState::Settled)
+        }
+        Err(error) => {
+            let effect_state = tool_error_effect_state(&error);
+            let text = error.to_string();
+            let text = if text.starts_with("error:") {
+                text
+            } else {
+                format!("error: {text}")
+            };
+            (
+                ToolObservation::text(text.clone()),
+                Some(text),
+                effect_state,
+            )
         }
     };
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    if !quiet {
-        emit_tool_result(seq, tool.name(), args, &out, Some(elapsed_ms));
+    if prepared.workspace_changes.is_none()
+        && failure.is_none()
+        && tool.workspace_effect_prepared(prepared).needs_checkpoint()
+        && tool.name() != "native_owner_undo"
+        && !observation.text.starts_with(builtin::NOOP_WRITE_PREFIX)
+        && !observation.text.starts_with(builtin::DRY_RUN_PREFIX)
+    {
+        let root = exec_ctx
+            .placement()
+            .map(|p| p.workspace_root())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        exec_ctx.note_workspace_changes(&prepared_edit_paths(root, tool.name(), prepared));
     }
+    let ToolObservation {
+        text: mut out,
+        images,
+    } = observation;
+    let mut withheld = false;
+    let images = images
+        .into_iter()
+        .map(|image| match image_destination.as_deref() {
+            Some(destination)
+                if image
+                    .metadata()
+                    .provenance
+                    .approved_destination
+                    .as_deref()
+                    .is_none_or(|approved| approved == destination) =>
+            {
+                image.with_approved_destination(destination)
+            }
+            _ => {
+                withheld = true;
+                image.without_payload(crate::core::tool_media::ImageUnavailable::MetadataOnly)
+            }
+        })
+        .collect();
+    if withheld {
+        out.push_str("\n[Tool image withheld: transmission was not approved for this effective endpoint/model; not visually reviewed.]");
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    // `post_tool` hooks read the raw result; what they say rides the result the model reads.
+    let hook_note = if hook_denied.is_none() && effect_state == tools::ToolEffectState::Settled {
+        hooks::post_tool(tool.name(), args, &out, failure.is_none(), &hook_ctx)
+    } else {
+        None
+    };
+    if let Err(error) = check_background_effects() {
+        effect_state = tools::ToolEffectState::UnknownWorker;
+        let note = format!("error: {error:#}");
+        failure = Some(note.clone());
+        out.push_str(&format!("\n[{note}]"));
+    }
+    if !quiet {
+        emit_prepared_tool_result(
+            seq,
+            tool.name(),
+            prepared,
+            &out,
+            Some(elapsed_ms),
+            dispatch_here().as_deref(),
+        );
+    }
+    // The TUI has drawn the full diff; the MODEL gets the removed lines, the `@@` anchor and a
+    // `+N lines` count per hunk, at most three hunks. The added text is what it just wrote — a
+    // ten-edit batch used to echo ~800 of its own lines back and hit the result cut. A dry-run
+    // preview keeps the whole diff: there the diff is the answer.
+    let out = if is_edit_tool(tool.name()) && !out.starts_with(builtin::DRY_RUN_PREFIX) {
+        compact_edit_diff(&out)
+    } else {
+        out
+    };
+    // SPILL BEFORE THE CUT: a raw result past `spill_over` is written to the scratch dir in full,
+    // and the cut result below ends with the path — nothing the tool produced is lost, and the model
+    // fetches the part it needs with `file_read` instead of re-running the command. `file_read` is
+    // exempt: its file is already on disk and its own cut says how to ask for the rest.
+    let spill_note = if budgets.spill_over > 0
+        && out.len() > budgets.spill_over
+        && !is_self_budgeted(tool.name())
+    {
+        observe::spill_to_scratch(tool.name(), &out).map(|p| observe::spill_note(&p, &out))
+    } else {
+        None
+    };
+    let raw_chars = out.chars().count();
+    let cut = cut_result(tool.name(), args, &out, budgets);
+    let result = observe::attach_spill_note(cut, raw_chars, spill_note);
+    tools::ToolOutcome {
+        observation: ToolObservation {
+            text: match hook_note {
+                Some(note) => format!("{result}\n\n{note}"),
+                None => result,
+            },
+            images,
+        },
+        failure,
+        effect_state,
+    }
+}
+
+fn check_background_effects() -> anyhow::Result<()> {
+    // LSP and MCP stdio pool one sidecar admission gate, so they share one settlement charge: this
+    // single check covers both. Calling it twice would also double the bounded wait.
+    crate::agent::mcp::check_startup_effects()?;
+    crate::core::proctree::check_bounded_effects().map_err(|error| {
+        anyhow::Error::new(tools::ToolEffectsUnsettled(
+            tools::ToolEffectState::UnknownWorker,
+        ))
+        .context(error.to_string())
+    })
+}
+
+pub(crate) fn tool_error_effect_state(error: &anyhow::Error) -> tools::ToolEffectState {
+    if let Some(error) = error.downcast_ref::<tools::ToolEffectsUnsettled>() {
+        error.0
+    } else if error
+        .downcast_ref::<task_tool::TaskWorkerStillRunning>()
+        .is_some()
+    {
+        tools::ToolEffectState::UnknownWorker
+    } else if let Some(error) = error.downcast_ref::<crate::core::native_journal::PossiblyApplied>()
+    {
+        tools::ToolEffectState::PossiblyApplied(Some(error.record_id))
+    } else if let Some(error) =
+        error.downcast_ref::<crate::core::speculation::integration::IntegrationUnsettled>()
+    {
+        tools::ToolEffectState::PossiblyApplied(error.possibly_applied_record)
+    } else if let Some(error) = error.downcast_ref::<native_undo::NativeUndoFailure>() {
+        tools::ToolEffectState::PossiblyApplied(error.possibly_applied_record)
+    } else {
+        tools::ToolEffectState::Settled
+    }
+}
+
+/// The per-kind budget cut for one raw result — see the comments on each arm.
+fn cut_result(name: &str, args: &serde_json::Value, out: &str, budgets: ResultBudgets) -> String {
+    let max_chars = budgets.default;
+    let max_fetch_chars = budgets.fetch;
     // Relevance-aware truncation for the READ/FETCH tools whose output is a large document the model
     // is scanning for specifics (W11/W22): keep the region matching the call's query keywords rather
     // than a blind head+tail, and give it the LARGER `max_fetch_chars` budget so the reach layer's
@@ -3256,28 +5828,187 @@ fn run_tool_body(
     // Non-failure only (an error string must survive verbatim — the model's error trail is how it
     // recovers) and only for these tools (an edit diff / shell log is positional, not keyword-scored).
     // Everything else keeps the exact old head+tail behavior at the standard budget.
-    if !is_failure_result(&out) && is_relevance_truncatable(tool.name()) {
-        let keywords = relevance_keywords(&relevance_query_from_args(args));
-        return truncate_relevant(&out, max_fetch_chars.max(max_chars), &keywords);
+    // Logs and delegate reports have their own shapes and their own budgets; both apply to
+    // failures too — a failing `cargo test` IS the log the model needs whole, and a child that
+    // ended in `VerificationFailed` still reports what it found.
+    if is_log_tool(name) {
+        return truncate_log(out, budgets.log.max(max_chars));
     }
-    truncate_result(&out, max_chars)
+    if is_delegate_tool(name) {
+        return truncate_sections(out, budgets.delegate.max(max_chars));
+    }
+    if !is_failure_result(out) && is_relevance_truncatable(name) {
+        let keywords = relevance_keywords(&relevance_query_from_args(args));
+        return truncate_relevant(out, max_fetch_chars.max(max_chars), &keywords);
+    }
+    // `file_read` budgets itself: `budget_view` / the ranged view cut inside the tool and say
+    // exactly which lines were left out and how to ask for them. A second cut here used to
+    // re-slice that contiguous window by keywords taken from the file PATH and hand the model a
+    // head + "…elided…" + keyword-window splice — text that does not exist in that order in the
+    // file, so an `old_string` copied across the seam never matched. The transport cap remains
+    // only as a safety net, far above anything the tool's own budget can produce.
+    if is_self_budgeted(name) {
+        return truncate_result(out, max_fetch_chars.max(max_chars) * 4);
+    }
+    truncate_result(out, max_chars)
 }
 
 /// Tools whose large output is a document scanned for specifics — relevance-trimming keeps the
 /// matching region instead of a blind head+tail. Edit/shell/memory tools are excluded (their
-/// output is positional or already digested).
+/// output is positional or already digested), and so is `file_read`, which cuts itself (see
+/// [`is_self_budgeted`]).
 fn is_relevance_truncatable(name: &str) -> bool {
-    matches!(
-        name,
-        "file_read" | "web_fetch" | "web_crawl" | "search_files"
-    )
+    matches!(name, "web_fetch" | "web_crawl" | "search_files")
+}
+
+/// Tools whose output is already cut to a budget INSIDE the tool, with a marker that names the
+/// omitted range and the call that fetches it. The loop must not cut them again: the tool's view
+/// is contiguous and the marker is only true if what surrounds it is exactly what the tool wrote.
+fn is_self_budgeted(name: &str) -> bool {
+    matches!(name, "file_read")
+}
+
+/// Tools whose output is a LOG: the verdict is at the end and the first error is wherever the
+/// build put it, so the cut keeps both (see [`truncate_log`]).
+fn is_log_tool(name: &str) -> bool {
+    matches!(name, "shell_run" | "process" | "git_inspect")
+}
+
+/// Tools whose output is a sub-agent's REPORT, structured in `## ` sections; cut by whole
+/// sections with the omitted ones named (see [`truncate_sections`]).
+fn is_delegate_tool(name: &str) -> bool {
+    matches!(name, "task" | "workflow")
+}
+
+/// Cut a build/test/process log to `max` chars the way a developer reads one: the head (the
+/// command's banner, the first lines of context), the region around the FIRST error line the log
+/// contains, and a large tail (test summaries, "could not compile", the exit line all live at the
+/// end). A head-⅔/tail-⅓ cut lost the middle failures of a three-failure `cargo test` and kept
+/// twelve hundred chars of warnings instead. Without any error line the split is head ⅓ / tail ⅔.
+pub fn truncate_log(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    if max < 96 {
+        return truncate_result(s, max);
+    }
+    static ANCHOR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let anchor = ANCHOR.get_or_init(|| {
+        regex::Regex::new(
+            r"(?m)^\s*(?:error(?:\[E\d+\])?[: ]|FAILED\b|failures:|thread '.*' panicked|panicked at|Traceback \(most recent|[A-Za-z]*(?:Error|Exception)\b[: ]|FAIL\b|npm ERR!|✗|×)",
+        )
+        .expect("static regex")
+    });
+    let markers = 96; // three elision markers
+    let usable = max.saturating_sub(markers);
+    let chars: Vec<char> = s.chars().collect();
+    let take = |from: usize, len: usize| -> String {
+        chars[from..(from + len).min(chars.len())].iter().collect()
+    };
+    let first_anchor = anchor.find(s).map(|m| s[..m.start()].chars().count());
+    match first_anchor {
+        Some(at) => {
+            // head ⅙ · error window ⅓ · tail ½ — the window is centred a little before the anchor
+            // so the lines that led to the error come with it.
+            let head_len = usable / 6;
+            let win_len = usable / 3;
+            let tail_len = usable - head_len - win_len;
+            let tail_start = n - tail_len;
+            let win_start = at.saturating_sub(win_len / 4).max(head_len);
+            let win_end = (win_start + win_len).min(tail_start);
+            let head = take(0, head_len);
+            let mut out = head;
+            if win_start > head_len && win_end > win_start {
+                out.push_str(&format!("\n…[{} chars elided]…\n", win_start - head_len));
+                out.push_str(&take(win_start, win_end - win_start));
+            } else if win_end > win_start {
+                out.push_str(&take(head_len, win_end - head_len));
+            }
+            let resume = win_end.max(head_len);
+            if tail_start > resume {
+                out.push_str(&format!("\n…[{} chars elided]…\n", tail_start - resume));
+                out.push_str(&take(tail_start, tail_len));
+            } else {
+                out.push_str(&take(resume, n - resume));
+            }
+            out
+        }
+        None => {
+            let head_len = usable / 3;
+            let tail_len = usable - head_len;
+            format!(
+                "{}\n…[{} chars elided]…\n{}",
+                take(0, head_len),
+                n - head_len - tail_len,
+                take(n - tail_len, tail_len)
+            )
+        }
+    }
+}
+
+/// Cut a sub-agent report to `max` chars by WHOLE `## ` sections, in order, naming every section
+/// that did not fit — a reviewer's findings 4–9 are worth more than a byte-exact prefix of finding
+/// 4. A report with no section headers falls back to the head+tail cut at this larger budget.
+pub fn truncate_sections(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    // Section = a `## ` header line and everything up to the next one; text before the first
+    // header is the preamble (usually the verdict line, always admitted first).
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut cur_title = String::from("(preamble)");
+    let mut cur = String::new();
+    for line in s.split_inclusive('\n') {
+        if let Some(title) = line.strip_prefix("## ") {
+            if !cur.trim().is_empty() || !sections.is_empty() {
+                sections.push((cur_title.clone(), std::mem::take(&mut cur)));
+            } else {
+                cur.clear();
+            }
+            cur_title = format!("## {}", title.trim_end());
+        }
+        cur.push_str(line);
+    }
+    sections.push((cur_title, cur));
+    if sections.len() < 2 {
+        return truncate_result(s, max);
+    }
+    let reserve = 160 + sections.len() * 40; // the omission line
+    let budget = max.saturating_sub(reserve);
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut omitted: Vec<String> = Vec::new();
+    for (title, body) in &sections {
+        let len = body.chars().count();
+        if used + len <= budget {
+            out.push_str(body);
+            used += len;
+        } else {
+            omitted.push(format!("{title} ({len} chars)"));
+        }
+    }
+    if omitted.is_empty() {
+        return out;
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "…[omitted for the {max}-char delegate budget — whole sections, not clipped: {}. Ask the same role for one of them by name if it matters.]…",
+        omitted.join("; ")
+    ));
+    out
 }
 
 /// Pull the relevance-signal string from a call's args: the query/pattern/topic fields these tools
 /// take. `web_fetch`/`web_crawl` carry a URL (its path segments are decent keywords); `search_files`
-/// a `query`/`pattern`; `file_read` a `path`. Joined so [`relevance_keywords`] can tokenize once.
+/// a `query`/`pattern`. A file `path` is deliberately NOT a signal: the words of a path say where
+/// a file lives, not what the model is looking for in it, and scoring lines by "src", "agent" and
+/// the file's own name kept the wrong region.
 fn relevance_query_from_args(args: &serde_json::Value) -> String {
-    const KEYS: &[&str] = &["query", "pattern", "q", "search", "topic", "url", "path"];
+    const KEYS: &[&str] = &["query", "pattern", "q", "search", "topic", "url"];
     let mut parts = Vec::new();
     for k in KEYS {
         if let Some(v) = args.get(*k).and_then(|v| v.as_str()) {
@@ -3293,23 +6024,24 @@ fn relevance_query_from_args(args: &serde_json::Value) -> String {
 /// as a quiet footnote. Tools with no mapping fall back to the older `◆ name(salient-arg)` shape.
 /// The `◆` anchor is moonlight-silver here (the call is starting); the result corner `└` on the
 /// A one-shot styled string form of the call line (mockup shape `⚙ <name>   <target>`) — the raw
-/// tool name in moonlight, its salient target in dim silver. Used for the APPROVAL PROMPT (a single
-/// inline line), where there's no in-place digest to fill later. The live transcript uses the
-/// structured [`emit_tool_call`]/[`emit_tool_result`] pair instead, which right-aligns the digest.
+/// tool name in its work-lane colour (matching the live transcript's `render_tool_row`), its
+/// salient target in dim silver. Used for the APPROVAL PROMPT (a single inline line), where
+/// there's no in-place digest to fill later. The live transcript uses the structured
+/// [`emit_tool_call`]/[`emit_tool_result`] pair instead, which right-aligns the digest.
 fn tool_call_line(name: &str, args: &serde_json::Value) -> String {
     let icon = tool_icon();
     let target = tool_target(name, args);
     if target.is_empty() {
         format!(
             "{} {}",
-            crate::ui::theme::accent(icon),
-            crate::ui::theme::accent(name)
+            crate::ui::theme::lane(name, icon),
+            crate::ui::theme::lane(name, name)
         )
     } else {
         format!(
             "{} {}   {}",
-            crate::ui::theme::accent(icon),
-            crate::ui::theme::accent(name),
+            crate::ui::theme::lane(name, icon),
+            crate::ui::theme::lane(name, name),
             crate::ui::theme::accent_dim(target)
         )
     }
@@ -3387,6 +6119,11 @@ pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
 
 /// Emit a trace line into the scroll region (sticky TUI) or stderr (plain / one-shot path).
 fn emit_trace(line: &str) {
+    // The JSON stream owns stdout: the line becomes a `trace` event, styling stripped.
+    if crate::ui::events::on() {
+        crate::ui::events::trace(line);
+        return;
+    }
     // `retained_running()` (not just `active()`) so replay during a SUSPENDED dialoguer menu — e.g.
     // restoring via `/sessions` — still routes into the render thread's buffer, which `resume`
     // redraws from. Otherwise the trace would `eprintln!` onto the menu screen and be wiped.
@@ -3397,11 +6134,181 @@ fn emit_trace(line: &str) {
     }
 }
 
+/// A safety notice about a call (`⛔ blocked`, `⚠ caution`, `⚠ network`): a `warning` event on
+/// the JSON stream, else the styled line on the transcript or stderr (unless `quiet`).
+fn emit_warning(kind: &str, plain: &str, styled: &str, quiet: bool) {
+    if crate::ui::events::on() {
+        crate::ui::events::warning(kind, plain);
+        return;
+    }
+    if crate::ui::tui::active() {
+        crate::ui::tui::emit_line(styled);
+    } else if !quiet {
+        eprintln!("{styled}");
+    }
+}
+
+/// A call that produced a result WITHOUT running its body — arguments that did not parse, an
+/// unknown tool, a gate refusal, a failed pre-edit checkpoint — still owes the JSON stream its
+/// `tool_call` / `tool_result` pair, or a front-end would show a model that asked for a tool and
+/// heard nothing back. The transcript needs nothing extra: the gate already said why. Returns
+/// `out` unchanged so it can wrap the expression that produced it.
+fn note_unrun_call(name: &str, args: &serde_json::Value, out: String, cfg: &AgentConfig) -> String {
+    note_unrun_call_with_identity(name, args, out, cfg, None)
+}
+
+fn note_unrun_prepared_call(
+    name: &str,
+    prepared: &tools::PreparedToolCall,
+    out: String,
+    cfg: &AgentConfig,
+) -> String {
+    note_unrun_call_with_identity(
+        name,
+        &prepared.args,
+        out,
+        cfg,
+        Some(&prepared.approval_identity),
+    )
+}
+
+fn note_unrun_call_with_identity(
+    name: &str,
+    args: &serde_json::Value,
+    out: String,
+    cfg: &AgentConfig,
+    identity: Option<&crate::ui::events::ApprovalIdentity>,
+) -> String {
+    if crate::ui::events::on() {
+        // On the loop's thread, so the label is the config's, not the thread's.
+        let dispatch = cfg.exec_ctx.dispatch_label();
+        let seq = emit_tool_call_with_identity(name, args, dispatch.as_deref(), identity);
+        emit_tool_result_as(seq, name, args, &out, None, dispatch.as_deref());
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn approval_identity_fixture(
+    root: &std::path::Path,
+    label: &str,
+    abandon: bool,
+) -> Result<bool> {
+    struct ApprovalProbe;
+    impl tools::Tool for ApprovalProbe {
+        fn name(&self) -> &str {
+            "approval_identity_probe"
+        }
+        fn description(&self) -> &str {
+            "Owned approval correlation fixture"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        fn is_destructive(&self) -> bool {
+            true
+        }
+        fn is_concurrency_safe(&self) -> bool {
+            false
+        }
+        fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+            Ok("owned fixture body ran".into())
+        }
+    }
+    let ctx = crate::core::exec_ctx::ExecutionContext::default()
+        .with_dispatch_label(Some(label.to_owned()))
+        .with_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(15),
+        ))
+        .with_placement(crate::core::file_placement::PlacementContext::with_paths(
+            root.to_path_buf(),
+            root.join("home"),
+            root.join("process"),
+            "approval-identity-fixture",
+        )?);
+    let cfg = AgentConfig {
+        exec_ctx: ctx.clone(),
+        workspace_root: Some(root.to_path_buf()),
+        enable_verify_gate: false,
+        auto_checkpoint: false,
+        enable_lsp: false,
+        spill_result_over_chars: 0,
+        ..AgentConfig::default()
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    crate::core::cancel::with_current(cfg.cancel.clone(), || {
+        crate::core::exec_ctx::with_current(ctx, || {
+            runtime.block_on(async {
+                let mut registry = tools::ToolRegistry::new();
+                registry.register(Box::new(ApprovalProbe));
+                let tool = registry.get("approval_identity_probe").unwrap();
+                let prepared = tool.prepare_call(&serde_json::json!({}), &cfg.exec_ctx)?;
+                if abandon {
+                    let allowed = gate_prepared_and_approve(tool, &prepared, &cfg).is_none();
+                    drop(prepared); // Allowed, but this invocation never starts or lends its id.
+                    let seq =
+                        emit_tool_call_as(tool.name(), &serde_json::json!({}), Some("unbound"));
+                    emit_tool_result_as(
+                        seq,
+                        tool.name(),
+                        &serde_json::json!({}),
+                        "owned unbound observation",
+                        None,
+                        Some("unbound"),
+                    );
+                    return Ok(allowed);
+                }
+                if label == "cancelled" {
+                    anyhow::ensure!(gate_prepared_and_approve(tool, &prepared, &cfg).is_none());
+                    cfg.cancel.cancel(); // Approval succeeded, but dispatch must not launch a body.
+                }
+                let call = ToolCall {
+                    id: format!("call_{label}"),
+                    kind: "function".into(),
+                    function: crate::core::types::FunctionCall {
+                        name: tool.name().into(),
+                        arguments: "{}".into(),
+                    },
+                };
+                let mut sink = [Message::tool_result(&call.id, "pending")];
+                let executions = execute_execution_calls(
+                    &registry,
+                    &[call],
+                    &[Ok(prepared)],
+                    false,
+                    &cfg,
+                    &mut sink,
+                    Vec::new(),
+                    &mut false,
+                    &mut None,
+                    &mut None,
+                    &[],
+                )
+                .await;
+                let outcome = &executions[0].outcome;
+                anyhow::ensure!(outcome.effect_state == tools::ToolEffectState::Settled);
+                Ok(outcome.failure.is_none())
+            })
+        })
+    })
+}
+
 /// [`emit_trace`] for tool bodies outside this module.
 ///
 /// A long-running tool is the one place a *tool* legitimately needs the trace lane: `shell_run`'s
 /// slow-command note has to reach the same surface as the loop's own progress lines, or it would
 /// `println!` into a raw-mode TUI and be wiped by the next repaint.
+/// A diagnostic that belongs in the run log, not in the user's transcript. Checkpoint
+/// unavailability is a property of the working directory (no repo, no git binary), so it recurs at
+/// every phase boundary and says nothing new after the first time — but it is still worth having
+/// when reconciling a run.
+fn tracing_note(line: &str) {
+    crate::ui::events::trace(line);
+}
+
 pub(crate) fn emit_trace_public(line: &str) {
     emit_trace(line);
 }
@@ -3414,26 +6321,41 @@ pub(crate) fn emit_trace_public(line: &str) {
 /// Factored out of the loop because the phase mark can fire on a turn that made no edit (the closing
 /// `todo_write` lands alone), so the call site is outside the `edited_this_turn` block. `label` is the
 /// full checkpoint label (e.g. `"phase: wire up auth"`), already prefixed by the caller.
-fn stamp_phase_checkpoint(quiet: bool, label: &str) {
-    match crate::features::timemachine::save(label, true) {
-        Ok(snap) => {
-            crate::features::timemachine::note_last_good(snap.id);
-            if !quiet {
+fn stamp_phase_checkpoint(cfg: &AgentConfig, root: Option<&std::path::Path>, label: &str) {
+    if cfg.exec_ctx.native_scope().is_some() {
+        return;
+    }
+    let root = root
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| cfg.effective_root());
+    match crate::features::timemachine::save_for_in_context(
+        cfg.exec_ctx.recovery(),
+        &root,
+        label,
+        true,
+        false,
+        &cfg.exec_ctx,
+    ) {
+        Ok(Some(snap)) => {
+            if !cfg.quiet {
                 emit_trace(&format!(
                     "  └ checkpoint #{} — {label} (agent: `checkpoint` action=rewind target=last_good; human: `aizen time restore {}`)",
                     snap.id, snap.id
                 ));
             }
         }
+        Ok(None) => {
+            // Same benign, repeating case as the two arms below: no git-visible coverage is a
+            // property of the directory, not news about this turn.
+            tracing_note("checkpoint unavailable: no git-visible repository coverage");
+        }
         Err(e) if e.to_string().contains("not a git repository") => {
-            if !quiet {
-                emit_trace("  └ checkpoint unavailable: not a git repository");
-            }
+            // Benign and repeated: every phase boundary in a non-repo directory would print this.
+            // The session run-log keeps it for forensics; the transcript stays clean.
+            tracing_note("checkpoint unavailable: not a git repository");
         }
         Err(e) if crate::core::gitx::is_git_missing(&e) => {
-            if !quiet {
-                emit_trace("  └ checkpoint unavailable: git executable not found (edits proceed without checkpoints)");
-            }
+            tracing_note("checkpoint unavailable: git executable not found (edits proceed without checkpoints)");
         }
         Err(e) => {
             emit_trace(&format!(
@@ -3456,6 +6378,26 @@ fn tool_icon() -> &'static str {
 /// The compact TARGET shown after the raw tool name — a basename / host / clipped query, reusing the
 /// same salient-field extraction as [`tool_trace`] but WITHOUT a verb (the mockup shows the raw tool
 /// name + its target, e.g. `file_read   src/auth.rs`). Empty when there's nothing salient.
+/// A path as the user would type it: relative to the process cwd when under it, forward
+/// slashes, else as given. The approval header and the diff box title use it.
+fn rel_path_display(p: &str) -> String {
+    let path = std::path::Path::new(p);
+    let shown = if path.is_absolute() {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| path.strip_prefix(&cwd).ok().map(|r| r.to_path_buf()))
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let s = shown.to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
+        p.to_string()
+    } else {
+        s
+    }
+}
+
 fn tool_target(name: &str, args: &serde_json::Value) -> String {
     let field = |k: &str| args.get(k).and_then(|v| v.as_str());
     let base = |p: &str| basename(p).to_string();
@@ -3463,8 +6405,10 @@ fn tool_target(name: &str, args: &serde_json::Value) -> String {
         "shell_run" | "bash" | "powershell" | "shell" => {
             shell_target(field("command").or_else(|| field("cmd")).unwrap_or(""))
         }
+        // The repo-relative path, not the basename: several `mod.rs` edits in one turn were
+        // indistinguishable in the header and the diff box.
         "file_write" | "write_file" | "file_edit" | "edit_file" | "apply_patch"
-        | "symbol_replace" | "symbol_insert" => base(
+        | "symbol_replace" | "symbol_insert" => rel_path_display(
             field("path")
                 .or_else(|| field("file"))
                 .or_else(|| field("symbol"))
@@ -3472,7 +6416,14 @@ fn tool_target(name: &str, args: &serde_json::Value) -> String {
         ),
         "file_read" | "read_file" => base(field("path").or_else(|| field("file")).unwrap_or("")),
         "file_move" | "move_file" | "rename_file" | "file_rename" => {
-            base(field("from").unwrap_or(""))
+            match field("to").filter(|t| !t.is_empty()) {
+                Some(to) => format!(
+                    "{} → {}",
+                    rel_path_display(field("from").unwrap_or("")),
+                    rel_path_display(to)
+                ),
+                None => rel_path_display(field("from").unwrap_or("")),
+            }
         }
         "file_glob" => {
             first_line_clip(field("pattern").or_else(|| field("glob")).unwrap_or(""), 40)
@@ -3534,10 +6485,10 @@ fn subagent_target(args: &serde_json::Value) -> String {
     let who = field("agent")
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        // Mirrors `resolve_dispatch`: absent/blank `role` runs as `coder`, so the line must say
-        // `coder` rather than go silent about a dispatch that CAN write.
+        // Mirrors `resolve_dispatch`: absent/blank `role` runs as `argus`, the safe read-only
+        // default — a dispatch that needs to write must say `daedalus` out loud.
         .or_else(|| field("role").map(str::trim).filter(|s| !s.is_empty()))
-        .unwrap_or("coder");
+        .unwrap_or("argus");
     let subject = subagent_subject(args, 48);
     if subject.is_empty() {
         who.to_string()
@@ -3593,14 +6544,190 @@ fn workflow_target(args: &serde_json::Value) -> String {
 /// Open a tool-call line (mockup shape `⚙ <name>   <target>`), returning the `seq` so the result can
 /// update the same line in place under retained. Shared by the serial + eager-adoption paths.
 fn emit_tool_call(name: &str, args: &serde_json::Value) -> u64 {
-    // Point the working caption (the typewriter line at the transcript bottom) at this tool's human
-    // action ("Reading retained.rs", "Run cargo test") — the hybrid caption's "concrete" half. When a
-    // tool has no English mapping, leave the caption on whatever whimsical verb is showing rather than
-    // typing out a raw tool slug. `emit_tool_result` clears it back to the verb when the call ends.
-    if let Some(action) = tool_action(name, args) {
-        crate::ui::tui::set_work_caption(&action);
+    emit_tool_call_as(name, args, dispatch_here().as_deref())
+}
+
+/// The delegated sub-agent whose call this thread is running — from the execution context the
+/// tool body was entered with (`exec_ctx::with_current`). `None` on the loop's own thread, which
+/// is why the sites that emit from there (an eager start adopted, a call that never ran) pass the
+/// label from their `cfg` instead of asking here.
+fn dispatch_here() -> Option<String> {
+    crate::core::exec_ctx::current().and_then(|c| c.dispatch_label())
+}
+
+/// [`emit_tool_call`] with the dispatch label given. Only the JSON stream carries it: the
+/// transcript never showed a child's calls, and still does not.
+fn emit_tool_call_as(name: &str, args: &serde_json::Value, dispatch: Option<&str>) -> u64 {
+    emit_tool_call_with_identity(name, args, dispatch, None)
+}
+
+fn prepared_display_target(
+    name: &str,
+    prepared: &tools::PreparedToolCall,
+) -> crate::ui::links::DisplayTarget {
+    let mut display = crate::ui::links::DisplayTarget::default();
+    let add = |display: &mut crate::ui::links::DisplayTarget, raw: &str| {
+        if let Some(path) = prepared
+            .display_paths
+            .iter()
+            .find(|path| path.matches_argument(std::path::Path::new(raw)))
+        {
+            let start = display.text.len();
+            display.text.push_str(path.label());
+            display
+                .paths
+                .push((start..display.text.len(), path.clone()));
+        } else {
+            display.text.push_str(&rel_path_display(raw));
+        }
+    };
+    if prepared.display_paths.is_empty() {
+        return display;
     }
-    crate::ui::tui::tool_call_begin(tool_icon(), name, &tool_target(name, args))
+    match name {
+        "file_move" => {
+            add(&mut display, prepared.args["from"].as_str().unwrap_or(""));
+            display.text.push_str(" → ");
+            add(&mut display, prepared.args["to"].as_str().unwrap_or(""));
+        }
+        "file_read" => {
+            let paths: Vec<_> = if let Some(files) = prepared.args["files"].as_array() {
+                files
+                    .iter()
+                    .take(8)
+                    .filter_map(|file| file["path"].as_str())
+                    .collect()
+            } else {
+                prepared.args["path"].as_str().into_iter().collect()
+            };
+            for path in paths {
+                if !display.text.is_empty() {
+                    display.text.push_str(", ");
+                }
+                add(&mut display, path);
+            }
+        }
+        "file_edit" | "file_write" => {
+            add(&mut display, prepared.args["path"].as_str().unwrap_or(""))
+        }
+        _ => {}
+    }
+    display
+}
+
+fn emit_prepared_tool_call(
+    name: &str,
+    prepared: &tools::PreparedToolCall,
+    dispatch: Option<&str>,
+) -> u64 {
+    if crate::ui::events::on() || prepared.display_paths.is_empty() {
+        return emit_tool_call_with_identity(
+            name,
+            &prepared.args,
+            dispatch,
+            Some(&prepared.approval_identity),
+        );
+    }
+    let display = prepared_display_target(name, prepared);
+    set_tool_work_caption(name, &prepared.args);
+    crate::ui::tui::tool_call_begin_display(
+        tool_icon(),
+        name,
+        &tool_target(name, &prepared.args),
+        &display,
+    )
+}
+
+fn prepared_result_summary(
+    name: &str,
+    prepared: &tools::PreparedToolCall,
+    out: &str,
+) -> (bool, String) {
+    let (ok, summary) = summarize_result(name, out);
+    if !ok || prepared.display_paths.is_empty() {
+        return (ok, summary);
+    }
+    let first = out.lines().next().unwrap_or("");
+    let summary = match name {
+        "file_write" if out.starts_with(builtin::NOOP_WRITE_PREFIX) => "unchanged".into(),
+        "file_write" if first.starts_with("overwrote ") => "overwrote".into(),
+        "file_write" => "created".into(),
+        "file_move" => "moved".into(),
+        "file_edit" if first.starts_with("created ") => "created".into(),
+        "file_edit" if first.starts_with("inserted ") => "inserted".into(),
+        "file_edit" if first.starts_with("replaced ") => "replaced".into(),
+        _ => summary,
+    };
+    (ok, summary)
+}
+
+fn emit_prepared_tool_result(
+    seq: u64,
+    name: &str,
+    prepared: &tools::PreparedToolCall,
+    out: &str,
+    elapsed_ms: Option<u64>,
+    dispatch: Option<&str>,
+) {
+    if crate::ui::events::on() || prepared.display_paths.is_empty() {
+        emit_tool_result_as(seq, name, &prepared.args, out, elapsed_ms, dispatch);
+        return;
+    }
+    let (ok, summary) = prepared_result_summary(name, prepared, out);
+    let display = prepared_display_target(name, prepared);
+    let target = tool_target(name, &prepared.args);
+    crate::ui::tui::tool_call_end_display(
+        seq,
+        tool_icon(),
+        name,
+        &target,
+        &summary,
+        Some(ok),
+        elapsed_ms,
+        out,
+        &display,
+    );
+    if ok {
+        crate::ui::cards::note_tool_activity(name);
+        if is_edit_tool(name) {
+            emit_edit_diff(&target, out);
+        }
+    }
+    crate::ui::tui::set_work_caption("");
+}
+
+fn set_tool_work_caption(name: &str, args: &serde_json::Value) {
+    if let Some(action) = tool_action(name, args) {
+        match crate::ui::theme::lane_tint(name) {
+            Some(color) => crate::ui::tui::set_work_caption_tinted(&action, color),
+            None => crate::ui::tui::set_work_caption(&action),
+        }
+    }
+}
+
+fn emit_tool_call_with_identity(
+    name: &str,
+    args: &serde_json::Value,
+    dispatch: Option<&str>,
+    identity: Option<&crate::ui::events::ApprovalIdentity>,
+) -> u64 {
+    if crate::ui::events::on() {
+        let target = tool_target(name, args);
+        let seq = crate::ui::tui::tool_call_begin(tool_icon(), name, &target);
+        crate::ui::events::tool_call(seq, name, args, &target, dispatch, identity);
+        return seq;
+    }
+    // The typed and ordinary tool rows share the same human action caption.
+    set_tool_work_caption(name, args);
+    // A task/workflow dispatch under the retained UI feeds the collapsible sub-agents block instead
+    // of opening a tool row per spawn — the registry's `start()` already published the new row, so
+    // the seq must exist for the matching `emit_tool_result` but no row is drawn.
+    let target = tool_target(name, args);
+    let suppress_row = is_delegate_tool(name) && crate::ui::tui::retained_running();
+    if !suppress_row {
+        return crate::ui::tui::tool_call_begin(tool_icon(), name, &target);
+    }
+    crate::ui::tui::tool_seq_alloc()
 }
 
 /// Close a tool-call line: compute the result digest (via [`summarize_result`]) and update the line
@@ -3614,21 +6741,57 @@ fn emit_tool_result(
     out: &str,
     elapsed_ms: Option<u64>,
 ) {
+    emit_tool_result_as(seq, name, args, out, elapsed_ms, dispatch_here().as_deref());
+}
+
+/// [`emit_tool_result`] with the dispatch label given (see [`emit_tool_call_as`]).
+fn emit_tool_result_as(
+    seq: u64,
+    name: &str,
+    args: &serde_json::Value,
+    out: &str,
+    elapsed_ms: Option<u64>,
+    dispatch: Option<&str>,
+) {
     let (ok, summary) = summarize_result(name, out);
+    if crate::ui::events::on() {
+        crate::ui::events::tool_result(
+            seq,
+            name,
+            &tool_target(name, args),
+            ok,
+            &summary,
+            elapsed_ms,
+            out,
+            dispatch,
+        );
+        return;
+    }
     // Point the idle screensaver's context card at the feature this tool illustrates (a sub-agent
     // spawn → "Delegate", a web_search → "Researches the web", …). Only on success — a failed call
     // didn't really exercise the feature. A no-op for tools with no card.
     if ok {
         crate::ui::cards::note_tool_activity(name);
     }
+    let target = tool_target(name, args);
+    if is_delegate_tool(name) && crate::ui::tui::retained_running() {
+        // Under retained a task/workflow never opened a tool row (see `emit_tool_call_as`): the
+        // collapsible sub-agents block carries it. Still keep the result tail for `Ctrl-E` and
+        // re-publish the panel so the finished row's ✓/✗ shows up.
+        crate::ui::tui::note_tool_body(seq, format!("{name} {target}"), out.to_string());
+        crate::agent::orchestration::publish_panel();
+        crate::ui::tui::set_work_caption("");
+        return;
+    }
     crate::ui::tui::tool_call_end(
         seq,
         tool_icon(),
         name,
-        &tool_target(name, args),
+        &target,
         &summary,
         Some(ok),
         elapsed_ms,
+        out,
     );
     if ok && !out.trim_start().starts_with("error:") && is_edit_tool(name) {
         emit_edit_diff(&tool_target(name, args), out);
@@ -3667,40 +6830,247 @@ fn count_diff(out: &str) -> (usize, usize) {
     (add, del)
 }
 
-/// `edited src/foo.rs (2 replacement(s))` → `edited src/foo.rs`; `created src/foo.rs` → `created src/foo.rs`.
-fn edit_target(head: &str) -> String {
-    let mut it = head.split_whitespace();
-    match (it.next(), it.next()) {
-        (Some("created"), Some(path)) => format!("created {path}"),
-        (Some(_), Some(path)) => format!("edited {path}"),
-        _ => "edited".to_string(),
-    }
+/// Parse a `@@ -N[,c] +M[,c] @@` unified hunk header into `(N, M)`.
+fn parse_hunk_header(l: &str) -> Option<(usize, usize)> {
+    let rest = l.strip_prefix("@@ -")?;
+    let (old_part, rest) = rest.split_once(" +")?;
+    let (new_part, _) = rest.split_once(" @@")?;
+    let num = |s: &str| s.split(',').next()?.parse::<usize>().ok();
+    Some((num(old_part)?, num(new_part)?))
 }
 
-/// Emit a boxed diff preview for an edit result: header `diff · <path>  +A −D`, then up to a few of
-/// the `^[-+]`-prefixed lines the unified `diff_preview` emitted (added = green `+`, removed = salmon
-/// `−`); context / cap-note lines (space- / `…`-prefixed) are skipped. `path` is the edited target
-/// (already a basename-ish target string). The full diff still reaches the model; only this preview
-/// hits the screen. Under retained this is a framed box; classic re-renders the same box inline.
+/// Emit a boxed diff preview for an edit result: the `^[-+]`-prefixed lines the unified
+/// `diff_preview` emitted, grouped into hunks by their `@@ -N +M @@` headers with the surrounding
+/// context lines kept — everything the side-by-side panes need (real gutter numbers, aligned
+/// context). A headerless output (an older tool shape) still shows, as bare `+`/`−` rows without
+/// numbers; context is only trusted INSIDE a numbered hunk (space-prefixed prose elsewhere in a
+/// result must not leak into the box). `path` is the edited target. The full diff still reaches
+/// the model; only this preview hits the screen. Under retained this is a framed box; classic
+/// re-renders the same box inline.
 fn emit_edit_diff(path: &str, out: &str) {
-    const MAX_SHOWN: usize = 8;
+    const MAX_CHANGED: usize = 12; // changed (±) rows shown across all hunks; context rides free
     let (adds, dels) = count_diff(out);
-    let mut lines: Vec<(bool, String)> = Vec::new();
-    for l in out.lines() {
-        let (is_add, content) = match l.as_bytes().first() {
-            Some(b'+') => (true, &l[1..]),
-            Some(b'-') => (false, &l[1..]),
-            _ => continue,
-        };
-        if lines.len() == MAX_SHOWN {
-            break;
-        }
-        lines.push((is_add, content.trim_end().to_string()));
-    }
-    if lines.is_empty() {
+    if crate::ui::events::on() {
+        // The `tool_result` event already carries the diff text; this is its size.
+        crate::ui::events::diff(path, adds, dels);
         return;
     }
-    crate::ui::tui::diff_box(path, adds, dels, lines);
+    let mut hunks: Vec<crate::ui::tui::DiffHunk> = Vec::new();
+    let mut cur: Option<crate::ui::tui::DiffHunk> = None;
+    let mut changed = 0usize;
+    for l in out.lines() {
+        if let Some((so, sn)) = parse_hunk_header(l) {
+            if let Some(h) = cur.take().filter(|h| !h.rows.is_empty()) {
+                hunks.push(h);
+            }
+            cur = Some(crate::ui::tui::DiffHunk {
+                start_old: so,
+                start_new: sn,
+                rows: Vec::new(),
+            });
+            continue;
+        }
+        if l.starts_with('…') {
+            continue; // `…(N more lines …)` cap note — elision, not the end of the diff section
+        }
+        let (kind, text) = match l.as_bytes().first() {
+            Some(b'+') => (1u8, &l[1..]),
+            Some(b'-') => (2u8, &l[1..]),
+            // Context is only meaningful inside a numbered hunk — a space-prefixed line anywhere
+            // else (edit summaries, LSP diagnostics) is prose, not diff.
+            Some(b' ') if cur.as_ref().is_some_and(|h| h.start_old > 0) => (0u8, &l[1..]),
+            _ => {
+                // A non-diff line after rows have been collected ends the diff section — anything
+                // later (the LSP feedback fold) must not be mistaken for more hunk rows.
+                if cur.as_ref().is_some_and(|h| !h.rows.is_empty()) || !hunks.is_empty() {
+                    break;
+                }
+                continue;
+            }
+        };
+        if kind != 0 {
+            if changed == MAX_CHANGED {
+                break;
+            }
+            changed += 1;
+            if cur.is_none() {
+                // Headerless output: one synthetic hunk, unknown position.
+                cur = Some(crate::ui::tui::DiffHunk {
+                    start_old: 0,
+                    start_new: 0,
+                    rows: Vec::new(),
+                });
+            }
+        }
+        if let Some(h) = cur.as_mut() {
+            h.rows.push((kind, text.trim_end().to_string()));
+        }
+    }
+    if let Some(h) = cur.take().filter(|h| !h.rows.is_empty()) {
+        hunks.push(h);
+    }
+    if hunks.iter().all(|h| h.rows.iter().all(|(k, _)| *k == 0)) {
+        return;
+    }
+    crate::ui::tui::diff_box(path, adds, dels, hunks);
+}
+
+/// Split a multi-file unified patch (`git diff-tree -p` output) into `(path, patch)` per file —
+/// the path from the `+++ b/…` line, else from the `diff --git a/x b/y` header.
+pub(crate) fn split_patch_by_file(patch: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut cur: Option<(String, String)> = None;
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(block) = cur.take() {
+                out.push(block);
+            }
+            let path = rest
+                .rsplit_once(" b/")
+                .map(|(_, p)| p.to_string())
+                .unwrap_or_else(|| rest.to_string());
+            cur = Some((path, String::new()));
+            continue;
+        }
+        let Some((path, body)) = cur.as_mut() else {
+            continue;
+        };
+        if let Some(p) = line.strip_prefix("+++ b/") {
+            *path = p.trim().to_string();
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if let Some(block) = cur.take() {
+        out.push(block);
+    }
+    out
+}
+
+/// Render a multi-file patch as one diff box per file (`/diff --patch` on the retained TUI;
+/// the same boxes an edit result gets). Files whose patch carries no changed rows are skipped.
+pub(crate) fn emit_patch_boxes(patch: &str) -> usize {
+    let blocks = split_patch_by_file(patch);
+    let n = blocks.len();
+    for (path, body) in blocks {
+        emit_edit_diff(&path, &body);
+    }
+    n
+}
+
+/// Hunks an edit result shows the model before the rest becomes a count.
+const COMPACT_DIFF_MAX_HUNKS: usize = 3;
+
+/// The model-facing form of an edit result: everything before the first `@@` header verbatim
+/// (the `edited …` line, batch summaries), then per hunk the header, context, removed lines and
+/// ONE `+N line(s)` row in place of the added text, at most [`COMPACT_DIFF_MAX_HUNKS`] hunks (the
+/// rest is summed), then everything after the diff section verbatim (the LSP feedback fold). A
+/// result with no `@@` header is returned unchanged.
+fn compact_edit_diff(out: &str) -> String {
+    if !out.lines().any(|l| parse_hunk_header(l).is_some()) {
+        return out.to_string();
+    }
+    let mut res: Vec<String> = Vec::new();
+    let mut in_diff = false;
+    let mut hunks = 0usize;
+    let mut pending_added = 0usize;
+    let mut hidden_hunks = 0usize;
+    let mut hidden_removed = 0usize;
+    let mut hidden_added = 0usize;
+    let mut ended = false;
+    let flush_added = |res: &mut Vec<String>, pending: &mut usize| {
+        if *pending > 0 {
+            res.push(format!("+{} line(s)", *pending));
+            *pending = 0;
+        }
+    };
+    for l in out.lines() {
+        if ended {
+            res.push(l.to_string());
+            continue;
+        }
+        if parse_hunk_header(l).is_some() {
+            flush_added(&mut res, &mut pending_added);
+            in_diff = true;
+            hunks += 1;
+            if hunks > COMPACT_DIFF_MAX_HUNKS {
+                hidden_hunks += 1;
+            } else {
+                res.push(l.to_string());
+            }
+            continue;
+        }
+        if !in_diff {
+            res.push(l.to_string());
+            continue;
+        }
+        let hidden = hunks > COMPACT_DIFF_MAX_HUNKS;
+        match l.as_bytes().first() {
+            Some(b'+') => {
+                if hidden {
+                    hidden_added += 1;
+                } else {
+                    pending_added += 1;
+                }
+            }
+            Some(b'-') => {
+                if hidden {
+                    hidden_removed += 1;
+                } else {
+                    flush_added(&mut res, &mut pending_added);
+                    res.push(l.to_string());
+                }
+            }
+            Some(b' ') => {
+                if !hidden {
+                    flush_added(&mut res, &mut pending_added);
+                    res.push(l.to_string());
+                }
+            }
+            _ if l.starts_with('…') => {
+                // `…(N more lines added/removed)` — fold into the counts.
+                let n: usize = l
+                    .trim_start_matches('…')
+                    .trim_start_matches('(')
+                    .split_whitespace()
+                    .next()
+                    .and_then(|w| w.parse().ok())
+                    .unwrap_or(0);
+                if l.contains("added") {
+                    if hidden {
+                        hidden_added += n;
+                    } else {
+                        pending_added += n;
+                    }
+                } else if !hidden {
+                    flush_added(&mut res, &mut pending_added);
+                    res.push(l.to_string());
+                } else {
+                    hidden_removed += n;
+                }
+            }
+            _ => {
+                // The diff section is over (LSP feedback, prose): close it and copy the rest.
+                flush_added(&mut res, &mut pending_added);
+                if hidden_hunks > 0 {
+                    res.push(format!(
+                        "…({hidden_hunks} more hunk(s): -{hidden_removed} +{hidden_added} lines)"
+                    ));
+                }
+                ended = true;
+                res.push(l.to_string());
+            }
+        }
+    }
+    if !ended {
+        flush_added(&mut res, &mut pending_added);
+        if hidden_hunks > 0 {
+            res.push(format!(
+                "…({hidden_hunks} more hunk(s): -{hidden_removed} +{hidden_added} lines)"
+            ));
+        }
+    }
+    res.join("\n")
 }
 
 /// Build the `⎿` summary for a tool result, returning `(ok, text)` (`ok=false` → coloured as a
@@ -3748,7 +7118,12 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
                 (true, first.chars().take(80).collect())
             } else {
                 let (a, d) = count_diff(out);
-                (true, format!("{} · +{a} −{d}", edit_target(first)))
+                let verb = if first.starts_with("created") {
+                    "created"
+                } else {
+                    "edited"
+                };
+                (true, format!("{verb} · +{a} −{d}"))
             }
         }
         "file_write" | "write_file" => {
@@ -3798,6 +7173,26 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
                 (true, format!("{} chars", out.chars().count()))
             }
         }
+        // A loaded skill's body is the tool's RESULT, not its outcome: printing it above the turn
+        // buried the conversation under the skill's own instructions (name, when, entry, resources,
+        // then the whole procedure). The digest names what was loaded; the body stays in history and
+        // opens with Ctrl-E.
+        "skill_load" => {
+            let name = out
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("# skill: ")
+                .split(" — ")
+                .next()
+                .unwrap_or("")
+                .trim();
+            if name.is_empty() {
+                (true, "skill loaded".to_string())
+            } else {
+                (true, format!("skill loaded · {name}"))
+            }
+        }
         // Everything else already returns a good one-line header (`N reference(s)`,
         // `N match(es) in M file(s):`, `crawled N page(s) → M URL(s)`, `todo list updated: …`) —
         // reuse it verbatim (sans a trailing ':').
@@ -3823,19 +7218,171 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
 /// verbatim in history". All legs must hold; any miss falls back to a normal read. A false
 /// negative costs nothing, a false positive would starve the model of content it needs — so every
 /// check is byte-level.
+#[derive(Clone)]
 struct ReadCacheEntry {
-    /// Resolved on-disk path, for the fingerprint re-check.
-    path: std::path::PathBuf,
-    /// Fingerprint of the file bytes the cached result described. Recorded only from turns with
-    /// NO destructive call, so it provably equals the content at read time (nothing in the same
-    /// turn could have rewritten the file between the read and the record).
-    fingerprint: crate::core::persist::FileFingerprint,
+    /// Resolved on-disk path(s) with the fingerprint of the bytes the cached result described —
+    /// one pair for the single-path form, one per entry for the `files:[…]` batch form (every
+    /// file must still match for the whole call to count as unchanged). Recorded only from turns
+    /// with NO destructive call, so each fingerprint provably equals the content at read time
+    /// (nothing in the same turn could have rewritten the file between the read and the record).
+    files: Vec<(std::path::PathBuf, crate::core::persist::FileFingerprint)>,
+    /// The requested line window per file, aligned with `files` (see [`read_windows`]) — kept
+    /// so the context pack can say `path:start-end`, not just `path`. The key's canonical
+    /// args are NOT JSON (keys unquoted), so this is recorded here, not re-parsed from there.
+    windows: Vec<ReadWindow>,
     /// Where the result message sat when recorded — revalidated against id+len+prefix below, so a
     /// shifted (compacted) or blanked (evicted) history can never false-match.
     msg_index: usize,
     call_id: String,
     result_chars: usize,
     result_prefix: String,
+    /// Insertion order, so "the newest N reads in a scope" is well-defined — the context
+    /// pack hands a delegated child the parent's most recent reading list.
+    seq: u64,
+}
+
+fn unchanged_read_result(
+    entry: &ReadCacheEntry,
+    root: &std::path::Path,
+    args: &serde_json::Value,
+) -> Option<String> {
+    let paths: Vec<_> = match args.get("files").and_then(|v| v.as_array()) {
+        Some(files) => files
+            .iter()
+            .map(|f| f.get("path")?.as_str())
+            .collect::<Option<_>>()?,
+        None => vec![args.get("path")?.as_str()?],
+    };
+    if paths.is_empty() || paths.len() != entry.files.len() {
+        return None;
+    }
+    for (raw, (path, expected)) in paths.iter().zip(&entry.files) {
+        let resolved = builtin::confine(root, raw, true).ok()?;
+        if resolved.canonicalize().ok()? != path.canonicalize().ok()? {
+            return None;
+        }
+        let bytes = std::fs::read(&resolved).ok()?;
+        if crate::core::persist::FileFingerprint::for_bytes(&bytes) != *expected {
+            return None;
+        }
+    }
+    let what = entry
+        .files
+        .iter()
+        .map(|(p, _)| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "[unchanged] {what} — identical to your earlier file_read (tool result {} above); \
+         still in context and the file has not changed since. Use what you already have, \
+         or pass a different start/end for another slice.",
+        entry.call_id,
+    ))
+}
+
+static READ_CACHE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The short-circuit store, process-global and keyed by `{scope}\u{1f}{canonical args}` so it
+/// SURVIVES the loop that recorded it: history persists across user turns, but the cache used to be
+/// a loop local — turn 2 re-reading a file from turn 1 always paid full price, which is exactly the
+/// pattern the feature exists for. Safe globally because every hit re-proves itself at use time
+/// against the CURRENT history and the CURRENT file bytes; a stale entry from any other loop or
+/// scope simply misses. Scoped by `exec_ctx.resource_scope()` (conversation id for top-level turns,
+/// a derived id per delegated child) so a sub-agent's recordings never collide with its parent's.
+fn read_cache_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, ReadCacheEntry>>
+{
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ReadCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn read_cache_key(scope: &str, canonical: &str) -> String {
+    format!("{scope}\u{1f}{canonical}")
+}
+
+fn read_cache_get(key: &str) -> Option<ReadCacheEntry> {
+    read_cache_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .cloned()
+}
+
+fn read_cache_insert(key: String, entry: ReadCacheEntry) {
+    let mut map = read_cache_store().lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= 512 {
+        map.clear(); // bounded; a dropped entry only costs a re-read
+    }
+    map.insert(key, entry);
+}
+
+/// Drop every entry recorded under `scope` — the compaction path calls this when it rebuilds
+/// history, because the msg_index leg of those entries' proof dies with the rebuild.
+fn read_cache_clear_scope(scope: &str) {
+    let prefix = format!("{scope}\u{1f}");
+    read_cache_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|k, _| !k.starts_with(&prefix));
+}
+
+/// The line window a `file_read` call asked for: `(start, Some(end))` for a ranged read,
+/// `(start, None)` for one that ran to the end of the file, `None` for a whole-file read.
+pub(crate) type ReadWindow = Option<(usize, Option<usize>)>;
+
+/// The line window a `file_read` call asked for, per file: `(start, Some(end))` for a ranged
+/// read, `(start, None)` for one that ran to the end of the file, `None` for a whole-file read.
+/// One entry per `files:[…]` item for the batch form, one for the single-path form.
+fn read_windows(args: &serde_json::Value) -> Vec<ReadWindow> {
+    let window = |v: &serde_json::Value| -> ReadWindow {
+        let start = v.get("start").and_then(|x| x.as_u64()).map(|n| n as usize);
+        let end = v.get("end").and_then(|x| x.as_u64()).map(|n| n as usize);
+        match (start, end) {
+            (None, None) => None,
+            (s, e) => Some((s.unwrap_or(1), e)),
+        }
+    };
+    match args.get("files").and_then(|f| f.as_array()) {
+        Some(items) => items.iter().map(window).collect(),
+        None => vec![window(args)],
+    }
+}
+
+/// The locations recorded in `scope`'s read cache, newest first: `(resolved path, line window)`
+/// per file — the parent's own reading list, which `context_pack` hands to a delegated child.
+/// The batch `files:[…]` form yields one row per file; duplicates collapse.
+pub(crate) fn read_cache_recent(scope: &str, max: usize) -> Vec<(std::path::PathBuf, ReadWindow)> {
+    let prefix = format!("{scope}\u{1f}");
+    let mut rows: Vec<(u64, std::path::PathBuf, ReadWindow)> = Vec::new();
+    {
+        let map = read_cache_store().lock().unwrap_or_else(|e| e.into_inner());
+        for (key, entry) in map.iter() {
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            for (i, (path, _)) in entry.files.iter().enumerate() {
+                rows.push((
+                    entry.seq,
+                    path.clone(),
+                    entry.windows.get(i).copied().flatten(),
+                ));
+            }
+        }
+    }
+    // Stable sort: files of one batch read keep their spec order under the same seq.
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let mut out: Vec<(std::path::PathBuf, ReadWindow)> = Vec::new();
+    for (_, path, w) in rows {
+        if out.iter().any(|(p, x)| *p == path && *x == w) {
+            continue;
+        }
+        out.push((path, w));
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
 }
 
 fn turn_signature(calls: &[ToolCall]) -> String {
@@ -4051,11 +7598,25 @@ const IMAGE_TOK: usize = 768;
 /// `content: null`), so the 60/80/90% context guards fired late. Shared with `main.rs`'s
 /// `session_tokens` so the mid-loop guard and the HUD agree on size.
 pub fn estimate_message_tokens(m: &Message) -> usize {
-    let mut chars: usize = m.content.as_ref().map_or(0, |c| c.chars().count());
-    for tc in &m.tool_calls {
-        chars += tc.function.name.chars().count() + tc.function.arguments.chars().count() + 24;
+    // One counter, one division: the weighting lives in `core::tokens` (CJK, combining marks and
+    // precomposed Vietnamese count 1/1.8 each; ASCII stays exactly chars/4).
+    let mut n = crate::core::tokens::Counter::default();
+    if let Some(c) = &m.content {
+        n.add(c);
     }
-    chars / 4 + MSG_OVERHEAD_TOK + m.images.len() * IMAGE_TOK
+    for tc in &m.tool_calls {
+        n.add(&tc.function.name)
+            .add(&tc.function.arguments)
+            .add_light(24);
+    }
+    n.tokens()
+        + MSG_OVERHEAD_TOK
+        + m.images.len() * IMAGE_TOK
+        + m.tool_images
+            .iter()
+            .filter(|image| image.is_available())
+            .count()
+            * IMAGE_TOK
 }
 
 /// Sum of [`estimate_message_tokens`]. Callers comparing against the context window must ADD the
@@ -4065,15 +7626,33 @@ fn estimate_tokens(messages: &[Message]) -> usize {
     messages.iter().map(estimate_message_tokens).sum()
 }
 
+/// Context guards count the outgoing view, not retained images the wire will omit. Synthetic
+/// observations and the task capsule remain request-only; base64 is not counted as prose tokens.
+fn estimate_request_tokens(messages: &[Message], cfg: &AgentConfig) -> usize {
+    if cfg.exec_ctx.design().is_none() && messages.iter().all(|m| m.tool_images.is_empty()) {
+        return estimate_tokens(messages);
+    }
+    let mut request = messages.to_vec();
+    if let Some(ctx) = cfg.exec_ctx.design() {
+        design::prompt::seat_prompt(&mut request, &ctx);
+    }
+    let projected = crate::llm::media::project_messages_for_destination(
+        &request,
+        cfg.tool_image_policy,
+        cfg.tool_image_destination.as_deref(),
+    );
+    estimate_tokens(&projected.messages)
+}
+
 /// The most recent tool-schema overhead estimate, published by the loop for `main.rs`'s HUD /
 /// auto-compact so both sides agree on request size (0 before the first loop run).
 static SCHEMA_OVERHEAD_TOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Per-request tool-schema cost: the serialized JSON length / 4. Computed once per loop run (the
-/// defs don't change mid-run) and published to a process-global for the HUD.
+/// Per-request tool-schema cost: the serialized JSON through the shared estimator. Computed once
+/// per loop run (the defs don't change mid-run) and published to a process-global for the HUD.
 pub fn estimate_defs_tokens(defs: &[ToolDef]) -> usize {
     let tok = serde_json::to_string(defs)
-        .map(|s| s.len() / 4)
+        .map(|s| crate::core::tokens::estimate_str(&s))
         .unwrap_or(0);
     SCHEMA_OVERHEAD_TOK.store(tok, std::sync::atomic::Ordering::Relaxed);
     tok
@@ -4169,6 +7748,15 @@ fn is_failure_result(content: &str) -> bool {
     false
 }
 
+/// How many emergency shrinks one run may spend before a context overflow is surfaced as the
+/// error it is. One was a single shot: the second overflow of a long run failed with evictable
+/// bodies still in the transcript. Each shrink halves what is left, so three is plenty — and
+/// `emergency_overflow_shrink` returning `false` (nothing left to evict) ends it sooner.
+const MAX_OVERFLOW_SHRINKS: usize = 3;
+
+/// Consecutive auto-compaction failures before the cadence latch arms anyway (see the loop).
+const COMPACT_FAILURES_BEFORE_LATCH: usize = 2;
+
 /// EMERGENCY OVERFLOW SHRINK — the recovery behind [`crate::llm::client::ApiErrorKind::ContextOverflow`].
 ///
 /// The provider just rejected the request as too big, which means the chars/4 estimate that arms
@@ -4182,7 +7770,7 @@ fn emergency_overflow_shrink(
     cfg: &AgentConfig,
     schema_overhead: usize,
 ) -> bool {
-    let raw = estimate_tokens(messages) + schema_overhead;
+    let raw = estimate_request_tokens(messages, cfg) + schema_overhead;
     let target = if cfg.context_window > 0 {
         (cfg.context_window / 2).min(raw / 2)
     } else {
@@ -4234,12 +7822,23 @@ pub fn clear_tool_results_to_floor(
         if est <= target_tokens {
             break;
         }
-        let len = match messages[i].content.as_deref() {
-            Some(b) if b.chars().count() > min_chars && !is_failure_result(b) => b.chars().count(),
-            _ => continue,
-        };
+        let has_images = messages[i]
+            .tool_images
+            .iter()
+            .any(|image| image.is_available());
+        let body = messages[i].content.as_deref().unwrap_or("");
+        if is_failure_result(body) || (!has_images && body.chars().count() <= min_chars) {
+            continue;
+        }
+        let len = body.chars().count();
         est = est.saturating_sub(estimate_message_tokens(&messages[i]));
-        messages[i].content = Some(CLEARED_TOOL_PLACEHOLDER.to_string());
+        if len > min_chars {
+            messages[i].content = Some(CLEARED_TOOL_PLACEHOLDER.to_string());
+        }
+        observe::evict_tool_images(
+            &mut messages[i],
+            crate::core::tool_media::ImageUnavailable::Retention,
+        );
         est += estimate_message_tokens(&messages[i]);
         stats.chars_reclaimed += len.saturating_sub(CLEARED_TOOL_PLACEHOLDER.chars().count());
         stats.cleared += 1;
@@ -4250,11 +7849,15 @@ pub fn clear_tool_results_to_floor(
         if est <= target_tokens {
             break;
         }
+        let has_images = messages[i]
+            .tool_images
+            .iter()
+            .any(|image| image.is_available());
         let (len, trimmed) = match messages[i].content.as_deref() {
             Some(b)
                 if is_failure_result(b)
-                    && b.chars().count() > min_chars
-                    && !b.ends_with(FAILED_TOOL_TRIM_SUFFIX) =>
+                    && (has_images || b.chars().count() > min_chars)
+                    && (has_images || !b.ends_with(FAILED_TOOL_TRIM_SUFFIX)) =>
             {
                 let first: String = b.lines().next().unwrap_or("").chars().take(160).collect();
                 (
@@ -4266,6 +7869,10 @@ pub fn clear_tool_results_to_floor(
         };
         est = est.saturating_sub(estimate_message_tokens(&messages[i]));
         messages[i].content = Some(trimmed);
+        observe::evict_tool_images(
+            &mut messages[i],
+            crate::core::tool_media::ImageUnavailable::Retention,
+        );
         est += estimate_message_tokens(&messages[i]);
         stats.chars_reclaimed += len.saturating_sub(
             messages[i]
@@ -4645,6 +8252,8 @@ const NUDGE_TODO: &str = "Current task list";
 const NUDGE_STUCK: &str = "Recent turns added no new evidence";
 /// P0.1 incomplete-todo gate inject (user role — hard block path, not a soft system nudge).
 const TODO_POKE_PREFIX: &str = "[todo-poke]";
+/// P1 plan nudge: a large untracked run is told to write a todo list or a plan file.
+pub(crate) const PLAN_NUDGE_PREFIX: &str = "[plan-nudge]";
 /// P0.2 confidence-spike gate inject.
 const CONFIDENCE_GATE_PREFIX: &str = "[confidence-gate]";
 /// P0.3 hill-climb reframe / remeasure (system nudge via push_nudge).
@@ -4664,10 +8273,12 @@ const GOAL_POKE_PREFIX: &str = "[goal]";
 /// shape as the todo-poke and goal pokes rather than a soft system nudge). Shared by both paths so
 /// the transcript reads with one consistent marker for "the harness granted more room".
 const CONTINUE_PREFIX: &str = "[continue]";
-/// Save-before-clear warning (P-ctx2). Mirrors Claude's server-side "preserve important information"
-/// warning: fired ONCE, the turn BEFORE the first tool-result eviction, so the model can persist
-/// anything durable (memory files, todo_write) while the old results are still in context.
-const NUDGE_SAVE_BEFORE_CLEAR: &str = "Context is filling up";
+/// A sibling posted a new blackboard note mid-run (Phase 2b): the loop refreshes the pointer as
+/// a collapsing system nudge, so the child sees fresh findings without a new spawn.
+const NUDGE_BLACKBOARD: &str = "[blackboard]";
+/// A coordinator instruction arrived via `<run_id>.signals.jsonl` (Phase 2c): drained at the top
+/// of each loop iteration and injected as a collapsing system nudge.
+const NUDGE_SIGNAL: &str = "[signal]";
 /// Running context-budget signal (P-ctx1). Like Claude's server-side `<budget>`/`<system_warning>`
 /// pair, but client-side and CACHE-AWARE: refreshed only when usage crosses a new band (see
 /// `budget_band`), never every turn — every mid-history system-message rewrite busts the provider
@@ -4691,7 +8302,7 @@ fn retry_line(lane: &str, reason: &str, delay_ms: u64) {
     if crate::ui::tui::active() {
         crate::ui::tui::emit_line(&line);
     } else {
-        eprintln!("{line}");
+        emit_trace(&line);
     }
 }
 
@@ -4727,11 +8338,7 @@ fn budget_band(est: usize, window: usize) -> Option<u8> {
 /// out.` Kept terse; the leading `NUDGE_BUDGET` prefix lets `push_nudge` collapse the prior one.
 fn budget_nudge_text(est: usize, window: usize) -> String {
     let remaining = window.saturating_sub(est);
-    let pct_left = if window > 0 {
-        remaining * 100 / window
-    } else {
-        0
-    };
+    let pct_left = (remaining * 100).checked_div(window).unwrap_or(0);
     format!(
         "{NUDGE_BUDGET} ~{}/{} tokens used (~{} remaining, {}% left). Spend it deliberately — do \
          not re-read files you already have, and wrap up before it runs out.",
@@ -4769,12 +8376,47 @@ const FLAT_TURNS_BEFORE_NUDGE: usize = 2;
 /// here — if it makes no progress the thrash guard catches it. O(1) memory, cheap String compares.
 const SIG_RING: usize = 6;
 
-/// Append a system nudge, first removing any EARLIER system message of the same kind
-/// (`kind_prefix` must prefix `text`). Scans indices 1.. only — the system prompt at `[0]` is
-/// untouchable — and removes ONLY `role == "system"` messages, so assistant↔tool pairing cannot be
+/// Tag on a nudge delivered in the user turn, so it is never mistaken for something the user
+/// typed and can be found again for de-duplication and retirement.
+const USER_NUDGE_TAG: &str = "[harness] ";
+
+/// Every nudge kind the loop injects. Used by [`retire_nudges`] to strip stale ones at the start
+/// of the next run — a nudge is advice for THIS run, and left in place it rides every later
+/// request as instructions (and, on the Codex path, inside the hoisted instructions blob).
+const NUDGE_KINDS: &[&str] = &[
+    NUDGE_CONTEXT,
+    NUDGE_DIVERGENCE,
+    NUDGE_STEP_LIMIT,
+    NUDGE_TODO,
+    NUDGE_STUCK,
+    NUDGE_HILL_CLIMB,
+    NUDGE_BATCH,
+    NUDGE_BUDGET,
+    NUDGE_BLACKBOARD,
+    NUDGE_SIGNAL,
+    PLAN_NUDGE_PREFIX,
+];
+
+/// Is `m` a nudge of `kind_prefix`, in either delivery role?
+fn is_nudge_of_kind(m: &Message, kind_prefix: &str) -> bool {
+    let Some(c) = m.content.as_deref() else {
+        return false;
+    };
+    match m.role.as_str() {
+        "system" => c.starts_with(kind_prefix),
+        "user" => c
+            .strip_prefix(USER_NUDGE_TAG)
+            .is_some_and(|rest| rest.starts_with(kind_prefix)),
+        _ => false,
+    }
+}
+
+/// Append a nudge in `role`, first removing any EARLIER nudge of the same kind (`kind_prefix`
+/// must prefix `text`). Scans indices 1.. only — the system prompt at `[0]` is untouchable — and
+/// removes ONLY messages that are nudges of this kind, so assistant↔tool pairing cannot be
 /// orphaned by construction. The new nudge is always the TAIL message, preserving the caller's
 /// error-rollback contract (`messages.pop()` removes exactly the nudge).
-fn push_nudge(messages: &mut Vec<Message>, kind_prefix: &str, text: &str) {
+fn push_nudge_as(messages: &mut Vec<Message>, role: NudgeRole, kind_prefix: &str, text: &str) {
     debug_assert!(
         text.starts_with(kind_prefix),
         "kind prefix must identify its own nudge text"
@@ -4782,16 +8424,39 @@ fn push_nudge(messages: &mut Vec<Message>, kind_prefix: &str, text: &str) {
     let mut i = messages.len();
     while i > 1 {
         i -= 1;
-        if messages[i].role == "system"
-            && messages[i]
-                .content
-                .as_deref()
-                .is_some_and(|c| c.starts_with(kind_prefix))
+        if is_nudge_of_kind(&messages[i], kind_prefix) {
+            messages.remove(i);
+        }
+    }
+    match role {
+        NudgeRole::System => messages.push(Message::system(text)),
+        NudgeRole::User => messages.push(Message::user(format!("{USER_NUDGE_TAG}{text}"))),
+    }
+}
+
+/// [`push_nudge_as`] in the default `system` role (tests and the paths with no config in reach).
+#[cfg_attr(not(test), allow(dead_code))]
+fn push_nudge(messages: &mut Vec<Message>, kind_prefix: &str, text: &str) {
+    push_nudge_as(messages, NudgeRole::System, kind_prefix, text)
+}
+
+/// Remove every nudge left behind by an EARLIER run. Called at loop entry, not at exit: the
+/// harness tests read the nudges a run injected off its history, and a new user turn rewrites
+/// the cache prefix from that point anyway, so stripping here costs nothing extra. Index 0 (the
+/// system prompt) is never touched. Returns how many were removed.
+pub fn retire_nudges(messages: &mut Vec<Message>) -> usize {
+    let before = messages.len();
+    let mut i = messages.len();
+    while i > 1 {
+        i -= 1;
+        if NUDGE_KINDS
+            .iter()
+            .any(|k| is_nudge_of_kind(&messages[i], k))
         {
             messages.remove(i);
         }
     }
-    messages.push(Message::system(text));
+    before - messages.len()
 }
 
 /// Generic tokens a URL/protocol source contributes that carry no topical signal (scheme, common
@@ -4854,11 +8519,14 @@ pub fn truncate_relevant(s: &str, max: usize, keywords: &[String]) -> String {
     if scores.iter().all(|&x| x == 0) {
         return truncate_result(s, max); // nothing matched → don't distort; keep head+tail
     }
-    // Reserve ~1/4 of the budget for an always-included HEAD (orientation), the rest for the best
-    // window around the peak-scoring region.
+    // Reserve ~1/4 of the budget for an always-included HEAD (orientation), a small fixed TAIL
+    // (tools put their "…[capped at N — narrow the query]" hints at the very end, and a cut that
+    // drops the hint leaves the model reasoning over a list it cannot tell is incomplete), and the
+    // rest for the best window around the peak-scoring region.
+    const TAIL_KEEP: usize = 200;
     let head_budget = (max / 4).min(n);
     let head: String = s.chars().take(head_budget).collect();
-    let body_budget = max.saturating_sub(head.chars().count() + 48); // 48 ≈ two elision markers
+    let body_budget = max.saturating_sub(head.chars().count() + TAIL_KEEP + 64); // 64 ≈ three elision markers
 
     // Find the contiguous line-run maximizing total score under body_budget chars (greedy window
     // grown around the single best line — O(lines), good enough and stable).
@@ -4903,9 +8571,22 @@ pub fn truncate_relevant(s: &str, max: usize, keywords: &[String]) -> String {
         }
     }
     let window: String = lines[lo..=hi].join("\n");
-    let omitted = n.saturating_sub(head.chars().count() + window.chars().count());
+    // Whatever follows the window: appended whole when it is short, else its last TAIL_KEEP chars
+    // behind a marker, so the trailing hint survives either way.
+    let rest: String = lines[hi + 1..].join("\n");
+    let rest_chars = rest.chars().count();
+    let tail = if rest.is_empty() {
+        String::new()
+    } else if rest_chars <= TAIL_KEEP {
+        format!("\n{rest}")
+    } else {
+        let kept: String = rest.chars().skip(rest_chars - TAIL_KEEP).collect();
+        format!("\n…[{} chars elided]…\n{kept}", rest_chars - TAIL_KEEP)
+    };
+    let omitted =
+        n.saturating_sub(head.chars().count() + window.chars().count() + tail.chars().count());
     format!(
-        "{head}\n…[{omitted} chars elided — kept the region most relevant to the query]…\n{window}"
+        "{head}\n…[{omitted} chars elided — kept the region most relevant to the query]…\n{window}{tail}"
     )
 }
 
@@ -4936,7 +8617,49 @@ pub fn truncate_result(s: &str, max: usize) -> String {
 ///
 /// `cfg` supplies the LANE the prompt belongs to: `serve` runs lanes concurrently, so the reply must
 /// go back to the bot+chat that asked, not to whichever lane last wrote the process-global route.
-fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
+/// Render a call's pre-flight payload above its approval question: the patch as a diff box,
+/// the plain rows (cwd, full command, byte counts) as faint lines.
+fn show_preview(p: &crate::agent::tools::ApprovalPreview) {
+    if let Some(diff) = &p.diff {
+        emit_edit_diff(&p.title, diff);
+    }
+    for l in &p.lines {
+        let row = format!(
+            "  {} {}",
+            crate::ui::theme::faint("│"),
+            crate::ui::theme::faint(l)
+        );
+        if crate::ui::tui::active() {
+            crate::ui::tui::emit_line(&row);
+        } else {
+            emit_trace(&row);
+        }
+    }
+}
+
+/// The preview as plain text for a chat surface (Telegram): the rows, then the patch clipped.
+fn preview_plain(p: &crate::agent::tools::ApprovalPreview) -> String {
+    const DIFF_CHARS: usize = 1_500;
+    let mut s = p.lines.join("\n");
+    if let Some(diff) = &p.diff {
+        let body: String = diff.chars().take(DIFF_CHARS).collect();
+        s.push('\n');
+        s.push_str(&body);
+        if body.len() < diff.len() {
+            s.push_str("\n…");
+        }
+    }
+    s
+}
+
+fn approve(
+    tool: &str,
+    prepared: &tools::PreparedToolCall,
+    cfg: &AgentConfig,
+    preview: Option<&crate::agent::tools::ApprovalPreview>,
+    target: Option<&std::path::Path>,
+) -> bool {
+    let args = &prepared.args;
     use std::io::{IsTerminal, Write};
     crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::AwaitingApproval);
     struct RestorePhase;
@@ -4946,6 +8669,45 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
         }
     }
     let _restore_phase = RestorePhase;
+    // WHO is asking: a delegated child's approval used to read exactly like the parent's own
+    // (`Run rm -rf build — approve?`), so the user could not tell a sub-agent's request apart.
+    let plain_who = cfg
+        .exec_ctx
+        .dispatch_label()
+        .map(|l| format!("{l} wants: "))
+        .unwrap_or_default();
+    let who = if plain_who.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} ",
+            style(plain_who.trim_end()).color256(crate::ui::theme::WARN)
+        )
+    };
+    let once = preview.is_some_and(|p| p.lines.iter().any(|line| line == IMAGE_APPROVAL_ONCE));
+    // JSON stream: the question goes out as data and the answer comes back on stdin.
+    if crate::ui::events::on() {
+        let preview = preview
+            .map(|p| serde_json::json!({ "title": p.title, "lines": p.lines, "diff": p.diff }));
+        let who = cfg.exec_ctx.dispatch_label();
+        return if once {
+            crate::ui::events::ask_approval_once(
+                tool,
+                args,
+                who.as_deref(),
+                preview,
+                &prepared.approval_identity,
+            )
+        } else {
+            crate::ui::events::ask_approval(
+                tool,
+                args,
+                who.as_deref(),
+                preview,
+                &prepared.approval_identity,
+            )
+        };
+    }
     // Under the sticky TUI the background input thread owns stdin, so we can't run a blocking y/N
     // read inline. Instead, route a per-action prompt THROUGH that thread: `ask_approval` blocks
     // until it presses [y]es / [n]o / [a]llow-all-session. (Destructive tools force the serial path,
@@ -4956,21 +8718,40 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
         // menu can be painted and y/n/a on the keyboard is the whole interface.
         let hint = if crate::ui::tui::retained_running() {
             "— approve?"
+        } else if once {
+            "— approve this image transmission? [y]es · [n]o"
         } else {
-            "— approve? [y]es · [n]o · [a]llow all this session"
+            "— approve? [y]es · [t]ool always · [d]ir always · [a]llow all · [n]o"
         };
         let prompt = format!(
-            "{}  {}",
+            "{who}{}  {}",
             tool_call_line(tool, args),
             style(hint).color256(crate::ui::theme::WARN)
         );
-        return tokio::task::block_in_place(|| crate::ui::tui::ask_approval(&prompt));
+        // The payload ABOVE the question, unless the session already said allow-all (then
+        // `ask_approval` answers without asking and the box would be noise).
+        if let Some(p) = preview {
+            if once || !crate::ui::tui::session_allow_all() {
+                show_preview(p);
+            }
+        }
+        return tokio::task::block_in_place(|| {
+            if once {
+                crate::ui::tui::ask_approval_once(&prompt, tool)
+            } else {
+                crate::ui::tui::ask_approval_for(&prompt, tool, target)
+            }
+        });
     }
     if !std::io::stdin().is_terminal() {
         if crate::hostbot::platforms::telegram::daemon_is_active()
             && crate::hostbot::platforms::telegram::is_configured()
         {
-            let prompt = format!("{tool} {}", compact_args(args));
+            let mut prompt = format!("{plain_who}{tool} {}", compact_args(args));
+            if let Some(p) = preview {
+                prompt.push('\n');
+                prompt.push_str(&preview_plain(p));
+            }
             // Bridge to the async approval on the current (multi-thread) runtime; the serve poll
             // loop runs on another worker and delivers the callback. The route comes from THIS
             // turn's context — under concurrent lanes the process-global one belongs to whoever
@@ -4986,8 +8767,11 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
         }
         return false;
     }
+    if let Some(p) = preview {
+        show_preview(p);
+    }
     print!(
-        "{}  {} ",
+        "{who}{}  {} ",
         tool_call_line(tool, args),
         style("— run it? [y/N]:").dim()
     );
@@ -5091,7 +8875,7 @@ fn tool_action(name: &str, args: &serde_json::Value) -> Option<String> {
 /// The last path segment of `p` (handles both `/` and `\`), so a long absolute path renders as just
 /// the file name in the action line. Empty stays empty.
 fn basename(p: &str) -> &str {
-    p.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(p)
+    p.rsplit(['/', '\\']).next().unwrap_or(p)
 }
 
 /// The host of a URL for a compact fetch/crawl label — `https://docs.rs/x` → `docs.rs`. Falls back
@@ -5182,6 +8966,691 @@ mod tests {
     use super::*;
     use crate::core::types::FunctionCall;
     use std::collections::VecDeque;
+
+    mod task_parallel_tests {
+        include!("task_parallel_tests.rs");
+    }
+
+    mod hooks_executor_tests {
+        include!("hooks_executor_tests.rs");
+    }
+
+    mod scratch_display_tests {
+        include!("scratch_display_tests.rs");
+    }
+
+    mod native_access_tests {
+        include!("native_access_tests.rs");
+    }
+
+    mod speculation_tests {
+        include!("speculation_tests.rs");
+    }
+
+    fn observation_image(
+        id: &str,
+        scope: &str,
+        destination: Option<&str>,
+    ) -> crate::core::tool_media::ToolImage {
+        use crate::core::tool_media::{ImageProvenance, ToolImage};
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[12, 34, 56, 255])
+                .unwrap();
+        }
+        let mut provenance = ImageProvenance::new("test", None);
+        provenance.evidence_id = Some(id.into());
+        provenance.design_scope = Some(scope.into());
+        provenance.approved_destination = destination.map(str::to_owned);
+        ToolImage::from_bytes(&bytes, "image/png", provenance).unwrap()
+    }
+
+    fn user_reference_receipt_fixture() -> (
+        design::DesignContext,
+        Vec<Message>,
+        Vec<crate::core::reference_media::ReferenceDescriptor>,
+    ) {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        let original = ToolImage::from_bytes(
+            &encode_rgba_png(&[7, 11, 13, 255], 1, 1).unwrap(),
+            "image/png",
+            ImageProvenance::new("fixture", None),
+        )
+        .unwrap();
+        let mut messages = vec![Message::user_with_images(
+            "same pixels, distinct occurrences",
+            vec![original.data_url(), original.data_url()],
+        )];
+        let registry = crate::core::reference_media::ReferenceRegistry::new("receipt-owner");
+        let descriptors = registry.register_loaded(&mut messages).unwrap();
+        let design =
+            design::DesignContext::new("receipt-owner", "fixture", design::DesignMode::Auto);
+        design.begin_turn("reference-task", "fixture");
+        design
+            .activate_selected_references(
+                descriptors
+                    .iter()
+                    .map(|descriptor| {
+                        (
+                            descriptor.reference_id.clone(),
+                            descriptor.original.sha256.clone(),
+                        )
+                    })
+                    .collect(),
+                design::FidelityMode::Exact,
+            )
+            .unwrap();
+        (design, messages, descriptors)
+    }
+
+    #[test]
+    fn image_delivery_user_receipt_binds_url_and_exact_occurrence_not_binary_hash() {
+        use crate::llm::media::{ImageDeliveryReceipt, ProjectedUserImage};
+        let (design, messages, descriptors) = user_reference_receipt_fixture();
+        let source_sha256 = crate::core::tool_media::sha256(messages[0].images[0].as_bytes());
+        assert_ne!(
+            source_sha256, descriptors[0].original.sha256,
+            "wire source URL hash and canonical original binary hash are different domains"
+        );
+        let receipt = ImageDeliveryReceipt {
+            tool_images: Vec::new(),
+            user_images: vec![ProjectedUserImage {
+                message_index: 0,
+                image_index: 0,
+                source_sha256: source_sha256.clone(),
+                wire_sha256: source_sha256,
+                original: true,
+                dimensions: Some((1, 1)),
+            }],
+        };
+        mark_image_delivery(&messages, &ImageDeliveryReceipt::default(), &design);
+        assert!(design.snapshot().reference_observations.is_empty());
+        mark_image_delivery(&messages, &receipt, &design);
+        let observed = design.snapshot().reference_observations;
+        assert_eq!(
+            observed.len(),
+            1,
+            "same pixels at another index must not get receipt credit"
+        );
+        let marker = messages[0]
+            .tool_images
+            .iter()
+            .find(|image| image.metadata().provenance.locator.as_deref() == Some("attachment:0"))
+            .unwrap();
+        assert_eq!(
+            observed[0].reference_id,
+            marker.metadata().provenance.evidence_id.clone().unwrap()
+        );
+        assert_eq!(observed[0].original_sha256, marker.metadata().sha256);
+        assert_eq!(observed[0].kind, design::ReferenceObservationKind::Original);
+        assert!(design.snapshot().evidence.is_empty());
+
+        // A correct binary digest is not a source-URL receipt; mismatched occurrence is uncredited.
+        let mut wrong_hash = receipt.clone();
+        wrong_hash.user_images[0].image_index = 1;
+        wrong_hash.user_images[0].source_sha256 = descriptors[0].original.sha256.clone();
+        wrong_hash.user_images[0].wire_sha256 = descriptors[0].original.sha256.clone();
+        mark_image_delivery(&messages, &wrong_hash, &design);
+        assert_eq!(design.snapshot().reference_observations.len(), 1);
+        let mut wrong_original_wire = receipt.clone();
+        wrong_original_wire.user_images[0].image_index = 1;
+        wrong_original_wire.user_images[0].wire_sha256 = "0".repeat(64);
+        mark_image_delivery(&messages, &wrong_original_wire, &design);
+        assert_eq!(design.snapshot().reference_observations.len(), 1);
+
+        let mut second = receipt;
+        second.user_images[0].image_index = 1;
+        mark_image_delivery(&messages, &second, &design);
+        assert_eq!(design.snapshot().reference_observations.len(), 2);
+    }
+
+    #[test]
+    fn image_delivery_preview_is_not_original_observation_or_output_acceptance() {
+        use crate::llm::media::{ImageDeliveryReceipt, ProjectedUserImage};
+        let (design, messages, _) = user_reference_receipt_fixture();
+        let receipt = ImageDeliveryReceipt {
+            tool_images: Vec::new(),
+            user_images: vec![ProjectedUserImage {
+                message_index: 0,
+                image_index: 1,
+                source_sha256: crate::core::tool_media::sha256(messages[0].images[1].as_bytes()),
+                wire_sha256: crate::core::tool_media::sha256(b"balanced preview wire fixture"),
+                original: false,
+                dimensions: Some((1, 1)),
+            }],
+        };
+        mark_image_delivery(&messages, &receipt, &design);
+        let state = design.snapshot();
+        assert_eq!(state.reference_observations.len(), 1);
+        assert_eq!(
+            state.reference_observations[0].kind,
+            design::ReferenceObservationKind::Preview
+        );
+        assert!(!state
+            .reference_observations
+            .iter()
+            .any(|observation| observation.kind == design::ReferenceObservationKind::Original));
+        assert!(state.evidence.is_empty() && state.comparisons.is_empty());
+    }
+
+    #[test]
+    fn image_delivery_reference_crop_requires_complete_receipt_and_never_marks_output() {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, PixelRect, ToolImage};
+        use crate::llm::media::{ImageDeliveryReceipt, ProjectedToolImage};
+        let (design, _, descriptors) = user_reference_receipt_fixture();
+        let reference = &descriptors[0];
+        design.set_target("fixture-page").unwrap();
+        design.set_source_revision("fixture-source").unwrap();
+        design
+            .record_capture(
+                "reference-crop-output",
+                Some("fixture-source"),
+                "fixture-page",
+                design::Viewport {
+                    width: 1280,
+                    height: 800,
+                },
+                design.current_revision(),
+                true,
+                "current output fixture",
+            )
+            .unwrap();
+        let rect = PixelRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let mut provenance =
+            ImageProvenance::new("reference_read", Some(reference.reference_id.clone()));
+        provenance.evidence_id = Some("reference-crop-output".into());
+        provenance.parent_sha256 = Some(reference.original.sha256.clone());
+        provenance.crop = Some(rect);
+        // Even misleading matching design_scope must not turn a reference read into acceptance.
+        provenance.design_scope = Some(design.evidence_scope());
+        provenance.approved_destination = Some(crate::llm::media::destination_key(
+            "https://fixture.test",
+            "vision",
+        ));
+        let image = ToolImage::from_bytes(
+            &encode_rgba_png(&[7, 11, 13, 255], 1, 1).unwrap(),
+            "image/png",
+            provenance,
+        )
+        .unwrap();
+        let messages = vec![
+            Message::assistant_tool_calls(vec![call("ref-call", "reference_read", "{}")]),
+            Message::tool_observation("ref-call", "reference pixels", vec![image.clone()]),
+        ];
+        let receipt = ImageDeliveryReceipt {
+            user_images: Vec::new(),
+            tool_images: vec![ProjectedToolImage {
+                assistant_message_index: 0,
+                message_index: 1,
+                image_index: 0,
+                sha256: image.metadata().sha256.clone(),
+            }],
+        };
+        mark_image_delivery(&messages, &ImageDeliveryReceipt::default(), &design);
+        assert!(design.snapshot().reference_observations.is_empty());
+        let mut missing_group = messages.clone();
+        missing_group[1].tool_call_id = Some("unmatched".into());
+        mark_image_delivery(&missing_group, &receipt, &design);
+        assert!(design.snapshot().reference_observations.is_empty());
+        let mut failed = messages.clone();
+        failed[1].content = Some("error: reference read failed".into());
+        mark_image_delivery(&failed, &receipt, &design);
+        assert!(design.snapshot().reference_observations.is_empty());
+        mark_image_delivery(&messages, &receipt, &design);
+        let state = design.snapshot();
+        assert_eq!(state.reference_observations.len(), 1);
+        assert_eq!(
+            state.reference_observations[0].reference_id,
+            reference.reference_id
+        );
+        assert_eq!(
+            state.reference_observations[0].kind,
+            design::ReferenceObservationKind::Crop(rect)
+        );
+        assert_eq!(state.evidence.len(), 1);
+        assert!(!state.evidence[0].projected,
+            "reference pixels must not project implementation evidence even with an ID/scope collision");
+        assert!(state.comparisons.is_empty());
+    }
+
+    #[test]
+    fn selected_evidence_requires_complete_successful_bound_scoped_tool_output() {
+        let destination = crate::llm::media::destination_key("https://example.test/v1", "vision");
+        let good = observation_image("good", "child", Some(&destination));
+        let mut messages = vec![
+            Message::assistant_tool_calls(vec![
+                call("a", "image_read", "{}"),
+                call("b", "echo", "{}"),
+            ]),
+            Message::tool_observation("a", "reference", vec![good.clone()]),
+        ];
+        let ids = vec!["good".into()];
+        assert!(selected_evidence_images(&messages, &ids, "child").is_empty());
+        messages.push(Message::tool_result("b", "ok"));
+        assert_eq!(
+            selected_evidence_images(&messages, &ids, "child"),
+            vec![good]
+        );
+        assert!(selected_evidence_images(&messages, &ids, "sibling").is_empty());
+        messages[1].content = Some("error: image tool failed".into());
+        assert!(selected_evidence_images(&messages, &ids, "child").is_empty());
+        messages[1].content = Some("reference".into());
+        messages[1].tool_images = vec![observation_image("good", "child", None)];
+        assert!(selected_evidence_images(&messages, &ids, "child").is_empty());
+    }
+
+    #[test]
+    fn projection_marks_only_the_delivered_occurrence_not_identical_pixels() {
+        use design::{DesignContext, DesignMode, Viewport};
+        let ctx = DesignContext::new("parent", "workspace", DesignMode::On);
+        ctx.begin_turn("task", "workspace");
+        ctx.set_target("page").unwrap();
+        ctx.set_source_revision("source").unwrap();
+        let revision = ctx.current_revision();
+        for id in ["desktop", "mobile"] {
+            ctx.record_capture(
+                id,
+                Some("source"),
+                "page",
+                Viewport {
+                    width: 1280,
+                    height: 800,
+                },
+                revision,
+                true,
+                "",
+            )
+            .unwrap();
+        }
+        let destination = crate::llm::media::destination_key("https://example.test", "vision");
+        let scope = ctx.evidence_scope();
+        let images = vec![
+            observation_image("desktop", &scope, Some(&destination)),
+            observation_image("mobile", &scope, Some(&destination)),
+        ];
+        let messages = vec![
+            Message::assistant_tool_calls(vec![call("a", "browser_screenshot", "{}")]),
+            Message::tool_observation("a", "pixels", images),
+        ];
+        let selected = crate::llm::media::projected_tool_image_occurrences_for_destination(
+            &messages,
+            crate::llm::media::VisionPolicy::Supported,
+            &destination,
+        );
+        assert_eq!(
+            selected.len(),
+            1,
+            "pixel dedup selects exactly one occurrence"
+        );
+        mark_projected_evidence(&messages, &selected, &ctx);
+        let state = ctx.snapshot();
+        assert_eq!(state.evidence.iter().filter(|e| e.projected).count(), 1);
+        assert_eq!(
+            state.evidence.iter().find(|e| e.projected).unwrap().id,
+            messages[selected[0].message_index].tool_images[selected[0].image_index]
+                .metadata()
+                .provenance
+                .evidence_id
+                .as_deref()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn short_failure_images_are_evicted_without_erasing_error_or_identity() {
+        let image = observation_image("failed", "child", None);
+        let metadata = image.metadata().clone();
+        let mut messages = vec![Message::tool_observation(
+            "call",
+            "error: capture failed",
+            vec![image],
+        )];
+        let stats = clear_tool_results_to_floor(&mut messages, 0, 1024, 0, 0);
+        assert_eq!(stats.failures_trimmed, 1);
+        assert!(messages[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .starts_with("error: capture failed"));
+        assert!(!messages[0].tool_images[0].is_available());
+        assert_eq!(messages[0].tool_images[0].metadata(), &metadata);
+        assert_eq!(
+            clear_tool_results_to_floor(&mut messages, 0, 1024, 0, 0),
+            ClearStats::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_image_read_is_rejected_before_vision_or_approval_gates() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(image_read::ImageRead::new(
+            std::path::PathBuf::from("unused-image-read-root"),
+        )));
+        registry.register(Box::new(image_read::ReferenceRead::new(
+            std::path::PathBuf::from("unused-image-read-root"),
+        )));
+        let mut config = cfg();
+        config.approval_mode = crate::core::approval::ApprovalMode::Ask;
+        // Even without a vision route, argument errors must reach the model before any consent gate.
+        config.tool_image_policy = crate::llm::media::VisionPolicy::Unknown;
+        config.tool_image_destination = None;
+        let calls = [
+            call(
+                "missing",
+                "image_read",
+                r#"{"transmit_image":true,"crop":{"x":536,"y":0,"width":1000,"height":770}}"#,
+            ),
+            call(
+                "conflict",
+                "image_read",
+                r#"{"transmit_image":true,"path":"x.png","evidence_id":"id"}"#,
+            ),
+            call(
+                "reference",
+                "reference_read",
+                r#"{"transmit_image":true,"path":"x.png"}"#,
+            ),
+            call(
+                "path_identity",
+                "reference_read",
+                r#"{"transmit_image":true,"path":"ref-valid"}"#,
+            ),
+            call(
+                "evidence_identity",
+                "reference_read",
+                r#"{"transmit_image":true,"evidence_id":"ref-valid"}"#,
+            ),
+            call(
+                "wrapped",
+                "reference_read",
+                r#"{"payload":{"transmit_image":true,"ref_id":"ref-valid"}}"#,
+            ),
+            call(
+                "coerced",
+                "reference_read",
+                r#"{"transmit_image":true,"ref_id":["ref-valid"]}"#,
+            ),
+            call(
+                "unknown",
+                "image_read",
+                r#"{"transmit_image":true,"source":"x.png"}"#,
+            ),
+        ];
+        for call in &calls {
+            let (args, repair) = prepare_call_args(&registry, call).unwrap();
+            assert_eq!(
+                args,
+                serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap()
+            );
+            assert!(repair.is_none());
+        }
+        for planned in [
+            plan_execution_calls(&registry, &calls, &config),
+            prepare_execution_calls(&registry, &calls, &config),
+        ] {
+            assert!(planned.iter().all(Result::is_err));
+        }
+        let results = exec(&registry, &calls, &config).await;
+        assert!(results[0].1.contains("received 0"), "{:?}", results[0]);
+        assert!(results[1].1.contains("received 2"), "{:?}", results[1]);
+        for (_, text) in &results[2..5] {
+            assert!(text.contains("granted ref_id only"), "{text}");
+        }
+        for (_, text) in results {
+            assert!(!text.contains("transmission unavailable"), "{text}");
+            assert!(!text.contains("denied"), "{text}");
+        }
+    }
+
+    #[test]
+    fn image_tools_cannot_execute_or_eager_start_with_unknown_capability() {
+        struct ImageTool(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Tool for ImageTool {
+            fn name(&self) -> &str {
+                "image_test"
+            }
+            fn description(&self) -> &str {
+                "Test image observation"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object"})
+            }
+            fn transmits_images(&self, _: &serde_json::Value) -> bool {
+                true
+            }
+            fn execute(&self, _: &serde_json::Value) -> Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("unexpected".into())
+            }
+        }
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ImageTool(count.clone())));
+        let mut config = cfg();
+        config.approval_mode = crate::core::approval::ApprovalMode::Yolo;
+        let call = call("image", "image_test", "{}");
+        assert!(
+            execute_one_for_test(&registry, &call, &config).contains("transmission unavailable")
+        );
+        assert!(eager_starter(&registry, &config)(0, &call).is_none());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn failed_approved_visual_calls_consume_the_aggregate_budget() {
+        struct Capture(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Tool for Capture {
+            fn name(&self) -> &str {
+                "capture_test"
+            }
+            fn description(&self) -> &str {
+                "Fail after reservation"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object"})
+            }
+            fn transmits_images(&self, _: &serde_json::Value) -> bool {
+                true
+            }
+            fn execute(&self, _: &serde_json::Value) -> Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("capture failed")
+            }
+        }
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(Capture(count.clone())));
+        let ctx = design::DesignContext::new("owner", "workspace", design::DesignMode::On);
+        ctx.begin_turn("task", "workspace");
+        ctx.set_intent(design::DesignIntent::Create);
+        let mut config = cfg();
+        config.exec_ctx = config.exec_ctx.with_design(ctx.clone());
+        config.approval_mode = crate::core::approval::ApprovalMode::Yolo;
+        config.tool_image_policy = crate::llm::media::VisionPolicy::Supported;
+        config.tool_image_destination = Some(crate::llm::media::destination_key(
+            "https://example.test",
+            "vision",
+        ));
+        let call = call("capture", "capture_test", "{}");
+        for attempt in 0..36 {
+            let output = execute_one_for_test(&registry, &call, &config);
+            assert!(
+                output.contains("capture failed"),
+                "attempt {attempt}: {output}"
+            );
+        }
+        let output = execute_one_for_test(&registry, &call, &config);
+        assert!(output.contains("budget exhausted"), "{output}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 36);
+        assert_eq!(ctx.snapshot().visual_operations, 36);
+        assert!(matches!(ctx.gate(), design::GateDecision::Failed(_)));
+    }
+
+    #[test]
+    fn request_budget_counts_only_projected_images_and_keeps_history_unchanged() {
+        let mut config = cfg();
+        let destination = crate::llm::media::destination_key("https://example.test", "vision");
+        config.tool_image_policy = crate::llm::media::VisionPolicy::Supported;
+        config.tool_image_destination = Some(destination.clone());
+        let images = (0..6)
+            .map(|i| observation_image(&format!("e{i}"), "scope", Some(&destination)))
+            .collect();
+        let messages = vec![
+            Message::assistant_tool_calls(vec![call("a", "image_read", "{}")]),
+            Message::tool_observation("a", "pixels", images),
+        ];
+        let before = serde_json::to_string(&messages).unwrap();
+        let projection = crate::llm::media::project_messages_for_destination(
+            &messages,
+            config.tool_image_policy,
+            Some(&destination),
+        );
+        assert_eq!(projection.selected_tool_images.len(), 1);
+        assert_eq!(
+            estimate_request_tokens(&messages, &config),
+            estimate_tokens(&projection.messages)
+        );
+        assert!(estimate_request_tokens(&messages, &config) < estimate_tokens(&messages));
+        assert_eq!(serde_json::to_string(&messages).unwrap(), before);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME stable until the destructive fixture's awaited lease and self-review complete"
+    )]
+    async fn unavailable_visual_review_still_runs_functional_self_review_demand() {
+        // The destructive fixture acquires its lease under AIZEN_HOME; keep it stable through await.
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (fixture, mut config) = placement_executor_fixture();
+        let root = config.effective_root();
+        let home = fixture.path().join("home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        let registry = builtin::file_registry_for_test(&root);
+        let ctx = design::DesignContext::new("owner", "workspace", design::DesignMode::On);
+        ctx.begin_turn("task", "workspace");
+        ctx.apply_brief(
+            design::DesignBrief {
+                intent: design::DesignIntent::Create,
+                brief: "Product page".into(),
+                acceptance: "No overflow".into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        config.exec_ctx = config.exec_ctx.with_design(ctx);
+        config.enable_self_review = true;
+        let mut messages = vec![Message::user("Create the page")];
+        let outcome = run_agent_loop(
+            scripted(vec![
+                tool_turn("file_write", r#"{"path":"page.html","content":"<main>Owned page</main>","purpose":"project"}"#),
+                final_turn("done"),
+                final_turn("done after checking"),
+            ]),
+            &config,
+            &registry,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("page.html")).unwrap(),
+            "<main>Owned page</main>"
+        );
+        assert!(messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|t| t.contains(SELF_REVIEW_NUDGE))));
+        assert!(matches!(outcome.stop, StopReason::VerificationFailed));
+        let verification = outcome.verification.unwrap();
+        assert_eq!(verification["build_test"], "unverified");
+        assert_eq!(verification["visual"]["status"], "unavailable");
+        assert_eq!(verification["visual"]["evidence"], serde_json::json!([]));
+        let answer = outcome.final_text.unwrap();
+        assert!(
+            answer.contains("Visual verification incomplete")
+                && answer.contains("Evidence (task task")
+        );
+    }
+
+    #[test]
+    fn read_cache_recent_lists_newest_first_with_line_windows() {
+        let scope = format!("ctx-pack-test-{}", std::process::id());
+        let fp = crate::core::persist::FileFingerprint::for_bytes(b"x");
+        let entry = |files: Vec<&str>, windows: Vec<ReadWindow>| ReadCacheEntry {
+            files: files
+                .into_iter()
+                .map(|p| (std::path::PathBuf::from(p), fp.clone()))
+                .collect(),
+            windows,
+            msg_index: 0,
+            call_id: "c".into(),
+            result_chars: 0,
+            result_prefix: String::new(),
+            seq: READ_CACHE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        read_cache_insert(
+            read_cache_key(
+                &scope,
+                &canonical_args(r#"{"path":"a.rs","start":10,"end":20}"#),
+            ),
+            entry(
+                vec!["/r/a.rs"],
+                read_windows(&serde_json::json!({"start": 10, "end": 20})),
+            ),
+        );
+        read_cache_insert(
+            read_cache_key(
+                &scope,
+                &canonical_args(r#"{"files":[{"path":"b.rs"},{"path":"c.rs","start":5}]}"#),
+            ),
+            entry(
+                vec!["/r/b.rs", "/r/c.rs"],
+                read_windows(
+                    &serde_json::json!({"files": [{"path": "b.rs"}, {"path": "c.rs", "start": 5}]}),
+                ),
+            ),
+        );
+        read_cache_insert(
+            read_cache_key("ctx-pack-other", &canonical_args(r#"{"path":"z.rs"}"#)),
+            entry(vec!["/r/z.rs"], vec![None]),
+        );
+        let show = |rows: Vec<(std::path::PathBuf, ReadWindow)>| {
+            rows.iter()
+                .map(|(p, w)| {
+                    let p = p.to_string_lossy().replace('\\', "/");
+                    match w {
+                        Some((a, Some(b))) => format!("{p}:{a}-{b}"),
+                        Some((a, None)) => format!("{p}:{a}-"),
+                        None => p,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        // Newest first; the batch read's files keep their order; other scopes stay out.
+        assert_eq!(
+            show(read_cache_recent(&scope, 10)),
+            vec!["/r/b.rs", "/r/c.rs:5-", "/r/a.rs:10-20"]
+        );
+        assert_eq!(show(read_cache_recent(&scope, 1)), vec!["/r/b.rs"]);
+        read_cache_clear_scope(&scope);
+        read_cache_clear_scope("ctx-pack-other");
+        assert!(read_cache_recent(&scope, 10).is_empty());
+    }
     use std::sync::Mutex;
 
     // ── per-lane workspace root ────────────────────────────────────────────
@@ -5258,6 +9727,53 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_file_patch_splits_per_file_with_the_new_path() {
+        let patch = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
+                     diff --git a/old.rs b/new.rs\nsimilarity index 90%\n--- a/old.rs\n+++ b/new.rs\n@@ -2 +2 @@\n-p\n+q\n";
+        let blocks = split_patch_by_file(patch);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "src/a.rs");
+        assert!(blocks[0].1.contains("@@ -1 +1 @@") && blocks[0].1.contains("+y"));
+        assert_eq!(blocks[1].0, "new.rs", "a rename is titled by its new path");
+        assert!(
+            !blocks[1].1.contains("+y"),
+            "files do not bleed into each other"
+        );
+        assert!(split_patch_by_file("").is_empty());
+    }
+
+    #[test]
+    fn edit_headers_show_the_relative_path_not_the_basename() {
+        assert_eq!(rel_path_display("src/agent/mod.rs"), "src/agent/mod.rs");
+        assert_eq!(rel_path_display("src\\agent\\mod.rs"), "src/agent/mod.rs");
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join("src").join("x.rs");
+        assert_eq!(rel_path_display(&abs.to_string_lossy()), "src/x.rs");
+        let t = tool_target(
+            "file_edit",
+            &serde_json::json!({"path": "src/agent/mod.rs"}),
+        );
+        assert_eq!(
+            t, "src/agent/mod.rs",
+            "two mod.rs edits in one turn stay distinguishable"
+        );
+        let m = tool_target(
+            "file_move",
+            &serde_json::json!({"from": "a/old.rs", "to": "b/new.rs"}),
+        );
+        assert_eq!(m, "a/old.rs → b/new.rs");
+        let plain = preview_plain(&crate::agent::tools::ApprovalPreview {
+            title: "x".into(),
+            diff: Some("d".repeat(2_000)),
+            lines: vec!["cwd: /r".into(), "$ make".into()],
+        });
+        assert!(
+            plain.starts_with("cwd: /r\n$ make\n") && plain.ends_with("\n…"),
+            "{plain}"
+        );
+    }
+
+    #[test]
     fn tool_call_line_unmapped_shows_bare_name() {
         // An unknown tool with no salient field renders just the raw name (no crash, no JSON dump).
         let line = tool_call_line("mystery_tool", &serde_json::json!({"foo": "bar"}));
@@ -5279,8 +9795,8 @@ mod tests {
             "{t:?}"
         );
         assert!(
-            t.starts_with("coder"),
-            "absent role defaults to coder: {t:?}"
+            t.starts_with("argus"),
+            "absent role defaults to argus (the safe read-only scope): {t:?}"
         );
         assert!(!t.contains("prompt"), "no arg-name leakage: {t:?}");
         assert!(!t.contains('{'), "no JSON dump: {t:?}");
@@ -5293,7 +9809,7 @@ mod tests {
             "task",
             &serde_json::json!({"prompt": "Read every call site and report", "label": "cwd-audit"}),
         );
-        assert_eq!(t, "coder · cwd-audit");
+        assert_eq!(t, "argus · cwd-audit");
         // A resolvable `agent` slug supersedes `role` in `resolve_dispatch`; the line must agree.
         let t = tool_target(
             "task",
@@ -5408,13 +9924,11 @@ mod tests {
             summarize_result("file_glob", "(no files match 'x')"),
             (true, "0 files".to_string())
         );
-        // an edit result → target + counts derived from the embedded unified diff
+        // an edit result → verb + counts derived from the embedded unified diff
+        // (the path already shows in the tool-row target, so the digest omits it)
         let edit = "edited src/x.rs (1 replacement(s))\n a\n-old\n+new\n b";
         let (ok, s) = summarize_result("file_edit", edit);
-        assert!(
-            ok && s.starts_with("edited src/x.rs") && s.contains("+1"),
-            "{s:?}"
-        );
+        assert!(ok && s.starts_with("edited") && s.contains("+1"), "{s:?}");
         assert_eq!(
             summarize_result("file_edit", "created src/n.rs"),
             (true, "created src/n.rs".to_string())
@@ -5430,6 +9944,151 @@ mod tests {
     }
 
     #[test]
+    fn skill_load_digest_names_the_skill_instead_of_printing_its_body() {
+        // A skill result is a multi-line document (`# skill: <name> — <desc>`, then `(when: …)`,
+        // entry/resources paths and the whole procedure). Taking its first line as the digest used to
+        // put the skill's instructions on screen; the row must name it and keep the body for Ctrl-E.
+        let loaded = "# skill: scan-junk-files-windows — Quét rác/dung lượng ở C:\\Users\\admin\n\
+                      (when: user asks about disk cleanup)\n\
+                      Entry: C:\\Users\\admin\\.aizen\\skills\\scan\\SKILL.md\n\
+                      Resources: C:\\Users\\admin\\.aizen\\skills\\scan\n\
+                      \n\
+                      # Steps\n\
+                      1. Get-PSDrive -PSProvider FileSystem | Select-Object Name,Used,Free\n\
+                      2. Report the largest offenders";
+        assert_eq!(
+            summarize_result("skill_load", loaded),
+            (true, "skill loaded · scan-junk-files-windows".to_string())
+        );
+        // A skill with no description still yields its name.
+        assert_eq!(
+            summarize_result("skill_load", "# skill: terse\n"),
+            (true, "skill loaded · terse".to_string())
+        );
+        // Nothing to name: a generic digest rather than an empty row.
+        assert_eq!(
+            summarize_result("skill_load", "some unexpected shape"),
+            (true, "skill loaded · some unexpected shape".to_string())
+        );
+        assert_eq!(
+            summarize_result("skill_load", "   "),
+            (true, "skill loaded".to_string())
+        );
+    }
+
+    #[test]
+    fn hunk_header_parses_starts_and_rejects_prose() {
+        assert_eq!(parse_hunk_header("@@ -95,7 +95,8 @@"), Some((95, 95)));
+        assert_eq!(parse_hunk_header("@@ -4 +6 @@"), Some((4, 6)));
+        assert_eq!(parse_hunk_header("@@ nonsense @@"), None);
+        assert_eq!(
+            parse_hunk_header("edited src/x.rs (1 replacement(s))"),
+            None
+        );
+    }
+
+    #[test]
+    fn compact_edit_diff_keeps_removed_lines_counts_added_and_caps_hunks() {
+        let mut out = String::from(
+            "edited src/x.rs (4 edits applied)\n  #1: 1 replacement\n  #2: 1 replacement\n  #3: 1 replacement\n  #4: 1 replacement\n",
+        );
+        for k in 0..4 {
+            let at = 10 * k + 1;
+            out.push_str(&format!(
+                "@@ -{at},3 +{at},4 @@\n ctx{k}\n-old{k}\n+new{k}a\n+new{k}b\n ctx{k}end\n"
+            ));
+        }
+        out.push_str("lsp: 1 new diagnostic\n  error: something");
+        let c = compact_edit_diff(&out);
+        assert!(
+            c.starts_with("edited src/x.rs (4 edits applied)\n  #1: 1 replacement"),
+            "{c}"
+        );
+        assert!(
+            c.contains("-old0") && c.contains("-old2"),
+            "removed lines kept: {c}"
+        );
+        assert!(!c.contains("new0a"), "added text not echoed: {c}");
+        assert_eq!(
+            c.matches("+2 line(s)").count(),
+            3,
+            "one count per shown hunk: {c}"
+        );
+        assert!(
+            c.contains("…(1 more hunk(s): -1 +2 lines)"),
+            "fourth hunk summed: {c}"
+        );
+        assert!(
+            c.ends_with("lsp: 1 new diagnostic\n  error: something"),
+            "trailing fold intact: {c}"
+        );
+        assert_eq!(
+            compact_edit_diff("edited f (1 replacement)"),
+            "edited f (1 replacement)"
+        );
+    }
+
+    #[test]
+    fn edit_target_file_resolves_relative_paths_under_the_root() {
+        let root = std::path::Path::new("/w/proj");
+        let rel = edit_target_file(root, &serde_json::json!({"path": "src/a.rs"})).unwrap();
+        assert_eq!(rel, root.join("src/a.rs"));
+        let abs = std::env::temp_dir().join("x.py");
+        let got =
+            edit_target_file(root, &serde_json::json!({"path": abs.to_string_lossy()})).unwrap();
+        assert_eq!(got, abs);
+        assert!(edit_target_file(root, &serde_json::json!({"path": "  "})).is_none());
+        assert!(edit_target_file(root, &serde_json::json!({"patch": "…"})).is_none());
+    }
+
+    #[test]
+    fn successful_edit_calls_counts_only_edits_that_wrote() {
+        let calls = vec![
+            call("1", "file_edit", "{}"),
+            call("2", "file_edit", "{}"),
+            call("3", "file_edit", "{}"),
+            call("4", "file_write", "{}"),
+            call("5", "file_read", "{}"),
+            call("6", "file_edit", "{}"),
+        ];
+        let results: Vec<(String, String)> = vec![
+            ("1".into(), "edited a.rs (1 replacement(s))".into()),
+            ("2".into(), "error: old_string not found".into()),
+            (
+                "3".into(),
+                format!("{}: a.rs unchanged", builtin::NOOP_WRITE_PREFIX),
+            ),
+            ("4".into(), "wrote b.rs (3 line(s))".into()),
+            ("5".into(), "fn main() {}".into()),
+            (
+                "6".into(),
+                format!("{}: would edit c.rs", builtin::DRY_RUN_PREFIX),
+            ),
+        ];
+        assert_eq!(successful_edit_calls(&calls, &results), 2);
+    }
+
+    #[test]
+    fn append_to_last_tool_result_rides_the_last_tool_message() {
+        let mut turn = vec![
+            Message::tool_result("1", "first"),
+            Message::tool_result("2", "second"),
+        ];
+        append_to_last_tool_result(&mut turn, &["[harness check] passed".to_string()]);
+        assert_eq!(turn[0].content.as_deref(), Some("first"));
+        assert_eq!(
+            turn[1].content.as_deref(),
+            Some("second\n\n[harness check] passed")
+        );
+        assert_eq!(turn[1].tool_call_id.as_deref(), Some("2"), "pairing intact");
+        append_to_last_tool_result(&mut turn, &[]);
+        assert_eq!(
+            turn[1].content.as_deref(),
+            Some("second\n\n[harness check] passed")
+        );
+    }
+
+    #[test]
     fn count_diff_counts_only_column0_markers() {
         let out = "edited x (1)\n a\n-gone\n+added\n+also\n…(3 more lines added)\n b";
         assert_eq!(
@@ -5437,15 +10096,6 @@ mod tests {
             (2, 1),
             "two '+' lines, one '-'; '…' and ' ' ignored"
         );
-    }
-
-    #[test]
-    fn edit_target_labels_create_vs_edit() {
-        assert_eq!(
-            edit_target("edited src/x.rs (1 replacement(s))"),
-            "edited src/x.rs"
-        );
-        assert_eq!(edit_target("created src/n.rs"), "created src/n.rs");
     }
 
     // ── test tools ──────────────────────────────────────────────────────────
@@ -5625,6 +10275,220 @@ mod tests {
         }
     }
 
+    #[test]
+    fn typed_execution_log_honors_tool_failure_and_raw_errors() {
+        struct Probe {
+            mode: u8,
+        }
+        impl Tool for Probe {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            fn description(&self) -> &str {
+                "typed result probe"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+                match self.mode {
+                    0 => Ok(String::new()),
+                    1 => Ok("upstream rejected".into()),
+                    _ => anyhow::bail!("actual execution failure"),
+                }
+            }
+            fn result_is_error(&self, _result: &str) -> Option<bool> {
+                Some(self.mode == 1)
+            }
+        }
+        for mode in 0..3 {
+            let outcome = run_prepared_tool_body(
+                std::sync::Arc::new(Probe { mode }),
+                &tools::PreparedToolCall::new(serde_json::json!({})),
+                true,
+                cfg().result_budgets(),
+                None,
+            );
+            let record = tools::ToolExecution {
+                call_id: "identity-not-body".into(),
+                prepared: None,
+                outcome,
+            };
+            let (result, error) = record.log_result();
+            if mode == 0 {
+                assert_eq!(result.as_deref(), Some(""));
+                assert_eq!(error, None);
+            } else {
+                assert_eq!(result, None);
+                assert!(error.is_some());
+                assert_ne!(error.as_deref(), Some("identity-not-body"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn serial_tool_panic_stops_loop_with_typed_uncertainty_and_retains_history() {
+        struct PanicTool;
+        impl Tool for PanicTool {
+            fn name(&self) -> &str {
+                "owned_panic"
+            }
+            fn description(&self) -> &str {
+                "owned tool panic fixture"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            fn is_concurrency_safe(&self) -> bool {
+                false
+            }
+            fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+                panic!("owned worker panic after possible effect");
+            }
+        }
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(PanicTool));
+        let chat = scripted(vec![
+            tool_turn("owned_panic", "{}"),
+            final_turn("must not continue"),
+        ]);
+        let mut messages = vec![Message::system("fixture"), Message::user("test panic")];
+        let error = run_agent_loop(chat, &cfg(), &r, &mut messages)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            tool_error_effect_state(&error),
+            tools::ToolEffectState::PossiblyApplied(None)
+        );
+        assert!(messages.iter().any(|message| message.role == "tool"
+            && message
+                .content
+                .as_deref()
+                .is_some_and(|text| text.contains("tool body panicked"))));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.as_deref() == Some("must not continue")));
+        assert_valid_history(&messages);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize process-global AIZEN_HOME and AIZEN_RUNS_DIR through the awaited executor, log assertions, and EnvGuard restoration"
+    )]
+    async fn executor_tool_log_roundtrip_preserves_results_errors_and_original_call_pairing() {
+        struct EmptyResultTool;
+        impl Tool for EmptyResultTool {
+            fn name(&self) -> &str {
+                "empty_result"
+            }
+            fn description(&self) -> &str {
+                "successful empty observation fixture"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        let runs = fixture.path().join("runs");
+        let _env = crate::core::config::EnvGuard::set([
+            ("AIZEN_HOME", home.as_os_str()),
+            ("AIZEN_RUNS_DIR", runs.as_os_str()),
+        ]);
+        // Empty output is a successful body result, not a blank required input.
+        let calls = vec![
+            call("empty-id", "empty_result", "{}"),
+            call("body-id", "echo", r#"{"text":"success-body"}"#),
+            call("declared-error-id", "selferr", "{}"),
+            call("rust-error-id", "fail", "{}"),
+        ];
+        let c = AgentConfig {
+            run_id: Some("typed-roundtrip".into()),
+            workspace_root: Some(fixture.path().to_path_buf()),
+            ..cfg()
+        };
+        let mut messages = vec![
+            Message::system("fixture"),
+            Message::user("test log pairing"),
+        ];
+        let mut tool_response = final_turn("");
+        tool_response.content = None;
+        tool_response.tool_calls = calls.clone();
+        let chat = scripted(vec![tool_response, final_turn("done")]);
+        let mut tools_registry = registry();
+        tools_registry.register(Box::new(EmptyResultTool));
+        let outcome = run_agent_loop(chat, &c, &tools_registry, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(outcome.stop, StopReason::Done);
+        let events =
+            crate::agent::runlog::read_events(&runs.join("typed-roundtrip.jsonl")).unwrap();
+        let tools: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, crate::agent::runlog::Event::Tool { .. }))
+            .collect();
+        assert_eq!(tools.len(), calls.len());
+        let mut failed = Vec::new();
+        for (index, (event, call)) in tools.iter().zip(&calls).enumerate() {
+            let crate::agent::runlog::Event::Tool {
+                seq,
+                name,
+                args_hash,
+                result,
+                error,
+                ..
+            } = event
+            else {
+                unreachable!();
+            };
+            assert_eq!(name, &call.function.name);
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&call.function.arguments, &mut hash);
+            assert_eq!(*args_hash, std::hash::Hasher::finish(&hash));
+            if index < 2 {
+                assert_eq!(
+                    result.as_deref(),
+                    Some(if index == 0 { "" } else { "success-body" }),
+                    "persisted tool event: {event:?}"
+                );
+                assert!(error.is_none());
+            } else {
+                assert!(result.is_none());
+                assert_eq!(
+                    error.as_deref(),
+                    Some(if index == 2 {
+                        r#"{"isError":true,"detail":"upstream 500"}"#
+                    } else {
+                        "error: boom"
+                    })
+                );
+                assert!(!error.as_ref().unwrap().contains(&call.id));
+                failed.push(*seq);
+            }
+        }
+        assert_eq!(
+            crate::agent::runlog::unresolved(&events),
+            failed,
+            "run-show diagnostics agree with persisted explicit failures"
+        );
+        let replies: Vec<_> = messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .collect();
+        assert_eq!(replies.len(), calls.len());
+        for (reply, call) in replies.iter().zip(&calls) {
+            assert_eq!(reply.tool_call_id.as_deref(), Some(call.id.as_str()));
+        }
+        assert_valid_history(&messages);
+    }
+
     /// Named "file_read" (a relevance-truncatable tool per `is_relevance_truncatable`) so tests can
     /// exercise the W22 fetch-budget split without a real file. Returns a long fixed document.
     struct LongReadTool;
@@ -5643,6 +10507,23 @@ mod tests {
                 .map(|i| format!("line {i} of filler text"))
                 .collect::<Vec<_>>()
                 .join("\n"))
+        }
+    }
+
+    /// `LongReadTool`'s twin named `web_fetch`: a document tool the loop DOES cut by relevance.
+    struct LongFetchTool;
+    impl Tool for LongFetchTool {
+        fn name(&self) -> &str {
+            "web_fetch"
+        }
+        fn description(&self) -> &str {
+            "test stand-in for web_fetch"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+            LongReadTool.execute(_args)
         }
     }
 
@@ -5680,6 +10561,8 @@ mod tests {
             }],
             finish_reason: Some("stop".into()), // deliberately NOT "tool_calls" — must still detect
             usage: None,
+            empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -5689,6 +10572,8 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -5710,6 +10595,8 @@ mod tests {
                 .collect(),
             finish_reason: Some("stop".into()),
             usage: None,
+            empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -5738,15 +10625,25 @@ mod tests {
     }
 
     fn cfg() -> AgentConfig {
+        // Opaque mock tools still take real leases, but must not borrow another test's HOME.
+        let exec_ctx = crate::core::exec_ctx::ExecutionContext::default();
+        let namespace = exec_ctx
+            .test_lock_namespace()
+            .cloned()
+            .unwrap_or_else(crate::core::workspace_txn::TestLockNamespace::owned);
+        let exec_ctx = exec_ctx.with_test_lock_namespace(namespace);
         // Verify gate OFF in unit tests (it spawns a real `cargo check`, non-hermetic).
         AgentConfig {
             max_iters: 5,
             auto_extend_to: 5,
             max_tool_result_chars: 4096,
             max_fetch_result_chars: 12_000,
+            max_log_result_chars: 16_000,
+            max_delegate_result_chars: 24_000,
+            nudge_role: NudgeRole::System,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
-            exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
+            exec_ctx,
             workspace_root: None,
             quiet: true,
             enable_verify_gate: false,
@@ -5756,12 +10653,16 @@ mod tests {
             context_window: 0, // guard off by default in tests; the guard test sets it explicitly
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
-            clear_at_pct: 60,
-            clear_target_pct: 45,
             clear_step_pct: 10,
             clear_cooldown_iters: 6,
+            collapse_after_observations: 8,
+            collapse_batch: 8,
+            collapse_min_chars: 800,
+            spill_result_over_chars: 16 * 1024,
+            harness_check_after_edits: 3,
             todo_reminder_every: 0, // recitation OFF in unit tests (todo state is process-global)
             compact_at_pct: 80,
+            run_id: None,
             context_guard_pct: 90,
             max_verify_attempts: 2,
             enable_self_review: false,
@@ -5771,6 +10672,8 @@ mod tests {
             // accidental early-exit blocks on unrelated scripts).
             enable_todo_poke: false,
             max_todo_poke_attempts: 2,
+            // OFF like the other harness gates here: tests that exercise it set it explicitly.
+            enable_plan_nudge: false,
             enable_confidence_gate: false,
             conf_high: 90,
             conf_spike_delta: 40,
@@ -5791,10 +10694,17 @@ mod tests {
             // script must not pick up a steer a steering test left behind.
             enable_steering: false,
             on_progress: None, // no live-history publishing in unit tests
+            step_note: None,
+            delegated_call_cap: None,
             // No wall-clock ceiling in unit tests: a scripted run is instant, so a deadline could only
             // fire spuriously on a loaded CI box and turn an assertion about MaxIters/Divergence into a
             // flake. The deadline tests set it explicitly.
             deadline: None,
+            wire_reasoning_effort: None,
+            tool_image_policy: crate::llm::media::VisionPolicy::Unknown,
+            image_config: None,
+            tool_image_destination: None,
+            tool_image_destination_label: None,
         }
     }
 
@@ -5819,6 +10729,233 @@ mod tests {
                 ..Self::default()
             }
         }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize process-global todos across the loop"
+    )]
+    async fn plan_nudge_precedes_first_model_call_without_a_done_gate() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        todo::clear();
+        for (request, enabled, expected) in [
+            ("Refactor all files in the codebase", true, true),
+            ("Fix a typo", true, false),
+            (
+                "Refactor all files, plan only; don't implement",
+                true,
+                false,
+            ),
+            ("Refactor all files", false, false),
+        ] {
+            let c = AgentConfig {
+                enable_plan_nudge: enabled,
+                ..cfg()
+            };
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let chat = |messages: Vec<Message>, _: Vec<ToolDef>| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reminders: Vec<_> = messages
+                    .iter()
+                    .filter(|m| {
+                        m.content
+                            .as_deref()
+                            .is_some_and(|s| s.contains(PLAN_NUDGE_PREFIX))
+                    })
+                    .collect();
+                assert_eq!(reminders.len(), usize::from(expected), "{request}");
+                std::future::ready(Ok(final_turn("done")))
+            };
+            let out = run_agent(chat, &c, &registry(), "sys", request)
+                .await
+                .unwrap();
+            assert_eq!(out.stop, StopReason::Done);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Pin test home and todos through real file execution"
+    )]
+    async fn plan_nudge_observes_growth_and_plan_reads_before_the_next_model_call() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        todo::clear();
+        for read_existing_plan in [false, true] {
+            let (fixture, mut c) = placement_executor_fixture();
+            let root = c.effective_root();
+            let home = fixture.path().join("home");
+            let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+            c.enable_plan_nudge = true;
+            c.max_iters = 8;
+            c.auto_extend_to = 8;
+            std::fs::create_dir_all(root.join("docs/plans")).unwrap();
+            std::fs::write(
+                root.join("docs/plans/existing.md"),
+                "# Existing spec\n\nAcceptance checks",
+            )
+            .unwrap();
+            let r = builtin::file_registry_for_test(&root);
+            let mut turns = VecDeque::new();
+            if read_existing_plan {
+                turns.push_back(tool_turn(
+                    "file_read",
+                    r#"{"path":"docs/plans/existing.md"}"#,
+                ));
+            }
+            for n in 0..4 {
+                turns.push_back(tool_turn(
+                    "file_write",
+                    &serde_json::json!({
+                        "path": format!("part-{n}.txt"), "content": "changed", "purpose": "project"
+                    })
+                    .to_string(),
+                ));
+            }
+            turns.push_back(final_turn("done"));
+            let turns = Mutex::new(turns);
+            let chat = |messages: Vec<Message>, _: Vec<ToolDef>| {
+                let changed = (0..4)
+                    .filter(|n| root.join(format!("part-{n}.txt")).exists())
+                    .count();
+                let count = messages
+                    .iter()
+                    .filter(|m| {
+                        m.content
+                            .as_deref()
+                            .is_some_and(|s| s.contains(PLAN_NUDGE_PREFIX))
+                    })
+                    .count();
+                assert_eq!(count, usize::from(changed >= 3 && !read_existing_plan));
+                std::future::ready(Ok(turns
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("no extra Done demand")))
+            };
+            let out = run_agent(chat, &c, &r, "sys", "Fix a typo").await.unwrap();
+            assert_eq!(out.stop, StopReason::Done);
+            assert!(turns.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Pin test home and todos through real file execution"
+    )]
+    async fn architect_plan_is_saved_by_normal_tools_before_implementation() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        todo::clear();
+        let (fixture, mut c) = placement_executor_fixture();
+        let root = c.effective_root();
+        let home = fixture.path().join("home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        c.enable_plan_nudge = true;
+        let r = builtin::file_registry_for_test(&root);
+        let mut plan = architect::parse_plan("## Acceptance\nCheck owned.txt", "request");
+        architect::prepare_document(
+            "Update the storage codebase",
+            &mut plan,
+            "fixture",
+            Some("max"),
+        );
+        // file_write's existing parent requirement is unchanged; directory setup is a separate
+        // approved shell operation in production, not an architect side effect.
+        std::fs::create_dir_all(root.join("docs/plans")).unwrap();
+        let path = plan.path.as_ref().unwrap();
+        let mut messages = vec![Message::user("Update the storage codebase")];
+        architect::attach_plan(&mut messages, &plan.text, Some(path));
+        let request = messages[0].content.as_deref().unwrap();
+        assert!(
+            !root.join(path).exists(),
+            "planner preparation cannot write"
+        );
+        let turns = Mutex::new(VecDeque::from([
+            tool_turn(
+                "file_write",
+                &serde_json::json!({"path":path,"content":plan.text,"purpose":"project"})
+                    .to_string(),
+            ),
+            tool_turn(
+                "file_write",
+                r#"{"path":"owned.txt","content":"implementation","purpose":"project"}"#,
+            ),
+            final_turn("done"),
+        ]));
+        let chat = |messages: Vec<Message>, _: Vec<ToolDef>| {
+            assert!(!messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|s| s.contains(PLAN_NUDGE_PREFIX))));
+            let mut turns = turns.lock().unwrap();
+            if turns.len() < 3 {
+                assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), plan.text);
+            }
+            if turns.len() == 2 {
+                assert!(
+                    !root.join("owned.txt").exists(),
+                    "spec precedes implementation"
+                );
+            }
+            std::future::ready(Ok(turns.pop_front().expect("bounded run")))
+        };
+        assert_eq!(
+            run_agent(chat, &c, &r, "sys", request).await.unwrap().stop,
+            StopReason::Done
+        );
+        assert!(root.join("owned.txt").exists());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Pin test home through the denied file execution"
+    )]
+    async fn architect_plan_write_denial_keeps_workspace_untouched() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (fixture, mut c) = placement_executor_fixture();
+        let root = c.effective_root();
+        let _env =
+            crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path().join("home"))]);
+        c.approval_mode = crate::core::approval::ApprovalMode::Ask;
+        let mut plan = architect::parse_plan("## Acceptance\nCheck behavior", "request");
+        architect::prepare_document("Change storage", &mut plan, "fixture", Some("max"));
+        std::fs::create_dir_all(root.join("docs/plans")).unwrap();
+        let path = plan.path.as_ref().unwrap();
+        let result = exec(
+            &builtin::file_registry_for_test(&root),
+            &[call(
+                "save-plan",
+                "file_write",
+                &serde_json::json!({
+                    "path": path, "content": plan.text, "purpose": "project"
+                })
+                .to_string(),
+            )],
+            &c,
+        )
+        .await;
+        assert!(result[0].1.contains("declined"), "{result:?}");
+        assert!(!root.join(path).exists());
+        assert_eq!(
+            std::fs::read_dir(root.join("docs/plans")).unwrap().count(),
+            0
+        );
+        assert!(
+            plan.text.contains("## Acceptance"),
+            "in-memory draft survives denial"
+        );
     }
 
     /// A scripted fake model: pops the next turn; empties → a final "stop".
@@ -5846,17 +10983,25 @@ mod tests {
         let Some(tool) = r.get_arc(&tc.function.name) else {
             return format!("error: unknown tool '{}'", tc.function.name);
         };
-        if let Some(denied) = gate_and_approve(tool.as_ref(), &args, cfg) {
+        let prepared = match tool.prepare_call(&args, &cfg.exec_ctx) {
+            Ok(prepared) => prepared,
+            Err(error) => return format!("error: {error}"),
+        };
+        if let Some(denied) = gate_prepared_and_approve(tool.as_ref(), &prepared, cfg) {
             return denied;
         }
         crate::core::cancel::with_current(cfg.cancel.clone(), || {
-            run_tool_body(
-                tool,
-                &args,
-                cfg.quiet,
-                cfg.max_tool_result_chars,
-                cfg.max_fetch_result_chars,
-            )
+            crate::core::exec_ctx::with_current(cfg.exec_ctx.clone(), || {
+                run_prepared_tool_body(
+                    tool,
+                    &prepared,
+                    cfg.quiet,
+                    cfg.result_budgets(),
+                    cfg.tool_image_destination.clone(),
+                )
+                .observation
+                .text
+            })
         })
     }
 
@@ -5868,14 +11013,17 @@ mod tests {
             .collect();
         let mut checkpointed = false;
         let mut writer_lease = None;
-        let results = execute_calls(
-            r,
-            calls,
-            c,
-            &mut sink,
-            Vec::new(),
-            &mut checkpointed,
-            &mut writer_lease,
+        let results = crate::core::workspace_txn::with_test_lock_namespace_future(
+            c.exec_ctx.test_lock_namespace().cloned(),
+            execute_calls(
+                r,
+                calls,
+                c,
+                &mut sink,
+                Vec::new(),
+                &mut checkpointed,
+                &mut writer_lease,
+            ),
         )
         .await;
         // The sink must mirror the returned results (the loop relies on it).
@@ -5887,6 +11035,37 @@ mod tests {
             );
         }
         results
+    }
+
+    #[test]
+    fn delegated_restore_commands_cannot_be_approved_under_yolo() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ShellStub));
+        let mut child = cfg();
+        child.approval_mode = crate::core::approval::ApprovalMode::Yolo;
+        child.exec_ctx = child.exec_ctx.without_workspace_restore();
+        for command in [
+            "git restore src/a.rs",
+            "git reset --hard HEAD",
+            "git read-tree --reset -u HEAD",
+            "aizen time undo",
+            "aizen time doctor --repair",
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            let output = execute_one_for_test(&registry, &call("1", "shell_run", &args), &child);
+            assert!(
+                output.contains("delegated children cannot restore"),
+                "{command}: {output}"
+            );
+            assert!(!output.contains("RAN"), "{command}: {output}");
+        }
+        let args = r#"{"command":"git restore src/a.rs"}"#;
+        let mut parent = cfg();
+        parent.approval_mode = crate::core::approval::ApprovalMode::Yolo;
+        assert_eq!(
+            execute_one_for_test(&registry, &call("2", "shell_run", args), &parent),
+            "RAN"
+        );
     }
 
     #[test]
@@ -6172,7 +11351,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Pin the fixture home through opaque tool admission and hook lookup so unrelated global state cannot introduce new failure evidence"
+    )]
     async fn thrash_guard_stops_distinct_but_all_failing_turns() {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (fixture, base) = placement_executor_fixture();
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
         let r = registry();
         // Every turn calls the always-failing `fail` tool with DIFFERENT args, so the identical-
         // signature Divergence check never trips — the thrash guard (all-fail, no-edit streak) must
@@ -6180,7 +11370,8 @@ mod tests {
         let c = AgentConfig {
             max_iters: 20,
             auto_extend_to: 20,
-            ..cfg()
+            approval_mode: crate::core::approval::ApprovalMode::Ask,
+            ..base
         };
         // The LAST scripted turn is consumed by the synthesis call, not the loop.
         let turns = vec![
@@ -6190,9 +11381,20 @@ mod tests {
             tool_turn("fail", r#"{"n":"4"}"#),
             final_turn("synth-answer"),
         ];
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted(turns), &c, &r, &mut messages)
             .await
             .unwrap();
+        let failures: Vec<_> = messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| message.content.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            failures,
+            vec!["error: boom"; 4],
+            "all four actual executions must report the same failure class"
+        );
         assert_eq!(
             out.stop,
             StopReason::Divergence,
@@ -6270,10 +11472,16 @@ mod tests {
             .map(|n| tool_turn("fail", &format!(r#"{{"n":"{n}"}}"#)))
             .collect();
         turns.push(final_turn("synth-answer"));
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted(turns), &c, &r, &mut messages)
             .await
             .unwrap();
-        assert_eq!(out.stop, StopReason::Divergence);
+        assert_eq!(
+            out.stop,
+            StopReason::Divergence,
+            "history: {}",
+            serde_json::to_string_pretty(&messages).unwrap()
+        );
         assert_eq!(out.iters, 4);
         assert_eq!(out.final_text.as_deref(), Some("synth-answer"));
     }
@@ -6344,22 +11552,75 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME stable while awaited destructive calls acquire writer leases; lease failures would invalidate the evidence test"
+    )]
     async fn successful_edit_always_counts_as_evidence() {
-        // `delete` returns the CONSTANT body "deleted", so novelty-by-body can never reset the
-        // episode — only the fact that the disk changed can. A long run of real edits must not be
-        // mistaken for a stall. (Distinct args keep the signature latch out of it.)
-        let r = registry();
-        let c = AgentConfig {
-            approval_mode: crate::core::approval::ApprovalMode::Yolo,
-            max_iters: 20,
-            auto_extend_to: 20,
-            ..cfg()
-        };
+        // The report is constant, but every invocation commits a distinct native write. Only the
+        // actual edit evidence can reset the episode after the first report has lost its novelty.
+        struct ConstantReport(std::sync::Arc<dyn Tool>);
+        impl Tool for ConstantReport {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            fn description(&self) -> &str {
+                self.0.description()
+            }
+            fn parameters(&self) -> serde_json::Value {
+                self.0.parameters()
+            }
+            fn is_destructive(&self) -> bool {
+                true
+            }
+            fn is_concurrency_safe(&self) -> bool {
+                false
+            }
+            fn workspace_effect_prepared(
+                &self,
+                p: &tools::PreparedToolCall,
+            ) -> tools::WorkspaceEffect {
+                self.0.workspace_effect_prepared(p)
+            }
+            fn workspace_target_prepared(
+                &self,
+                p: &tools::PreparedToolCall,
+            ) -> Option<std::path::PathBuf> {
+                self.0.workspace_target_prepared(p)
+            }
+            fn prepare_call(
+                &self,
+                a: &serde_json::Value,
+                c: &crate::core::exec_ctx::ExecutionContext,
+            ) -> Result<tools::PreparedToolCall> {
+                self.0.prepare_call(a, c)
+            }
+            fn execute(&self, _: &serde_json::Value) -> Result<String> {
+                unreachable!("prepared native fixture")
+            }
+            fn execute_prepared(&self, p: &tools::PreparedToolCall) -> Result<ToolObservation> {
+                let observation = self.0.execute_prepared(p)?;
+                assert!(!observation.text.starts_with(builtin::NOOP_WRITE_PREFIX));
+                Ok(ToolObservation::text("owned native edit committed"))
+            }
+        }
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let (fixture, mut c) = placement_executor_fixture();
+        let root = c.effective_root();
+        let home = fixture.path().join("home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(ConstantReport(
+            builtin::file_registry_for_test(&root)
+                .get_arc("file_write")
+                .unwrap(),
+        )));
+        c.max_iters = 20;
+        c.auto_extend_to = 20;
         let mut turns: Vec<_> = (1..=6)
-            .map(|n| tool_turn("delete", &format!(r#"{{"d":"{n}"}}"#)))
+            .map(|n| tool_turn("file_write", &serde_json::json!({"path":format!("owned-{n}.txt"),"content":"changed","purpose":"project"}).to_string()))
             .collect();
         turns.push(final_turn("all edits landed"));
         let out = run_agent(scripted(turns), &c, &r, "sys", "task")
@@ -6371,6 +11632,12 @@ mod tests {
             "a run of real edits with a constant result body must not be stopped as a stall"
         );
         assert_eq!(out.final_text.as_deref(), Some("all edits landed"));
+        for n in 1..=6 {
+            assert_eq!(
+                std::fs::read_to_string(root.join(format!("owned-{n}.txt"))).unwrap(),
+                "changed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6592,6 +11859,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME stable through the awaited edit's writer lease so the recovery step is genuinely successful"
+    )]
     async fn legit_reread_after_failed_edit_recovers() {
         let r = registry();
         // THE hardest trap: the system-prompt-sanctioned recovery — a failed edit, then a re-read
@@ -6635,6 +11906,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME stable through awaited writer-lease acquisition to preserve the exact destructive-call stop iteration"
+    )]
     async fn repeated_identical_destructive_call_stops() {
         let r = registry();
         // A repeated IDENTICAL successful destructive call (same signature, same body — models
@@ -6880,7 +12155,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep the fixture HOME and physical lock namespace stable through awaited tool settlement"
+    )]
     async fn a_deadline_cuts_a_healthy_run_that_still_has_steps_and_ignores_goal_mode() {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path())]);
         // The case the ceiling exists for: a run that is making genuine progress (fresh tool call every
         // turn, so neither the divergence latch nor the stall guard fires) and has plenty of budget
         // left. Steps alone would let it continue; only time stops it.
@@ -6889,12 +12173,23 @@ mod tests {
         // done"), and that is exactly the shape that needs a wall clock — so the deadline check sits
         // outside the `!goal_mode` guard, and this pins that.
         let r = registry();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
         let chat = move |_m: Vec<Message>, _d: Vec<ToolDef>| {
             let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                // Finish two ordinary turns, then cross the exact configured deadline in the model
+                // call, not in a tool worker. Relative sleeps can land just before the ceiling and
+                // accidentally exercise the fail-closed UnknownWorker path instead of this stop.
+                if n >= 2 {
+                    // Return after (not exactly at) the deadline. An exact timer tie can let the
+                    // read watcher win its own sleep_until race and truthfully report UnknownWorker;
+                    // crossing the deadline before returning means the tool launch is rejected as a
+                    // settled no-op, and the next loop-top check owns the deadline assertion.
+                    let after_deadline = deadline + std::time::Duration::from_millis(100);
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(after_deadline)).await;
+                }
                 // A DISTINCT argument each turn: two identical calls would trip the divergence latch
                 // and stop the run for the wrong reason, hiding whether the deadline works at all.
                 Ok(tool_turn("echo", &format!(r#"{{"text":"step {n}"}}"#)))
@@ -6904,7 +12199,7 @@ mod tests {
             max_iters: 50,
             auto_extend_to: 50,
             goal: Some("keep going".into()),
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(300)),
+            deadline: Some(deadline),
             ..cfg()
         };
         let out = run_agent(chat, &c, &r, "sys", "task").await.unwrap();
@@ -7005,6 +12300,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize the process-global todo fixture through awaited stall-recovery reads and cleanup; the loop uses the separate TODOS mutex"
+    )]
     async fn stall_recovery_changes_approach_while_todos_are_open_then_stops() {
         // The stall guard is right that nothing new landed — but with the model's OWN plan still open,
         // ending the run abandons work it declared unfinished. One bounded recovery turn is spent
@@ -7063,6 +12362,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep the process-global todo fixture empty throughout awaited stall-recovery checks; the loop uses the separate TODOS mutex"
+    )]
     async fn no_stall_recovery_without_an_open_plan() {
         // Without incomplete todos there is no evidence the work is unfinished, so the stall guard
         // keeps its original prompt stop — the recovery must not fire on every flat run.
@@ -7348,7 +12651,6 @@ mod tests {
             quiet: true,
             context_window: 100,
             context_guard_pct: pct,
-            clear_at_pct: 0,
             compact_at_pct: 0,
             enable_todo_poke: false,
             enable_confidence_gate: false,
@@ -7650,6 +12952,808 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delegated_refresh_is_not_done_or_automatically_continued() {
+        let registry = ToolRegistry::new();
+        let mut messages = vec![Message::user("inspect src/parser.rs")];
+        let out = run_agent_loop(
+            scripted(vec![final_turn("REFRESH: partial investigation")]),
+            &cfg(),
+            &registry,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Refresh);
+        assert_eq!(out.iters, 1);
+        assert!(task_tool::stop_body_warning(&out.stop)
+            .unwrap()
+            .contains("INCOMPLETE"));
+        assert_eq!(
+            out.final_text.as_deref(),
+            Some("REFRESH: partial investigation")
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesis_elapsed_deadline_spends_no_call() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let chat = |_: Vec<Message>, _: Vec<ToolDef>| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(final_turn("should not run")))
+        };
+        let c = AgentConfig {
+            deadline: Some(std::time::Instant::now()),
+            ..cfg()
+        };
+        let mut messages = vec![Message::user("task")];
+        let out = synthesize_final(&chat, &mut messages, "wrap up", &c).await;
+        assert_eq!(out.stop, Some(StopReason::Deadline));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn synthesis_pending_call_stops_at_the_original_absolute_deadline() {
+        let started = std::cell::Cell::new(false);
+        let chat = |_: Vec<Message>, _: Vec<ToolDef>| {
+            started.set(true);
+            std::future::pending::<Result<ChatTurn>>()
+        };
+        let start = std::time::Instant::now();
+        let c = AgentConfig {
+            deadline: Some(start + std::time::Duration::from_millis(30)),
+            ..cfg()
+        };
+        let mut messages = vec![Message::user("task")];
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            synthesize_final(&chat, &mut messages, "wrap up", &c),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, Some(StopReason::Deadline));
+        assert!(started.get());
+        assert_eq!(messages.len(), 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn synthesis_child_cancel_is_prompt_and_independent() {
+        let parent = crate::core::cancel::TurnCancel::new();
+        let c = AgentConfig {
+            cancel: parent.child(),
+            ..cfg()
+        };
+        let sibling = parent.child();
+        let cancel = c.cancel.clone();
+        let chat = move |_: Vec<Message>, _: Vec<ToolDef>| {
+            cancel.cancel();
+            std::future::pending::<Result<ChatTurn>>()
+        };
+        let mut messages = vec![Message::user("task")];
+        let out = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            synthesize_final(&chat, &mut messages, "wrap up", &c),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, Some(StopReason::Cancelled));
+        assert!(!parent.is_cancelled());
+        assert!(!sibling.is_cancelled());
+        assert_eq!(messages.len(), 1);
+    }
+
+    fn placement_executor_fixture() -> (crate::core::file_placement::tests::TestDir, AgentConfig) {
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let placement = crate::core::file_placement::PlacementContext::with_paths(
+            root.clone(),
+            temp.path().join("home"),
+            temp.path().join("process"),
+            "executor-test",
+        )
+        .unwrap();
+        let c = AgentConfig {
+            workspace_root: Some(root),
+            exec_ctx: cfg().exec_ctx.with_placement(placement),
+            approval_mode: crate::core::approval::ApprovalMode::Yolo,
+            ..cfg()
+        };
+        (temp, pin_placement_context(&c).unwrap())
+    }
+
+    #[test]
+    fn native_independent_child_loops_overlap_through_actual_executor_bodies() {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        struct BodyProbe {
+            inner: std::sync::Arc<dyn Tool>,
+            entered: std::sync::mpsc::Sender<String>,
+            release: std::sync::Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+            home: std::path::PathBuf,
+        }
+        impl Tool for BodyProbe {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+            fn description(&self) -> &str {
+                self.inner.description()
+            }
+            fn parameters(&self) -> serde_json::Value {
+                self.inner.parameters()
+            }
+            fn is_destructive(&self) -> bool {
+                self.inner.is_destructive()
+            }
+            fn is_concurrency_safe(&self) -> bool {
+                self.inner.is_concurrency_safe()
+            }
+            fn workspace_effect_prepared(
+                &self,
+                call: &tools::PreparedToolCall,
+            ) -> tools::WorkspaceEffect {
+                self.inner.workspace_effect_prepared(call)
+            }
+            fn workspace_target_prepared(
+                &self,
+                call: &tools::PreparedToolCall,
+            ) -> Option<std::path::PathBuf> {
+                self.inner.workspace_target_prepared(call)
+            }
+            fn plan_call(
+                &self,
+                args: &serde_json::Value,
+                ctx: &crate::core::exec_ctx::ExecutionContext,
+            ) -> Result<tools::PreparedToolCall> {
+                self.inner.plan_call(args, ctx)
+            }
+            fn prepare_call(
+                &self,
+                args: &serde_json::Value,
+                ctx: &crate::core::exec_ctx::ExecutionContext,
+            ) -> Result<tools::PreparedToolCall> {
+                self.inner.prepare_call(args, ctx)
+            }
+            fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+                anyhow::bail!("prepared fixture only")
+            }
+            fn execute_prepared(&self, call: &tools::PreparedToolCall) -> Result<ToolObservation> {
+                let scope = crate::core::exec_ctx::current().unwrap().resource_scope();
+                let entered = self.entered.clone();
+                let release = self.release.clone();
+                let hook = Box::new(move |_: &str, _: &std::path::Path| {
+                    entered.send(scope).unwrap();
+                    release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(15))
+                        .unwrap();
+                });
+                crate::core::native_journal::with_test_storage(&self.home, || {
+                    builtin::with_native_body_hook_for_test(hook, || {
+                        self.inner.execute_prepared(call)
+                    })
+                })
+            }
+        }
+        let (fixture, base) = placement_executor_fixture();
+        let root = base.effective_root();
+        let home = fixture.path().to_path_buf();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", home.as_os_str())]);
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        std::fs::write(root.join("b.txt"), "beta").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        let mut releases = Vec::new();
+        for (owner, name, path, args) in [
+            (
+                "executor/first",
+                "file_write",
+                "a.txt",
+                serde_json::json!({"path":"a.txt","content":"ALPHA"}),
+            ),
+            (
+                "executor/second",
+                "file_edit",
+                "b.txt",
+                serde_json::json!({"path":"b.txt","old_string":"beta","new_string":"BETA"}),
+            ),
+        ] {
+            let ctx = task_tool::child_execution_context(&base.exec_ctx, owner, &root, name)
+                .with_native_scope(
+                    crate::core::native_scope::NativeWriteScope::resolve(&root, &[path.into()])
+                        .unwrap(),
+                )
+                .unwrap();
+            let c = AgentConfig {
+                exec_ctx: ctx,
+                approval_mode: crate::core::approval::ApprovalMode::Yolo,
+                ..base.clone()
+            };
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            releases.push(release_tx);
+            let mut r = ToolRegistry::new();
+            r.register(Box::new(BodyProbe {
+                inner: builtin::file_registry_for_test(&root)
+                    .get_arc(name)
+                    .unwrap(),
+                entered: entered_tx.clone(),
+                release: std::sync::Arc::new(Mutex::new(release_rx)),
+                home: home.clone(),
+            }));
+            let args = args.to_string();
+            let home = home.clone();
+            workers.push(std::thread::spawn(move || {
+                crate::core::workspace_txn::with_test_lock_home(&home, || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async {
+                            let chat = scripted(vec![
+                                tool_turn(name, &args),
+                                final_turn("child complete"),
+                            ]);
+                            let mut messages = vec![
+                                Message::system("fixture"),
+                                Message::user("apply owned exact-file change"),
+                            ];
+                            let result = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+                            assert_eq!(result.stop, StopReason::Done);
+                            assert!(!c.exec_ctx.can_restore_workspace());
+                            assert_valid_history(&messages);
+                        })
+                })
+            }));
+        }
+        let mut arrived = vec![
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .unwrap(),
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .unwrap(),
+        ];
+        arrived.sort();
+        assert_eq!(arrived, ["executor/first", "executor/second"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "alpha"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "beta");
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "ALPHA"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "BETA");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Pin the fixture home across dispatch workers; workers do not acquire TEST_HOME_LOCK"
+    )]
+    async fn native_owner_undo_dispatch_skips_whole_tree_lease_baseline_and_checkpoint() {
+        use crate::core::persist::FileFingerprint;
+        use crate::core::workspace_txn::{NativeResource, NativeResourceLease};
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (temp, mut config) = placement_executor_fixture();
+        let root = config.effective_root();
+        let home = temp.path().join("coordination-home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        config.exec_ctx = config.exec_ctx.with_resource_scope("undo-parent");
+        config.enable_verify_gate = true;
+        config.auto_checkpoint = true;
+        config.checkpoint_each_edit = true;
+        let owner = "undo-parent/task/a";
+        let child = config
+            .exec_ctx
+            .clone()
+            .without_workspace_restore()
+            .with_resource_scope(owner);
+        std::fs::write(root.join("a.txt"), b"before").unwrap();
+        std::fs::write(root.join("b.txt"), b"sibling").unwrap();
+        let a = NativeResource::resolve(&root.join("a.txt")).unwrap();
+        crate::core::exec_ctx::with_current(child, || {
+            let _lease = NativeResourceLease::acquire(
+                &root,
+                &[(a.clone(), crate::core::repo_lock::LockMode::Exclusive)],
+                std::time::Duration::from_secs(1),
+                None,
+                owner,
+            )
+            .unwrap();
+            crate::core::native_journal::apply(
+                &a,
+                &FileFingerprint::for_bytes(b"before"),
+                b"owned",
+                owner,
+            )
+            .unwrap();
+        });
+        // A disjoint native body remains admitted. Whole-tree admission would conflict with its
+        // shared global gate; the undo must acquire only the selected exact resource instead.
+        let b = NativeResource::resolve(&root.join("b.txt")).unwrap();
+        let _sibling = crate::core::exec_ctx::with_current(config.exec_ctx.clone(), || {
+            NativeResourceLease::acquire(
+                &root,
+                &[(b, crate::core::repo_lock::LockMode::Shared)],
+                std::time::Duration::from_secs(1),
+                None,
+                "undo-sibling",
+            )
+            .unwrap()
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(native_undo::NativeOwnerUndo::new(root.clone())));
+        let calls = vec![call(
+            "undo",
+            "native_owner_undo",
+            r#"{"owner":"undo-parent/task/a","paths":["a.txt"]}"#,
+        )];
+        let planned = plan_execution_calls(&registry, &calls, &config);
+        let mut sink = vec![Message::tool_result("undo", INTERRUPTED_TOOL_PLACEHOLDER)];
+        let mut checkpointed = false;
+        let mut writer_lease = None;
+        let mut baseline = None;
+        let executions = crate::core::workspace_txn::with_test_lock_namespace_future(
+            config.exec_ctx.test_lock_namespace().cloned(),
+            execute_execution_calls(
+                &registry,
+                &calls,
+                &planned,
+                true,
+                &config,
+                &mut sink,
+                Vec::new(),
+                &mut checkpointed,
+                &mut writer_lease,
+                &mut baseline,
+                &[],
+            ),
+        )
+        .await;
+        assert!(executions[0].failure.is_none(), "{executions:?}");
+        assert_eq!(executions[0].effect_state, tools::ToolEffectState::Settled);
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"before");
+        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"sibling");
+        assert!(!checkpointed);
+        assert!(writer_lease.is_none());
+        assert!(baseline.is_none());
+        assert!(!config.exec_ctx.placement().unwrap().home_root().exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize process-global AIZEN_HOME through awaited placement workers and EnvGuard restoration; workers do not acquire the test mutex"
+    )]
+    async fn placement_executor_dependent_batch_prepares_at_each_boundary() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_temp, c) = placement_executor_fixture();
+        let _env = crate::core::config::EnvGuard::set([(
+            "AIZEN_HOME",
+            c.exec_ctx.placement().unwrap().home_root().to_path_buf(),
+        )]);
+        let root = c.effective_root();
+        let r = builtin::file_registry_for_test(&root);
+        let calls = vec![
+            call(
+                "create",
+                "file_write",
+                r#"{"path":"a.txt","content":"first","purpose":"project"}"#,
+            ),
+            call(
+                "rewrite",
+                "file_write",
+                r#"{"path":"a.txt","content":"second"}"#,
+            ),
+            call(
+                "move",
+                "file_move",
+                r#"{"from":"a.txt","to":"b.txt","purpose":"project"}"#,
+            ),
+            call("read", "file_read", r#"{"path":"b.txt"}"#),
+            call(
+                "edit",
+                "file_edit",
+                r#"{"path":"b.txt","old_string":"second","new_string":"third"}"#,
+            ),
+        ];
+        let original: Vec<_> = calls.iter().map(|c| c.function.arguments.clone()).collect();
+        let planned = plan_execution_calls(&r, &calls, &c);
+        assert!(
+            !root.join("a.txt").exists(),
+            "planning cannot create or snapshot future targets"
+        );
+        let mut sink: Vec<_> = calls
+            .iter()
+            .map(|c| Message::tool_result(&c.id, INTERRUPTED_TOOL_PLACEHOLDER))
+            .collect();
+        let executions = execute_execution_calls(
+            &r,
+            &calls,
+            &planned,
+            true,
+            &c,
+            &mut sink,
+            Vec::new(),
+            &mut false,
+            &mut None,
+            &mut None,
+            &[],
+        )
+        .await;
+        assert!(
+            executions.iter().all(|r| r.failure.is_none()),
+            "{executions:?}"
+        );
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "third"
+        );
+        for ((call, execution), original) in calls.iter().zip(&executions).zip(original) {
+            assert_eq!(call.function.arguments, original);
+            assert_eq!(call.id, execution.call_id);
+            assert!(execution.prepared.is_some());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME pinned across both awaited placement checks, absent-root assertions, and EnvGuard restoration"
+    )]
+    async fn placement_executor_missing_purpose_and_decline_leave_roots_absent() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (temp, mut c) = placement_executor_fixture();
+        // Coordination/audit storage is not an approved placement destination. Keep the fixture's
+        // process home separate so bookkeeping cannot satisfy the absent placement-root assertion.
+        let _env = crate::core::config::EnvGuard::set([(
+            "AIZEN_HOME",
+            temp.path().join("coordination-home"),
+        )]);
+        let root = c.effective_root();
+        let registry = builtin::file_registry_for_test(&root);
+        let missing = exec(
+            &registry,
+            &[call(
+                "missing",
+                "file_write",
+                r#"{"path":"new.txt","content":"x"}"#,
+            )],
+            &c,
+        )
+        .await;
+        assert!(missing[0].1.contains("requires purpose"), "{missing:?}");
+        assert!(!root.join("new.txt").exists());
+        c.approval_mode = crate::core::approval::ApprovalMode::Ask;
+        let denied = exec(
+            &registry,
+            &[call(
+                "denied",
+                "file_write",
+                r#"{"path":"nested/output.txt","content":"x","purpose":"artifact"}"#,
+            )],
+            &c,
+        )
+        .await;
+        assert!(denied[0].1.contains("declined"), "{denied:?}");
+        assert!(!c.exec_ctx.placement().unwrap().home_root().exists());
+        assert!(!c.exec_ctx.placement().unwrap().scratch_root().exists());
+        assert!(!root.join("nested").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME pinned through both awaited placement executions, writer-lease assertions, and EnvGuard restoration"
+    )]
+    async fn placement_executor_uses_one_effective_target_and_preserves_wire_history() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_temp, c) = placement_executor_fixture();
+        let home = c.exec_ctx.placement().unwrap().home_root().to_path_buf();
+        // Runtime bookkeeping shares the data root. Pin an existing home before preparation so
+        // unrelated store activity cannot create an unowned ancestor inside this approval baseline.
+        std::fs::create_dir(&home).unwrap();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        let root = c.effective_root();
+        let registry = builtin::file_registry_for_test(&root);
+        let args = r#"{"path":"nested/output.txt","content":"report","purpose":"artifact"}"#;
+        let requested = call("write", "file_write", args);
+        let prepared = prepare_execution_calls(&registry, std::slice::from_ref(&requested), &c);
+        let resolved = prepared[0].as_ref().unwrap();
+        let actual = c
+            .exec_ctx
+            .placement()
+            .unwrap()
+            .artifact_root()
+            .join("nested/output.txt");
+        assert_eq!(resolved.args["path"], actual.to_string_lossy().as_ref());
+        let preview = prepared_preview(registry.get("file_write").unwrap(), resolved).unwrap();
+        assert_eq!(preview.title, actual.to_string_lossy());
+        assert!(preview
+            .lines
+            .iter()
+            .any(|line| line.contains("artifact: nested/output.txt")));
+        assert_eq!(requested.function.arguments, args);
+        assert!(
+            !actual.parent().unwrap().exists(),
+            "preparation/preview must not mkdir"
+        );
+        let mut sink = vec![Message::tool_result("write", INTERRUPTED_TOOL_PLACEHOLDER)];
+        let mut checkpointed = false;
+        let mut lease = None;
+        let results = execute_prepared_calls(
+            &registry,
+            std::slice::from_ref(&requested),
+            &prepared,
+            &c,
+            &mut sink,
+            Vec::new(),
+            &mut checkpointed,
+            &mut lease,
+        )
+        .await;
+        assert!(!results[0].1.starts_with("error:"), "{results:?}");
+        assert_eq!(std::fs::read_to_string(&actual).unwrap(), "report");
+        assert!(results[0].1.contains(actual.to_string_lossy().as_ref()));
+        let lease = lease.expect("managed writes still protect their actual destination");
+        let expected_identity =
+            crate::core::workspace_txn::WorkspaceIdentity::discover(actual.parent().unwrap())
+                .unwrap();
+        assert_eq!(lease.identity().worktree_id, expected_identity.worktree_id);
+        assert_ne!(lease.identity().canonical_root, root);
+        assert!(!checkpointed);
+        assert!(!turn_made_edits(
+            &registry,
+            &effective_calls(std::slice::from_ref(&requested), &prepared),
+            &results
+        ));
+        assert!(!root.join("nested").exists());
+        assert_eq!(requested.function.arguments, args);
+
+        let mut messages = vec![Message::system("sys"), Message::user("write a report")];
+        let out = run_agent_loop(
+            scripted(vec![
+                tool_turn(
+                    "file_write",
+                    r#"{"path":"second.txt","content":"second","purpose":"artifact"}"#,
+                ),
+                final_turn("done"),
+            ]),
+            &c,
+            &registry,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert!(messages
+            .iter()
+            .flat_map(|message| &message.tool_calls)
+            .any(|call| {
+                serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                    .is_ok_and(|args| args["path"] == "second.txt")
+            }));
+        assert_valid_history(&messages);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME pinned across awaited drift and creation checks and EnvGuard restoration"
+    )]
+    async fn placement_executor_refuses_drift_and_native_edit_creation() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_temp, c) = placement_executor_fixture();
+        let _env = crate::core::config::EnvGuard::set([(
+            "AIZEN_HOME",
+            c.exec_ctx.placement().unwrap().home_root().to_path_buf(),
+        )]);
+        let root = c.effective_root();
+        let registry = builtin::file_registry_for_test(&root);
+        let path = root.join("existing.txt");
+        std::fs::write(&path, "approved before").unwrap();
+        let calls = vec![call(
+            "write",
+            "file_write",
+            r#"{"path":"existing.txt","content":"replacement"}"#,
+        )];
+        let prepared = prepare_execution_calls(&registry, &calls, &c);
+        let cached = prepared_preview(
+            registry.get("file_write").unwrap(),
+            prepared[0].as_ref().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&path, "changed after").unwrap();
+        assert_eq!(
+            prepared_preview(
+                registry.get("file_write").unwrap(),
+                prepared[0].as_ref().unwrap()
+            )
+            .unwrap(),
+            cached
+        );
+        let mut sink = vec![Message::tool_result("write", INTERRUPTED_TOOL_PLACEHOLDER)];
+        let mut checkpointed = false;
+        let mut lease = None;
+        let results = execute_prepared_calls(
+            &registry,
+            &calls,
+            &prepared,
+            &c,
+            &mut sink,
+            Vec::new(),
+            &mut checkpointed,
+            &mut lease,
+        )
+        .await;
+        assert!(results[0].1.starts_with("error:"), "{results:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed after");
+        assert!(lease.is_none());
+        let edit = exec(
+            &registry,
+            &[call(
+                "edit",
+                "file_edit",
+                r#"{"path":"missing.txt","new_string":"x"}"#,
+            )],
+            &c,
+        )
+        .await;
+        assert!(edit[0].1.starts_with("error:"), "{edit:?}");
+        assert!(!root.join("missing.txt").exists());
+    }
+
+    #[test]
+    fn placement_executor_child_scopes_and_move_effects_use_actual_paths() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_temp, c) = placement_executor_fixture();
+        let _env = crate::core::config::EnvGuard::set([(
+            "AIZEN_HOME",
+            c.exec_ctx.placement().unwrap().home_root().to_path_buf(),
+        )]);
+        let root = c.effective_root();
+        let registry = builtin::file_registry_for_test(&root);
+        let left = task_tool::child_execution_context(&c.exec_ctx, "task:left", &root, "left");
+        let right = task_tool::child_execution_context(&c.exec_ctx, "task:right", &root, "right");
+        let left = pin_placement_context(&AgentConfig {
+            exec_ctx: left,
+            ..c.clone()
+        })
+        .unwrap();
+        let right = pin_placement_context(&AgentConfig {
+            exec_ctx: right,
+            ..c.clone()
+        })
+        .unwrap();
+        let calls = [call(
+            "write",
+            "file_write",
+            r#"{"path":"same.txt","content":"x","purpose":"scratch"}"#,
+        )];
+        let a = prepare_execution_calls(&registry, &calls, &left);
+        let b = prepare_execution_calls(&registry, &calls, &right);
+        assert_ne!(
+            a[0].as_ref().unwrap().args["path"],
+            b[0].as_ref().unwrap().args["path"]
+        );
+        assert_eq!(
+            left.exec_ctx.placement().unwrap().run_id(),
+            right.exec_ctx.placement().unwrap().run_id()
+        );
+        assert!(!left.exec_ctx.placement().unwrap().scratch_root().exists());
+        std::fs::write(root.join("source.txt"), "source").unwrap();
+        let calls = [call(
+            "move",
+            "file_move",
+            r#"{"from":"source.txt","to":"report.txt","purpose":"artifact"}"#,
+        )];
+        let prepared = prepare_execution_calls(&registry, &calls, &c);
+        let prepared = prepared[0].as_ref().unwrap();
+        let tool = registry.get("file_move").unwrap();
+        assert_eq!(
+            tool.workspace_effect_prepared(prepared),
+            tools::WorkspaceEffect::Paths
+        );
+        assert_eq!(tool.workspace_target_prepared(prepared), Some(root.clone()));
+        assert_eq!(
+            prepared_edit_paths(&root, "file_move", prepared),
+            vec![root.join("source.txt")]
+        );
+        assert!(!prepared
+            .file
+            .as_ref()
+            .unwrap()
+            .destination
+            .actual_path()
+            .starts_with(&root));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME pinned through the awaited move, source-lease assertions, and EnvGuard restoration"
+    )]
+    async fn placement_executor_move_keeps_source_lease_with_initially_absent_home() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (temp, c) = placement_executor_fixture();
+        // Coordination storage is independent of the still-uncreated placement destination.
+        let _env = crate::core::config::EnvGuard::set([(
+            "AIZEN_HOME",
+            temp.path().join("coordination-home"),
+        )]);
+        let root = c.effective_root();
+        std::fs::write(root.join("source.txt"), "source").unwrap();
+        let registry = builtin::file_registry_for_test(&root);
+        let calls = [call(
+            "move",
+            "file_move",
+            r#"{"from":"source.txt","to":"report.txt","purpose":"artifact"}"#,
+        )];
+        let prepared = prepare_execution_calls(&registry, &calls, &c);
+        assert!(!c.exec_ctx.placement().unwrap().home_root().exists());
+        let actual = prepared[0]
+            .as_ref()
+            .unwrap()
+            .file
+            .as_ref()
+            .unwrap()
+            .destination
+            .actual_path()
+            .to_path_buf();
+        let mut sink = vec![Message::tool_result("move", INTERRUPTED_TOOL_PLACEHOLDER)];
+        let mut checkpointed = false;
+        let mut lease = None;
+        let results = execute_prepared_calls(
+            &registry,
+            &calls,
+            &prepared,
+            &c,
+            &mut sink,
+            Vec::new(),
+            &mut checkpointed,
+            &mut lease,
+        )
+        .await;
+        assert!(!results[0].1.starts_with("error:"), "{results:?}");
+        assert!(
+            lease.is_some(),
+            "source removal must retain the workspace lease"
+        );
+        assert!(!checkpointed, "fixture explicitly disables checkpoints");
+        assert!(!root.join("source.txt").exists());
+        assert_eq!(std::fs::read_to_string(actual).unwrap(), "source");
+        assert!(turn_made_prepared_edits(
+            &registry, &calls, &prepared, &results
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn execute_calls_parallel_preserves_order() {
         // 3 read-only echo calls in one turn → concurrent run; results re-stitch in CALL order
@@ -7669,6 +13773,264 @@ mod tests {
                 ("3".to_string(), "third".to_string()),
             ]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executor_hung_safe_batch_uses_one_deadline_and_stops_later_windows() {
+        struct SlowReader {
+            started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            sleep: std::time::Duration,
+        }
+        impl Tool for SlowReader {
+            fn name(&self) -> &str {
+                "slow_reader"
+            }
+            fn description(&self) -> &str {
+                "owned test worker"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object"})
+            }
+            fn execute(&self, _: &serde_json::Value) -> Result<String> {
+                self.started
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(self.sleep);
+                Ok("late result".into())
+            }
+        }
+        let calls: Vec<_> = (0..MAX_PARALLEL + 2)
+            .map(|i| call(&format!("id-{i}"), "slow_reader", "{}"))
+            .collect();
+
+        // Without an expired deadline every call must actually run. This proves dispatch starts
+        // real workers, independently of how long setup takes on a loaded machine — the deadline
+        // run below may legitimately start none when the deadline lapses before dispatch.
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowReader {
+            started: started.clone(),
+            sleep: std::time::Duration::from_millis(5),
+        }));
+        let results = exec(&registry, &calls, &cfg()).await;
+        assert_eq!(results.len(), calls.len());
+        assert!(
+            results.iter().all(|(_, text)| text == "late result"),
+            "{results:?}"
+        );
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            calls.len(),
+            "a healthy batch dispatches every call"
+        );
+
+        // One absolute deadline for the whole batch. Whether dispatch beats the deadline depends on
+        // the machine; the contract under test is that every call ends at that deadline, no later
+        // window starts, and the run does not serialize one deadline per collected worker.
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowReader {
+            started: started.clone(),
+            sleep: std::time::Duration::from_millis(200),
+        }));
+        let now = std::time::Instant::now();
+        let config = AgentConfig {
+            deadline: Some(now + std::time::Duration::from_millis(70)),
+            ..cfg()
+        };
+        let results = exec(&registry, &calls, &config).await;
+        assert!(
+            now.elapsed() < std::time::Duration::from_millis(400),
+            "one deadline, not one per sequentially collected worker"
+        );
+        assert_eq!(results.len(), calls.len());
+        for (call, result) in calls.iter().zip(&results) {
+            assert_eq!(result.0, call.id);
+            assert!(result.1.contains("deadline"), "{result:?}");
+        }
+        assert!(
+            started.load(std::sync::atomic::Ordering::SeqCst) <= MAX_PARALLEL,
+            "no later window starts after expiry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Owned HOME remains pinned until the gated native readers settle"
+    )]
+    async fn executor_unknown_worker_drains_admitted_siblings_and_stops_later_windows() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::time::Duration;
+
+        struct GatedReader {
+            inner: Arc<dyn Tool>,
+            started: Arc<AtomicUsize>,
+            sibling_finished: Arc<AtomicBool>,
+            sibling_entered: Arc<tokio::sync::Notify>,
+            unknown_release: Mutex<mpsc::Receiver<()>>,
+            sibling_release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Tool for GatedReader {
+            fn name(&self) -> &str {
+                "gated_reader"
+            }
+            fn description(&self) -> &str {
+                "owned channel-gated reader"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{"index":{"type":"integer"},"path":{"type":"string"}},"required":["path"]})
+            }
+            fn prepare_call(
+                &self,
+                args: &serde_json::Value,
+                ctx: &crate::core::exec_ctx::ExecutionContext,
+            ) -> Result<tools::PreparedToolCall> {
+                self.inner.prepare_call(args, ctx)
+            }
+            fn execute_prepared(
+                &self,
+                prepared: &tools::PreparedToolCall,
+            ) -> Result<ToolObservation> {
+                self.inner.execute_prepared(prepared)?;
+                self.execute(&prepared.args).map(ToolObservation::text)
+            }
+            fn execute(&self, args: &serde_json::Value) -> Result<String> {
+                let index = args["index"].as_u64().unwrap();
+                self.started.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    self.unknown_release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(15))?;
+                    return Err(
+                        tools::ToolEffectsUnsettled(tools::ToolEffectState::UnknownWorker).into(),
+                    );
+                }
+                if index == 1 {
+                    self.sibling_entered.notify_one();
+                    self.sibling_release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(15))?;
+                    self.sibling_finished.store(true, Ordering::SeqCst);
+                }
+                Ok(format!("body-{index}"))
+            }
+        }
+        struct ReleaseOnDrop(mpsc::Sender<()>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_fixture, mut config) = placement_executor_fixture();
+        let home = config
+            .exec_ctx
+            .placement()
+            .unwrap()
+            .home_root()
+            .to_path_buf();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        let root = config.effective_root();
+        std::fs::write(root.join("owned.txt"), "read-only fixture").unwrap();
+        config.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+        config.exec_ctx = config.exec_ctx.with_deadline(config.deadline);
+        let started = Arc::new(AtomicUsize::new(0));
+        let sibling_finished = Arc::new(AtomicBool::new(false));
+        let sibling_entered = Arc::new(tokio::sync::Notify::new());
+        let (unknown_release, unknown_rx) = mpsc::channel();
+        let (sibling_release, sibling_rx) = mpsc::channel();
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(GatedReader {
+            inner: builtin::file_registry_for_test(&root)
+                .get_arc("file_read")
+                .unwrap(),
+            started: started.clone(),
+            sibling_finished: sibling_finished.clone(),
+            sibling_entered: sibling_entered.clone(),
+            unknown_release: Mutex::new(unknown_rx),
+            sibling_release: Mutex::new(sibling_rx),
+        }));
+        let calls: Vec<_> = (0..MAX_PARALLEL + 2)
+            .map(|index| {
+                call(
+                    &format!("id-{index}"),
+                    "gated_reader",
+                    &serde_json::json!({"index":index,"path":"owned.txt"}).to_string(),
+                )
+            })
+            .collect();
+        let planned = plan_execution_calls(&registry, &calls, &config);
+        let mut sink: Vec<_> = calls
+            .iter()
+            .map(|call| Message::tool_result(&call.id, INTERRUPTED_TOOL_PLACEHOLDER))
+            .collect();
+        let mut checkpointed = false;
+        let mut writer_lease = None;
+        let mut baseline = None;
+        let mut execution = Box::pin(execute_execution_calls(
+            &registry,
+            &calls,
+            &planned,
+            true,
+            &config,
+            &mut sink,
+            Vec::new(),
+            &mut checkpointed,
+            &mut writer_lease,
+            &mut baseline,
+            &[],
+        ));
+        // Release detached blocking bodies even if a driver assertion fails.
+        let unknown_release = ReleaseOnDrop(unknown_release);
+        let sibling_release = ReleaseOnDrop(sibling_release);
+        let controller = async {
+            tokio::time::timeout(Duration::from_secs(5), sibling_entered.notified())
+                .await
+                .expect("the first window must admit its gated sibling");
+            unknown_release.0.send(()).unwrap();
+            assert!(!sibling_finished.load(Ordering::SeqCst));
+            assert!(started.load(Ordering::SeqCst) <= MAX_PARALLEL);
+            sibling_release.0.send(()).unwrap();
+        };
+        let (executions, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(execution.as_mut(), controller)
+        })
+        .await
+        .expect("uncertainty must drain admitted siblings and refuse later windows");
+        drop(execution);
+
+        assert!(
+            unstarted_tool_error(&config).is_none(),
+            "no deadline or cancellation explains the skipped window"
+        );
+        assert_eq!(started.load(Ordering::SeqCst), MAX_PARALLEL);
+        assert!(sibling_finished.load(Ordering::SeqCst));
+        assert_eq!(executions.len(), calls.len());
+        assert!(executions[0].failure.is_some());
+        assert_eq!(
+            executions[0].effect_state,
+            tools::ToolEffectState::UnknownWorker
+        );
+        for (index, execution) in executions.iter().enumerate().take(MAX_PARALLEL).skip(1) {
+            assert_eq!(execution.text, format!("body-{index}"));
+            assert!(execution.failure.is_none(), "{execution:?}");
+            assert_eq!(execution.effect_state, tools::ToolEffectState::Settled);
+        }
+        for execution in &executions[MAX_PARALLEL..] {
+            assert!(execution.failure.is_some());
+            assert_eq!(execution.text, UNSETTLED_TOOL_SKIP);
+        }
+        for ((call, execution), message) in calls.iter().zip(&executions).zip(&sink) {
+            assert_eq!(execution.call_id, call.id);
+            assert_eq!(message.tool_call_id.as_deref(), Some(call.id.as_str()));
+            assert_eq!(message.content.as_deref(), Some(execution.text.as_str()));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7755,27 +14117,36 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME stable through the awaited delete's writer lease so a successful edit really arms self-review"
+    )]
     async fn self_review_fires_once_after_edits_then_allows_done() {
         // enable_self_review + an edit → the first "done" is intercepted by ONE review turn
         // (nudge mode — no oracle), the second "done" is accepted.
-        let r = registry();
-        let c = AgentConfig {
-            enable_self_review: true,
-            approval_mode: crate::core::approval::ApprovalMode::Yolo,
-            ..cfg()
-        };
-        let mut messages = vec![Message::system("sys"), Message::user("edit something")];
-        let chat = scripted(vec![
-            tool_turn("delete", "{}"), // a successful destructive op arms made_any_edits
-            final_turn("first done"),  // intercepted by the self-review nudge
-            final_turn("second done"), // accepted
-        ]);
-        // Home-stability: a lease failure on the delete call would leave made_any_edits false and
-        // the property under test (exactly one review turn) silently unexercised.
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let (fixture, mut c) = placement_executor_fixture();
+        let root = c.effective_root();
+        let home = fixture.path().join("home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        let r = builtin::file_registry_for_test(&root);
+        c.enable_self_review = true;
+        let mut messages = vec![Message::system("sys"), Message::user("edit something")];
+        let chat = scripted(vec![
+            tool_turn(
+                "file_write",
+                r#"{"path":"owned.txt","content":"changed","purpose":"project"}"#,
+            ),
+            final_turn("first done"),
+            final_turn("second done"),
+        ]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("owned.txt")).unwrap(),
+            "changed"
+        );
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(out.final_text.as_deref(), Some("second done"));
         let reviews = messages
@@ -7849,6 +14220,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_tool_effects_survive_context_and_ignore_error_prose() {
+        let error = anyhow::Error::new(task_tool::TaskWorkerStillRunning)
+            .context("completed sibling report");
+        assert_eq!(
+            tool_error_effect_state(&error),
+            tools::ToolEffectState::UnknownWorker
+        );
+        let error =
+            anyhow::Error::new(crate::core::native_journal::PossiblyApplied { record_id: 42 })
+                .context("bounded report");
+        assert_eq!(
+            tool_error_effect_state(&error),
+            tools::ToolEffectState::PossiblyApplied(Some(42))
+        );
+        let error = anyhow::Error::new(native_undo::NativeUndoFailure {
+            report: "retained earlier reversals".into(),
+            possibly_applied_record: Some(9),
+        });
+        assert_eq!(
+            tool_error_effect_state(&error),
+            tools::ToolEffectState::PossiblyApplied(Some(9))
+        );
+        let error = anyhow::anyhow!("unknown-worker possibly applied still running");
+        assert_eq!(
+            tool_error_effect_state(&error),
+            tools::ToolEffectState::Settled,
+            "untrusted prose cannot set physical authority state"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_safe_watcher_keeps_typed_uncertainty_during_normal_and_cancelled_adoption() {
+        for cancelled in [false, true] {
+            let registry = registry();
+            let mut config = cfg();
+            let calls = vec![call("eager", "echo", r#"{"text":"must-not-rerun"}"#)];
+            let planned = prepare_execution_calls(&registry, &calls, &config);
+            let (entered_send, entered) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let started = tools::StartedSafeCall::start(
+                calls[0].id.clone(),
+                planned[0].as_ref().unwrap().clone(),
+                config.cancel.clone(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+                None,
+                move || {
+                    entered_send.send(()).unwrap();
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(15))
+                        .unwrap();
+                    tools::ToolOutcome {
+                        observation: ToolObservation::text("actual body finished"),
+                        failure: None,
+                        effect_state: tools::ToolEffectState::Settled,
+                    }
+                },
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(15), entered)
+                .await
+                .unwrap()
+                .unwrap();
+            started.abort();
+            if cancelled {
+                config.deadline = Some(std::time::Instant::now());
+            }
+            let mut sink = vec![Message::tool_result("eager", INTERRUPTED_TOOL_PLACEHOLDER)];
+            let executions = execute_execution_calls(
+                &registry,
+                &calls,
+                &planned,
+                false,
+                &config,
+                &mut sink,
+                vec![(0, started)],
+                &mut false,
+                &mut None,
+                &mut None,
+                &[],
+            )
+            .await;
+            release.send(()).unwrap();
+            assert_eq!(executions.len(), 1);
+            assert_eq!(
+                executions[0].effect_state,
+                tools::ToolEffectState::UnknownWorker,
+                "abandoned watcher cannot prove worker settlement: cancelled={cancelled}"
+            );
+            assert!(sink[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("actual worker effects are unknown"));
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn execute_calls_adopts_eager_handles_by_position() {
         let r = registry();
@@ -7858,7 +14325,18 @@ mod tests {
         ];
         // Position 0 was eagerly started (with a distinguishable payload) — adoption must use it,
         // never re-run the tool.
-        let h = tokio::task::spawn_blocking(|| "EAGER_RESULT".to_string());
+        let h = tools::StartedSafeCall::start(
+            calls[0].id.clone(),
+            tools::PreparedToolCall::new(serde_json::json!({"text": "fresh"})),
+            crate::core::cancel::TurnCancel::new(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            None,
+            || tools::ToolOutcome {
+                observation: ToolObservation::text("EAGER_RESULT"),
+                failure: None,
+                effect_state: tools::ToolEffectState::Settled,
+            },
+        );
         let mut sink: Vec<Message> = calls
             .iter()
             .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
@@ -7885,6 +14363,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eager_completed_before_deadline_is_adopted_after_deadline() {
+        let registry = registry();
+        let calls = vec![call("eager-id", "echo", r#"{"text":"must-not-rerun"}"#)];
+        let started = tools::StartedSafeCall::start(
+            calls[0].id.clone(),
+            tools::PreparedToolCall::new(serde_json::json!({"text": "frozen"})),
+            crate::core::cancel::TurnCancel::new(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            None,
+            || tools::ToolOutcome {
+                observation: ToolObservation::text("ON_TIME"),
+                failure: None,
+                effect_state: tools::ToolEffectState::Settled,
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let config = AgentConfig {
+            deadline: Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+            ..cfg()
+        };
+        let mut sink = vec![Message::tool_result(
+            calls[0].id.clone(),
+            INTERRUPTED_TOOL_PLACEHOLDER.to_string(),
+        )];
+        let results = execute_calls(
+            &registry,
+            &calls,
+            &config,
+            &mut sink,
+            vec![(0, started)],
+            &mut false,
+            &mut None,
+        )
+        .await;
+        assert_eq!(
+            results,
+            vec![("eager-id".to_string(), "ON_TIME".to_string())]
+        );
+        assert_eq!(sink[0].content.as_deref(), Some("ON_TIME"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn eager_starter_skips_empty_args_without_setting_barrier() {
         let r = registry();
         let c = cfg();
@@ -7900,7 +14420,7 @@ mod tests {
         // the rest of the response.)
         let h = starter(1, &call("2", "echo", r#"{"text":"b"}"#));
         assert!(h.is_some(), "a later valid call still starts eagerly");
-        assert_eq!(h.unwrap().await.unwrap(), "b");
+        assert_eq!(h.unwrap().await.unwrap().text, "b");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7937,7 +14457,7 @@ mod tests {
         // `text`; a single undeclared string key makes `message` an unambiguous alias.
         let h = starter(0, &call("1", "echo", r#"{"message":"hello"}"#))
             .expect("repairable read-only call should start eagerly");
-        assert_eq!(h.await.unwrap(), "hello");
+        assert_eq!(h.await.unwrap().text, "hello");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8013,7 +14533,11 @@ mod tests {
         // Safe call → started early.
         let h = starter(0, &call("1", "echo", r#"{"text":"a"}"#));
         assert!(h.is_some(), "read-only call starts eagerly");
-        assert_eq!(h.unwrap().await.unwrap(), "a", "the eager body really ran");
+        assert_eq!(
+            h.unwrap().await.unwrap().text,
+            "a",
+            "the eager body really ran"
+        );
         // Destructive call → None AND trips the barrier…
         assert!(
             starter(1, &call("2", "delete", "{}")).is_none(),
@@ -8167,6 +14691,8 @@ mod tests {
             ],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         };
         let out = run_agent(
@@ -8274,6 +14800,53 @@ mod tests {
         assert_eq!(out.final_text.as_deref(), Some("done"));
     }
 
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep process-global AIZEN_HOME stable through the awaited delete's writer lease so the no-manifest verification gate is actually exercised"
+    )]
+    async fn verify_gate_with_nothing_to_run_demands_a_manual_check_once() {
+        // Gate ON, an edit lands, but the tree carries no manifest the gate recognises. The old
+        // shape fell through to Done in silence; now the first "done" is intercepted by ONE demand
+        // to run the project's own check, and the second "done" is accepted — the demand fires
+        // once per run and never loops.
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (fixture, mut c) = placement_executor_fixture();
+        let dir = c.effective_root();
+        let home = fixture.path().join("home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        let r = builtin::file_registry_for_test(&dir);
+        c.enable_verify_gate = true;
+        let mut messages = vec![Message::system("sys"), Message::user("edit something")];
+        let chat = scripted(vec![
+            tool_turn(
+                "file_write",
+                r#"{"path":"owned.txt","content":"changed","purpose":"project"}"#,
+            ),
+            final_turn("first done"),
+            final_turn("second done"),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("owned.txt")).unwrap(),
+            "changed"
+        );
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("second done"));
+        let demands = messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|t| t.contains("[verify] No build or test command"))
+            })
+            .count();
+        assert_eq!(demands, 1, "exactly one absence demand");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── GOAL MODE (`/goal <text>`): the real loop paths ─────────────────────────
     // These drive `run_agent_loop` with `cfg.goal = Some(..)` through scripted turns to exercise the
     // ACTUAL goal gate + smart-retry code (not a re-implementation): premature-stop re-poke, the
@@ -8289,6 +14862,8 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -8318,6 +14893,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize the process-global goal claim through the awaited completion handshake and cleanup; the tool and loop use a separate PENDING mutex"
+    )]
     async fn goal_gate_pokes_premature_stop_then_done_after_complete() {
         let _g = crate::agent::goal::TEST_LOCK
             .lock()
@@ -8361,6 +14940,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize the process-global goal claim across awaited empty-response retries, completion, and cleanup; PENDING has a separate mutex"
+    )]
     async fn goal_mode_retries_empty_200_instead_of_treating_it_as_done() {
         let _g = crate::agent::goal::TEST_LOCK
             .lock()
@@ -8463,6 +15046,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_mode_empty_200_error_carries_wire_note_and_raw_body_once() {
+        // THE FLOOD this pins, and the evidence that replaces it. The screenshot case: a quiet
+        // workflow child billed `completion` tokens with text in no parsed key, and the transcript
+        // filled with unnumbered `empty response — finish_reason=<absent>, …` lines — one per
+        // retry per child, printed by the CLIENT with no quiet gate. Now the client never prints;
+        // the loop prints ONE numbered line per retry carrying the wire note, and the bounded raw
+        // body is captured per empty-200 (a fixture with `empty_wire_raw: Some(..)` models what
+        // the client captures) and surfaced exactly ONCE — attached to the exhausted-budget error,
+        // where it settles "parser missed a key" vs "provider sent nothing" from the trace alone.
+        let r = registry();
+        let c = AgentConfig {
+            quiet: true,
+            max_transient_retries: 1,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let mut wired = empty_turn();
+        wired.empty_wire_note = Some(
+            "finish_reason=<absent>, choice keys [index], usage prompt=99 completion=42".into(),
+        );
+        wired.empty_wire_raw = Some(
+            r#"{"choices":[{"index":0,"message":{"content":[]}}],"usage":{"completion_tokens":42}}"#
+                .into(),
+        );
+        // The wired turn is LAST: the exhausted-budget error reports the diagnostics of the
+        // attempt the budget dies on (each attempt captures fresh), so the first call returns the
+        // plain empty turn, the retry line carries nothing, and the second call — the one that
+        // spends the budget — is the one carrying the note + raw.
+        let chat = scripted(vec![empty_turn(), wired]);
+        let err = run_agent_loop(chat, &c, &r, &mut messages)
+            .await
+            .expect_err("a persistently silent provider must be an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("finish_reason=<absent>"),
+            "the exhausted-budget error must carry the wire note, got: {msg}"
+        );
+        assert_eq!(
+            msg.matches("raw body:").count(),
+            1,
+            "the raw body is printed exactly once — on the error, never per retry — got: {msg}"
+        );
+        assert!(
+            msg.contains("\"choices\""),
+            "the raw capture must show what the gateway actually sent, got: {msg}"
+        );
+        assert_eq!(
+            messages.len(),
+            2,
+            "the re-prompt is still rolled back on the error path, got: {messages:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_200_retry_reprompts_instead_of_resending_the_same_request() {
         // Re-sending the byte-identical request is what produced the observed run of many empty
         // responses: a provider that answered a request with silence usually answers the same
@@ -8502,6 +15139,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize the process-global goal claim across awaited transient retries, completion, and cleanup; PENDING has a separate mutex"
+    )]
     async fn goal_mode_retries_transient_chat_error_then_succeeds() {
         let _g = crate::agent::goal::TEST_LOCK
             .lock()
@@ -8536,6 +15177,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep the process-global goal claim isolated across awaited permanent-error retries and cleanup; PENDING has a separate mutex"
+    )]
     async fn goal_mode_gives_up_after_bounded_permanent_retries() {
         let _g = crate::agent::goal::TEST_LOCK
             .lock()
@@ -8768,6 +15413,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep the process-global goal claim isolated through the awaited cancellation path and cleanup; PENDING has a separate mutex"
+    )]
     async fn goal_mode_esc_during_retry_returns_cancelled() {
         let _g = crate::agent::goal::TEST_LOCK
             .lock()
@@ -8858,27 +15507,42 @@ mod tests {
 
     #[test]
     fn run_tool_body_gives_relevance_truncatable_tools_the_larger_fetch_budget() {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _hooks_disabled =
+            crate::core::config::EnvGuard::set([("AIZEN_NO_HOOKS", std::ffi::OsStr::new("1"))]);
         // W22: a read/fetch tool's output must be measured against `max_fetch_chars`, NOT the
         // smaller `max_chars` — otherwise the reach layer's 20k fetch gets halved to 4k before
         // relevance-truncation ever sees the full document (the double-cut the plan calls out).
-        let long_tool = std::sync::Arc::new(LongReadTool) as std::sync::Arc<dyn Tool>;
         let small_budget = 200usize;
         let large_budget = 6000usize;
-        let out = run_tool_body(
-            long_tool,
-            &serde_json::json!({}),
-            true,
-            small_budget,
-            large_budget,
-        );
+        let budgets = ResultBudgets {
+            default: small_budget,
+            fetch: large_budget,
+            log: small_budget,
+            delegate: small_budget,
+            spill_over: 0,
+        };
+        let fetch_tool = std::sync::Arc::new(LongFetchTool) as std::sync::Arc<dyn Tool>;
+        let out = run_tool_body(fetch_tool, &serde_json::json!({}), true, budgets, None).text;
         assert!(
             out.chars().count() > small_budget,
-            "file_read output should use the larger fetch budget, not the small default: got {} chars",
+            "web_fetch output should use the larger fetch budget, not the small default: got {} chars",
             out.chars().count()
         );
         assert!(
             out.chars().count() <= large_budget + 200,
             "still bounded by the larger budget"
+        );
+        // `file_read` budgets ITSELF (contiguous, marked) — the loop must not cut it again. Its
+        // 12 k-char output sits under the 4× safety net and comes back verbatim.
+        let read_tool = std::sync::Arc::new(LongReadTool) as std::sync::Arc<dyn Tool>;
+        let verbatim = LongReadTool.execute(&serde_json::json!({})).unwrap();
+        let out = run_tool_body(read_tool, &serde_json::json!({}), true, budgets, None).text;
+        assert_eq!(
+            out, verbatim,
+            "the loop must not re-cut a self-budgeted read"
         );
 
         // A non-truncatable tool (positional output) stays at the SMALL budget regardless.
@@ -8900,13 +15564,23 @@ mod tests {
             relevance_query_from_args(&serde_json::json!({"other": 1})),
             ""
         );
+        // A file path is where the file lives, not what the model wants from it.
+        assert_eq!(
+            relevance_query_from_args(&serde_json::json!({"path": "src/agent/builtin.rs"})),
+            ""
+        );
     }
 
     #[test]
-    fn is_relevance_truncatable_matches_read_fetch_only() {
-        assert!(is_relevance_truncatable("file_read"));
+    fn is_relevance_truncatable_matches_fetch_and_search_only() {
         assert!(is_relevance_truncatable("web_fetch"));
         assert!(is_relevance_truncatable("search_files"));
+        assert!(
+            !is_relevance_truncatable("file_read"),
+            "file_read cuts itself — a second, keyword-scored cut splices the file"
+        );
+        assert!(is_self_budgeted("file_read"));
+        assert!(!is_self_budgeted("search_files"));
         assert!(
             !is_relevance_truncatable("file_edit"),
             "edit output is positional"
@@ -8914,6 +15588,106 @@ mod tests {
         assert!(
             !is_relevance_truncatable("shell_run"),
             "shell log is positional"
+        );
+    }
+
+    #[test]
+    fn truncate_log_keeps_the_first_error_and_the_tail() {
+        // A build log: a banner, 200 warning lines, the first real error deep in the middle, more
+        // noise, then the verdict at the end.
+        let mut lines: Vec<String> = vec!["exit 101".into(), "   Compiling aizen v0.6.7".into()];
+        lines.extend((1..=200).map(|i| format!("warning: unused variable `w{i}` in src/x.rs")));
+        lines.push("error[E0599]: no method named `frob` found for struct `Parser`".into());
+        lines.push("  --> src/parse.rs:42:10".into());
+        lines.extend((1..=200).map(|i| format!("warning: more noise {i}")));
+        lines.push(
+            "error: could not compile `aizen` (bin \"aizen\") due to 1 previous error".into(),
+        );
+        let log = lines.join("\n");
+        let out = truncate_log(&log, 3_000);
+        assert!(
+            out.starts_with("exit 101\n   Compiling"),
+            "head kept: {out}"
+        );
+        assert!(
+            out.contains("error[E0599]"),
+            "the first error survives the cut: {out}"
+        );
+        assert!(out.contains("src/parse.rs:42:10"), "with its location line");
+        assert!(
+            out.trim_end().ends_with("due to 1 previous error"),
+            "the verdict at the end survives: {out}"
+        );
+        assert!(out.chars().count() <= 3_000, "{}", out.chars().count());
+        // No error line at all: tail-weighted head+tail.
+        let plain: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+        let out = truncate_log(&plain, 1_000);
+        assert!(out.starts_with("line 1\n"));
+        assert!(out.trim_end().ends_with("line 400"));
+        let head_part = out.split("…[").next().unwrap().chars().count();
+        assert!(head_part < 400, "head is the smaller share: {head_part}");
+    }
+
+    #[test]
+    fn truncate_sections_admits_whole_sections_and_names_the_rest() {
+        let report = format!(
+            "VERDICT: FAIL — 2 blocking findings\n\n## Findings\n{}\n## Coverage gaps\n{}\n## Commands run\n- cargo test\n",
+            (1..=9).map(|i| format!("{i}. [P1] src/a.rs:{i} — finding number {i} with detail")).collect::<Vec<_>>().join("\n"),
+            "x".repeat(900),
+        );
+        let out = truncate_sections(&report, 1_000);
+        assert!(out.starts_with("VERDICT: FAIL"), "preamble first: {out}");
+        assert!(
+            out.contains("finding number 9"),
+            "a section is admitted WHOLE or not at all"
+        );
+        assert!(
+            out.contains("## Commands run\n- cargo test"),
+            "small later sections still fit"
+        );
+        assert!(
+            out.contains("## Coverage gaps (")
+                && out.contains("omitted for the 1000-char delegate budget"),
+            "the dropped section is named, not clipped: {out}"
+        );
+        assert!(
+            !out.contains("xxxxxxxx"),
+            "no fragment of the dropped section leaks"
+        );
+        // No headers: fall back to head+tail at this budget.
+        let flat = "y".repeat(2_000);
+        assert!(truncate_sections(&flat, 500).contains("chars truncated"));
+        // Under budget: untouched.
+        assert_eq!(truncate_sections("## A\nshort\n", 500), "## A\nshort\n");
+    }
+
+    #[test]
+    fn truncate_relevant_keeps_the_trailing_hint() {
+        // 80 filler lines, the match deep in the middle, and the tool's cap hint on the last line.
+        let mut lines: Vec<String> = (1..=80)
+            .map(|i| format!("line {i} filler text here"))
+            .collect();
+        lines[40] = "fn retry_policy() { /* the needle */ }".to_string();
+        lines.push("…[capped at 200 matches — narrow the pattern]".to_string());
+        let text = lines.join("\n");
+        let out = truncate_relevant(&text, 700, &["retry_policy".to_string()]);
+        assert!(
+            out.contains("the needle"),
+            "keeps the matching region: {out}"
+        );
+        assert!(
+            out.trim_end()
+                .ends_with("…[capped at 200 matches — narrow the pattern]"),
+            "the tool's own cap hint must survive the cut: {out}"
+        );
+        assert!(
+            out.starts_with("line 1 filler"),
+            "head kept for orientation"
+        );
+        assert!(
+            out.chars().count() <= 700 + 64,
+            "stays near budget: {}",
+            out.chars().count()
         );
     }
 
@@ -9263,6 +16037,28 @@ mod tests {
             over.contains("0 remaining") && over.contains("0% left"),
             "saturating: {over}"
         );
+        for est in [0, 1, usize::MAX] {
+            let disabled = budget_nudge_text(est, 0);
+            assert!(
+                disabled.contains("0 remaining") && disabled.contains("0% left"),
+                "zero window: {disabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn basename_accepts_both_separators_and_empty_paths() {
+        for (path, expected) in [
+            ("", ""),
+            ("file.rs", "file.rs"),
+            ("src/file.rs", "file.rs"),
+            (r"src\file.rs", "file.rs"),
+            (r"src\nested/file.rs", "file.rs"),
+            ("src/", ""),
+            ("src/tiếng Việt.rs", "tiếng Việt.rs"),
+        ] {
+            assert_eq!(basename(path), expected);
+        }
     }
 
     #[tokio::test]
@@ -9273,7 +16069,6 @@ mod tests {
         let r = registry();
         let mut c = cfg();
         c.context_window = 1000; // tiny window so a couple of turns cross 50%/90%
-        c.clear_at_pct = 0; // disable clearing so history only grows (isolate the budget signal)
         let big = "X".repeat(3000); // ~750 tok result → crosses bands fast
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         let chat = scripted(vec![
@@ -9294,64 +16089,6 @@ mod tests {
         assert_eq!(
             budget_msgs, 1,
             "the running budget nudge collapses to a single message"
-        );
-    }
-
-    #[tokio::test]
-    async fn save_before_clear_warns_first_then_evicts_next_turn() {
-        // P-ctx2: the FIRST time clearing is due, the loop must WARN (so the model can persist) and
-        // NOT evict yet — the old result bodies are still in context that turn. The eviction happens
-        // on a LATER turn. Assert both: the warning appears, and at least one bulky result gets
-        // blanked to the placeholder by the end (proving the deferral didn't disable clearing).
-        let r = registry();
-        let mut c = cfg();
-        c.max_iters = 10;
-        c.auto_extend_to = 10;
-        c.context_window = 1200; // tiny window
-        c.clear_at_pct = 40; // arm early
-        c.clear_target_pct = 20;
-        c.clear_step_pct = 1; // cadence trivially satisfied so the deferred pass re-fires next turn
-        c.clear_cooldown_iters = 0;
-        c.keep_recent_tool_results = 1; // keep only the newest → older bulky ones are clearable
-        c.clear_tool_result_min_chars = 100;
-        let big = "Y".repeat(2400); // ~600 tok each → a couple crosses the 40% arm
-        let turns: Vec<ChatTurn> = (0..6)
-            .map(|_| tool_turn("echo", &format!(r#"{{"text":"{big}"}}"#)))
-            .collect();
-        let mut messages = vec![Message::system("sys"), Message::user("task")];
-        let _ = run_agent_loop(scripted(turns), &c, &r, &mut messages)
-            .await
-            .unwrap();
-        let warned = messages.iter().any(|m| {
-            m.role == "system"
-                && m.content
-                    .as_deref()
-                    .is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR))
-        });
-        assert!(
-            warned,
-            "the save-before-clear warning must be injected before eviction"
-        );
-        let evicted = messages
-            .iter()
-            .any(|m| m.role == "tool" && m.content.as_deref() == Some(CLEARED_TOOL_PLACEHOLDER));
-        assert!(
-            evicted,
-            "clearing must still happen (a later turn) — the warning only defers, not disables"
-        );
-        // And the warning is one-shot: exactly one such system message.
-        let warn_count = messages
-            .iter()
-            .filter(|m| {
-                m.role == "system"
-                    && m.content
-                        .as_deref()
-                        .is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR))
-            })
-            .count();
-        assert_eq!(
-            warn_count, 1,
-            "the save-before-clear warning fires at most once per run"
         );
     }
 
@@ -9387,6 +16124,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize the process-global todo fixture across both awaited reminder runs and reset; the loop uses the separate TODOS mutex"
+    )]
     async fn todo_recitation_fires_replaces_and_respects_cadence() {
         let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         todo::set(vec![
@@ -9446,6 +16187,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep the process-global todo fixture pending throughout awaited done-gate reads and cleanup; the loop uses the separate TODOS mutex"
+    )]
     async fn todo_poke_blocks_done_with_pending() {
         let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         todo::set(vec![
@@ -9497,14 +16242,19 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Hold HOME then todo fixture locks through awaited writer acquisition and merged gate reads; workers use separate runtime locks"
+    )]
     async fn done_gates_merge_into_one_round_trip() {
         // self-review (nudge mode) + incomplete todos both fire on the SAME "done" claim: the old
         // cascade spent one LLM round-trip PER gate; the merged flush carries both demands in ONE
         // combined user message, with each gate's budget/latch consumed exactly as before.
-        let _t = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Home before todo: the order every other test in the suite uses (home, tape, todo).
         let _h = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _t = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         todo::set(vec![todo::Todo::new("open-item", todo::Status::Pending)]);
         let r = registry();
         let c = AgentConfig {
@@ -9572,7 +16322,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Pin the fixture HOME so another test's hook configuration cannot decide this read"
+    )]
     async fn identical_re_read_short_circuits_only_while_unchanged() {
+        // Hook configuration is read from the process-global AIZEN_HOME at call time. Pin an empty
+        // owned home for the whole run: a hook test that installs a deny hook in ITS fixture home
+        // must not block this file_read while both tests run in parallel.
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let home_fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = home_fixture.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
         let dir = std::env::temp_dir().join(format!("aizen-reread-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -9584,6 +16348,12 @@ mod tests {
         let c = AgentConfig {
             max_iters: 10,
             auto_extend_to: 10,
+            // Pin the lane root to the fixture directory. `StubFileRead` declares no workspace
+            // footprint, so the dispatch treats it as opaque and takes a workspace writer lease on
+            // the lane root — which, left unset, is the process cwd (this repo). Other tests in a
+            // parallel run take that same repo lease, and the 15s wait would surface here as a
+            // spurious "acquiring workspace writer" instead of a real read.
+            workspace_root: Some(dir.clone()),
             ..cfg()
         };
         let mut messages = vec![Message::system("sys"), Message::user("read it")];
@@ -9676,6 +16446,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize the process-global steering fixture from arm through awaited drain and disarm; the loop uses the separate MAILBOX mutex"
+    )]
     async fn steer_is_folded_into_the_running_turn_at_the_next_iteration() {
         let _g = steer_guard();
         let r = registry();
@@ -9730,6 +16504,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize the process-global steering fixture through the awaited late-push/done-gate race and disarm; MAILBOX has a separate mutex"
+    )]
     async fn steer_arriving_at_the_final_answer_blocks_done_and_grants_another_turn() {
         let _g = steer_guard();
         let r = registry();
@@ -9781,6 +16559,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Preserve the process-global parent steering fixture through the awaited child run, pending assertion, and disarm; MAILBOX has a separate mutex"
+    )]
     async fn steering_is_ignored_when_disabled_so_a_steer_cannot_leak_into_a_subagent() {
         let _g = steer_guard();
         let r = registry();
@@ -9817,6 +16599,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep the process-global todo fixture complete throughout awaited done-gate reads and cleanup; the loop uses the separate TODOS mutex"
+    )]
     async fn todo_poke_allows_done_when_all_done() {
         let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         todo::set(vec![todo::Todo::new("only", todo::Status::Done)]);
@@ -9848,6 +16634,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize pending and empty process-global todo fixtures across both awaited done-gate runs; the loop uses the separate TODOS mutex"
+    )]
     async fn todo_poke_disabled_or_empty_list() {
         let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Pending todos but poke OFF → Done immediately.
@@ -9883,6 +16673,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize the process-global todo confidence sequence through awaited TodoWrite workers, gate reads, and cleanup; TODOS has a separate mutex"
+    )]
     async fn confidence_spike_arms_one_shot_gate() {
         let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         todo::clear();
@@ -9926,6 +16720,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize both process-global todo confidence sequences through awaited TodoWrite workers, resets, and cleanup; TODOS has a separate mutex"
+    )]
     async fn confidence_stepwise_or_omitted_no_gate() {
         let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         todo::clear();
@@ -10134,9 +16932,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Serialize the process-global clarification fixture across awaited pause and resume, pending assertions, and cleanup; PENDING has a separate mutex"
+    )]
     async fn clarify_yields_awaiting_input_with_valid_history() {
-        // The load-bearing wiring: a `clarify` call PAUSES the loop — it returns AwaitingInput
-        // carrying the question, having left a valid (resumable) history ending in the tool result.
+        // A `clarify` call pauses with valid history; the picker's ordinary user message then
+        // resumes that history to completion without re-asking or contacting a live provider.
         let _g = crate::agent::clarify::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -10144,27 +16946,32 @@ mod tests {
         let mut r = ToolRegistry::new();
         r.register(Box::new(crate::agent::clarify::Clarify));
         let mut messages = vec![Message::system("sys"), Message::user("ambiguous task")];
-        let out = run_agent_loop(
-            scripted(vec![
-                tool_turn("clarify", r#"{"question":"A or B?","options":["A","B"]}"#),
-                final_turn("unreached"), // the loop yields before ever reaching this
-            ]),
-            &cfg(),
-            &r,
-            &mut messages,
-        )
-        .await
-        .unwrap();
-        match out.stop {
-            StopReason::AwaitingInput(q) => {
-                assert!(q.starts_with("A or B?"), "carries the question: {q}");
+        let chat = scripted(vec![
+            tool_turn("clarify", r#"{"question":"A or B?","options":["A","B"]}"#),
+            final_turn("Completed using B."), // consumed only after the user's answer
+        ]);
+        let out = run_agent_loop(&chat, &cfg(), &r, &mut messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.iters, 1,
+            "clarify yields before the scripted final turn"
+        );
+        let ask = match out.stop {
+            StopReason::AwaitingInput(ask) => {
+                let display = ask.display();
                 assert!(
-                    q.contains("1. A") && q.contains("2. B"),
-                    "carries the options: {q}"
+                    display.starts_with("A or B?"),
+                    "carries the question: {display}"
                 );
+                assert!(
+                    display.contains("1. A") && display.contains("2. B"),
+                    "carries the options: {display}"
+                );
+                ask
             }
             other => panic!("expected AwaitingInput, got {other:?}"),
-        }
+        };
         // Resumable: last message is the clarify tool result (the user's next turn continues from
         // here), and the loop drained the pending cell.
         assert_eq!(
@@ -10176,6 +16983,49 @@ mod tests {
             crate::agent::clarify::take_pending().is_none(),
             "loop drained the pending cell"
         );
+        assert_valid_history(&messages);
+
+        let answer = ask.format_answers(&[vec!["B".into()]]);
+        assert_eq!(answer, "B");
+        messages.push(Message::user(answer));
+        let resumed = run_agent_loop(
+            |history: Vec<Message>, defs| {
+                assert_valid_history(&history);
+                let answer = history.last().unwrap();
+                assert_eq!(answer.role, "user");
+                assert_eq!(answer.content.as_deref(), Some("B"));
+                assert_eq!(history[history.len() - 2].role, "tool");
+                assert_eq!(
+                    history[history.len() - 2].tool_call_id.as_deref(),
+                    Some("call_clarify")
+                );
+                chat(history, defs)
+            },
+            &cfg(),
+            &r,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resumed.stop,
+            StopReason::Done,
+            "answer must not re-open clarify"
+        );
+        assert_eq!(resumed.iters, 1);
+        assert_eq!(resumed.final_text.as_deref(), Some("Completed using B."));
+        assert_eq!(messages.last().unwrap().role, "assistant");
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| &message.tool_calls)
+                .filter(|call| call.function.name == "clarify")
+                .count(),
+            1,
+            "no repeated clarify call after the selected answer"
+        );
+        assert!(crate::agent::clarify::take_pending().is_none());
+        assert_valid_history(&messages);
     }
 
     #[test]
@@ -10361,3 +17211,129 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/tool_surface.rs"]
 mod tool_surface_tests;
+
+#[cfg(test)]
+mod effort_and_nudge_tests {
+    use super::*;
+
+    #[test]
+    fn apply_effort_scales_the_harness_budgets_and_never_disables_a_user_review() {
+        let mut low = AgentConfig::default();
+        low.apply_effort("low");
+        let mut max = AgentConfig::default();
+        max.apply_effort("max");
+        assert!(low.max_iters < AgentConfig::default().max_iters);
+        assert!(max.max_iters > AgentConfig::default().max_iters);
+        assert!(low.max_continuations < max.max_continuations);
+        assert!(low.max_verify_attempts < max.max_verify_attempts);
+        assert!(low.max_log_result_chars < max.max_log_result_chars);
+        assert!(!low.enable_self_review && max.enable_self_review);
+        // A user who enabled self-review keeps it on a low turn.
+        let mut reviewed = AgentConfig {
+            enable_self_review: true,
+            ..AgentConfig::default()
+        };
+        reviewed.apply_effort("low");
+        assert!(reviewed.enable_self_review);
+        // Unknown tiers change nothing.
+        let mut odd = AgentConfig::default();
+        odd.apply_effort("minimal");
+        assert_eq!(odd.max_iters, AgentConfig::default().max_iters);
+    }
+
+    #[test]
+    fn nudge_role_follows_the_endpoint() {
+        assert_eq!(
+            NudgeRole::for_base_url("https://api.anthropic.com/v1"),
+            NudgeRole::System
+        );
+        assert_eq!(
+            NudgeRole::for_base_url("http://localhost:8080/v1"),
+            NudgeRole::User
+        );
+        assert_eq!(
+            NudgeRole::for_base_url("https://chatgpt.com/backend-api/codex"),
+            NudgeRole::User
+        );
+    }
+
+    #[test]
+    fn plan_nudge_is_retired_before_the_next_user_request() {
+        for role in [NudgeRole::System, NudgeRole::User] {
+            let mut messages = vec![Message::system("sys"), Message::user("old task")];
+            push_nudge_as(
+                &mut messages,
+                role,
+                PLAN_NUDGE_PREFIX,
+                "[plan-nudge] advice",
+            );
+            messages.push(Message::user("new task"));
+            assert_eq!(retire_nudges(&mut messages), 1);
+            assert_eq!(capture_review_request(&messages), "new task");
+        }
+    }
+
+    #[test]
+    fn user_role_nudges_are_tagged_deduplicated_and_retired_at_the_next_run() {
+        let mut msgs = vec![Message::system("sys"), Message::user("task")];
+        push_nudge_as(
+            &mut msgs,
+            NudgeRole::User,
+            NUDGE_DIVERGENCE,
+            "You repeated the same tool call(s). Stop.",
+        );
+        push_nudge_as(
+            &mut msgs,
+            NudgeRole::User,
+            NUDGE_BUDGET,
+            "Context budget: 60%",
+        );
+        push_nudge_as(
+            &mut msgs,
+            NudgeRole::User,
+            NUDGE_DIVERGENCE,
+            "You repeated the same tool call(s). Really stop.",
+        );
+        assert_eq!(
+            msgs.len(),
+            4,
+            "the second divergence nudge replaced the first"
+        );
+        assert!(
+            msgs[3].role == "user"
+                && msgs[3]
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .starts_with(USER_NUDGE_TAG)
+        );
+        assert!(msgs[3].content.as_deref().unwrap().contains("Really stop"));
+        // A real user message that merely resembles a nudge is never touched.
+        msgs.push(Message::user("Context budget: what is it?"));
+        push_nudge_as(
+            &mut msgs,
+            NudgeRole::System,
+            NUDGE_BUDGET,
+            "Context budget: 70%",
+        );
+        assert!(msgs
+            .iter()
+            .any(|m| m.content.as_deref() == Some("Context budget: what is it?")));
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| is_nudge_of_kind(m, NUDGE_BUDGET))
+                .count(),
+            1,
+            "one budget nudge across both roles"
+        );
+        let removed = retire_nudges(&mut msgs);
+        assert_eq!(removed, 2, "divergence + budget");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content.as_deref(), Some("sys"));
+        assert_eq!(msgs[1].content.as_deref(), Some("task"));
+        assert_eq!(
+            msgs[2].content.as_deref(),
+            Some("Context budget: what is it?")
+        );
+    }
+}

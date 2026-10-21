@@ -108,6 +108,10 @@ pub enum CommandOrigin {
     VerifyGate,
     /// A language server child (binary from PATH discovery; input is repository content).
     Lsp,
+    /// The `git_inspect` tool — a read-only git query whose subcommand and flags are Aizen-fixed
+    /// (closed action enum, exec form — no shell), with the model-supplied path/rev arguments
+    /// validated by the tool before they reach argv.
+    GitInspect,
     /// A `` !`cmd` `` expansion inside a user-defined custom command (repository-influenced).
     CustomCommand,
     /// The user's own `!cmd` escape typed at the REPL prompt.
@@ -128,6 +132,10 @@ pub enum CommandOrigin {
     /// A workflow stage's command. Same reservation as [`Self::SubAgent`].
     #[allow(dead_code)]
     Workflow,
+    /// A user lifecycle hook (`hooks` in `~/.aizen/cli-config.json`): the user's own command from
+    /// the user's own file, spawned with the network allowed and the real temp dir, as a typed
+    /// `!cmd` is — the env scrub still applies. Never repository content (see `agent::hooks`).
+    Hook,
     /// An MCP stdio server process (configured command; trust-gated per project elsewhere).
     McpStdio,
     /// An Aizen-internal spawn whose program AND arguments are Aizen-controlled (git plumbing,
@@ -143,12 +151,14 @@ impl CommandOrigin {
             Self::ProcessStart => "process_start",
             Self::VerifyGate => "verify_gate",
             Self::Lsp => "lsp",
+            Self::GitInspect => "git_inspect",
             Self::CustomCommand => "custom_command",
             Self::UserEscape => "user_escape",
             Self::TelegramShell => "telegram_shell",
             Self::Cron => "cron",
             Self::SubAgent => "sub_agent",
             Self::Workflow => "workflow",
+            Self::Hook => "hook",
             Self::McpStdio => "mcp_stdio",
             Self::InternalTrusted(_) => "internal_trusted",
         }
@@ -248,10 +258,12 @@ mod tests {
             CommandOrigin::ProcessStart,
             CommandOrigin::VerifyGate,
             CommandOrigin::Lsp,
+            CommandOrigin::GitInspect,
             CommandOrigin::CustomCommand,
             CommandOrigin::UserEscape,
             CommandOrigin::SubAgent,
             CommandOrigin::Workflow,
+            CommandOrigin::Hook,
             CommandOrigin::McpStdio,
             CommandOrigin::InternalTrusted("test"),
         ] {

@@ -166,8 +166,11 @@ static BLOCKLIST: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             r#"(?i)\bset-content\b[^;|&\n]*\s(\$null|''|"")\s*($|[;|&])"#,
             "shell file-blanking — use the file_write tool to create/overwrite files",
         ),
+        // A single `&` is NOT a segment start here: `cargo build &> build.log` is bash's
+        // redirect-both-streams operator (`&>`), a real write with a producing command, not a
+        // blanking. `&&` still counts (`cmd && > f` truncates `f` with nothing producing).
         (
-            r"(?i)(^|[;|&])\s*:?\s*>\s*[^>\s]",
+            r"(?i)(^|[;|]|&&)\s*:?\s*>\s*[^>\s]",
             "shell file-blanking — use the file_write tool to create/overwrite files",
         ),
     ];
@@ -183,31 +186,35 @@ static BLOCKLIST: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
 static READONLY_PROGS: &[&str] = &[
     "ls", "dir", "pwd", "cd", "echo", "cat", "type", "head", "tail", "wc", "nl", "rg", "grep",
     "egrep", "fgrep", "find", "fd", "tree", "stat", "file", "du", "df", "which", "where",
-    "whereis", "whoami", "hostname", "uname", "date", "env", "printenv", "ps", "top", "uptime",
-    "id", "groups", "less", "more", "diff", "cmp", "sort", "uniq", "basename", "dirname",
-    "realpath", "readlink", "true", "false", "test",
+    "whereis", "whoami", "uname", "date", "printenv", "ps", "top", "uptime", "id", "groups",
+    "less", "more", "diff", "cmp", "sort", "uniq", "basename", "dirname", "realpath", "readlink",
+    "true", "false", "test",
 ];
-// Subcommand-gated programs: read-only ONLY for these subcommands (e.g. `git status`, not `git push`).
-static READONLY_SUBCMDS: &[(&str, &[&str])] = &[
+/// Programs from the list above that turn into writers or executors with ONE flag: `find -delete`
+/// / `-exec`, `fd -x`, `sort -o`, `rg --pre`, `date -s`, `git … --output=<file>`. A segment leading
+/// with one of these is read-only only if NO token starts with a listed prefix — every token is
+/// inspected, so the flag is caught wherever it sits in the line.
+static ARG_GATED: &[(&str, &[&str])] = &[
     (
-        "git",
+        "find",
         &[
-            "status",
-            "diff",
-            "log",
-            "show",
-            "branch",
-            "remote",
-            "rev-parse",
-            "describe",
-            "blame",
-            "ls-files",
-            "shortlog",
-            "tag",
+            "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls",
         ],
     ),
-    ("cargo", &["check", "tree", "metadata", "fmt", "clippy"]),
-    ("npm", &["test", "list", "ls", "outdated", "view", "audit"]),
+    ("fd", &["-x", "-X", "--exec", "--exec-batch"]),
+    ("rg", &["--pre"]),
+    ("sort", &["-o", "--output"]),
+    ("date", &["-s", "--set"]),
+    ("git", &["--output"]),
+];
+/// Read-only ONLY when bare: `env CMD …` runs CMD, `hostname NAME` renames the machine.
+static BARE_ONLY: &[&str] = &["env", "hostname"];
+// Subcommand-gated programs: read-only ONLY for these subcommands. `git` and `cargo` have their
+// own functions below because their read-only subcommands take flags that make them write
+// (`git branch -d`, `cargo fmt` without `--check`). `npm test` runs whatever `package.json` says
+// and `npm audit`/`outdated`/`view` go to the network, so none of them is read-only.
+static READONLY_SUBCMDS: &[(&str, &[&str])] = &[
+    ("npm", &["list", "ls"]),
     (
         "docker",
         &["ps", "images", "version", "info", "inspect", "logs"],
@@ -329,12 +336,218 @@ pub fn classify(command: &str) -> Verdict {
     if RE_REDIRECT.is_match(&norm) {
         return Verdict::Ask;
     }
-    let segments = split_segments(&norm);
+    // Segments are split on the shell's separators INCLUDING newlines: `ls\nrm -rf build` is two
+    // commands to every shell, and collapsing the newline first made it one segment whose program
+    // was `ls` — auto-run under `smart`. A newline inside quotes becomes a separator too, which
+    // only makes the verdict more conservative (Ask), never less.
+    let segmented = collapse_ws(&cmd.replace(['\r', '\n'], " ; "));
+    let segments = split_segments(&segmented);
     if !segments.is_empty() && segments.iter().all(|s| segment_is_readonly(s)) {
         return Verdict::Allow;
     }
 
     Verdict::Ask
+}
+
+/// Recognise direct workspace-restore primitives denied to delegated executors.
+///
+/// Separate from `classify`: a parent may approve these commands, but a child without the
+/// workspace-restore capability must not regain it via approval or yolo. This is a policy check,
+/// NOT shell/program/kernel confinement: scripts, aliases, substitutions, wrappers and arbitrary
+/// programs are not interpreted. Conventional quotes, escaped separators, command chains, executable
+/// paths and Git global options are recognised. Oversized (>64 KiB / 4096 words) or unterminated
+/// quoted input fails closed; memory and scanning work are bounded. Inspectors and literal mentions
+/// such as `echo 'git restore .'` are not workspace-restore requests.
+pub fn delegated_restore_command(command: &str) -> bool {
+    const MAX_BYTES: usize = 64 * 1024;
+    const MAX_WORDS: usize = 4096;
+    if command.len() > MAX_BYTES {
+        return true;
+    }
+    let mut chars = command.chars().peekable();
+    let mut quote = None;
+    let mut word = String::new();
+    let mut started = false;
+    let mut words = Vec::new();
+    let mut total_words = 0;
+    while let Some(ch) = chars.next() {
+        if quote != Some('\'')
+            && (ch == '\\' || ch == '`')
+            && chars.peek().is_some_and(|next| {
+                (ch == '`' || quote.is_none()) && (next.is_whitespace() || "\"';&|".contains(*next))
+                    || (quote == Some('"') && *next == '"')
+            })
+        {
+            let next = chars.next().unwrap();
+            // Shell line continuations are not word separators.
+            if next == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            } else if next != '\n' && next != '\r' {
+                word.push(next);
+                started = true;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            started = true;
+            continue;
+        }
+        // A comment is data inside quotes or a word; otherwise skip through the line boundary.
+        if ch == '#' && !started {
+            while chars
+                .peek()
+                .is_some_and(|next| *next != '\n' && *next != '\r')
+            {
+                chars.next();
+            }
+            continue;
+        }
+        let separator = matches!(ch, ';' | '&' | '|' | '\r' | '\n');
+        if separator || ch.is_whitespace() {
+            if started {
+                words.push(std::mem::take(&mut word));
+                started = false;
+                total_words += 1;
+                if total_words > MAX_WORDS {
+                    return true;
+                }
+            }
+            if separator {
+                if restore_segment(&words) {
+                    return true;
+                }
+                words.clear();
+            }
+        } else {
+            word.push(ch);
+            started = true;
+        }
+    }
+    if quote.is_some() {
+        return true;
+    }
+    if started {
+        words.push(word);
+        total_words += 1;
+    }
+    total_words > MAX_WORDS || restore_segment(&words)
+}
+
+fn restore_segment(words: &[String]) -> bool {
+    // POSIX environment assignments do not change which direct executable is invoked.
+    let start = words.iter().position(|word| {
+        !word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.bytes().enumerate().all(|(i, byte)| {
+                    byte == b'_' || byte.is_ascii_alphabetic() || (i > 0 && byte.is_ascii_digit())
+                })
+        })
+    });
+    let Some(start) = start else { return false };
+    let args = &words[start + 1..];
+    match program_name(words[start].trim_start_matches('@')).trim_end_matches(".exe") {
+        "git" => git_restore_request(args),
+        "aizen" if args.first().is_some_and(|arg| arg == "time") => {
+            match args.get(1).map(String::as_str) {
+                Some("restore" | "undo" | "redo") => true,
+                Some("doctor") => args[2..]
+                    .iter()
+                    .take_while(|arg| arg.as_str() != "--")
+                    .any(|arg| arg == "--repair" || arg.starts_with("--repair=")),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn git_restore_request(args: &[String]) -> bool {
+    let mut pos = 0;
+    while let Some(arg) = args.get(pos) {
+        match arg.as_str() {
+            "--help" | "--version" | "-h" => return false,
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+            | "--exec-path" | "--super-prefix" => pos += 2,
+            "--" => {
+                pos += 1;
+                break;
+            }
+            flag if flag.starts_with('-') => pos += 1,
+            _ => break,
+        }
+    }
+    let Some(sub) = args.get(pos) else {
+        return false;
+    };
+    let options: Vec<&str> = args[pos + 1..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+        .collect();
+    if options.contains(&"--help") || options.contains(&"-h") {
+        return false;
+    }
+    match sub.as_str() {
+        "restore" => {
+            let mut staged = false;
+            let mut worktree = false;
+            let mut pos = 0;
+            while let Some(option) = options.get(pos) {
+                match *option {
+                    "--staged" => staged = true,
+                    "--no-staged" => staged = false,
+                    // Git accepts unique long-option abbreviations; do not let a staged-only
+                    // exception hide an explicit (or abbreviated) worktree request.
+                    long if long.starts_with("--work")
+                        || long == "--wor"
+                        || long == "--wo"
+                        || long == "--w" =>
+                    {
+                        worktree = true
+                    }
+                    "--source" | "--pathspec-from-file" => pos += 1,
+                    short if short.starts_with('-') && !short.starts_with("--") => {
+                        let mut flags = short[1..].chars().peekable();
+                        while let Some(flag) = flags.next() {
+                            match flag {
+                                'S' => staged = true,
+                                'W' => worktree = true,
+                                's' => {
+                                    if flags.peek().is_none() {
+                                        pos += 1;
+                                    }
+                                    break; // The remaining short-option suffix is the source value.
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                pos += 1;
+            }
+            !staged || worktree
+        }
+        "reset" => options
+            .iter()
+            .any(|arg| matches!(*arg, "--hard" | "--merge" | "--keep")),
+        // Branch checkout/switch also changes the worktree; do not try to infer a harmless target.
+        "checkout" | "switch" | "checkout-index" => true,
+        "read-tree" => options.iter().any(|arg| {
+            *arg == "--reset"
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('u'))
+        }),
+        _ => false,
+    }
 }
 
 /// Collapse runs of whitespace to single spaces (so patterns don't need `\s+` everywhere).
@@ -359,28 +572,159 @@ fn split_segments(cmd: &str) -> Vec<String> {
         .collect()
 }
 
-/// Is a single (un-chained) command segment read-only?
+/// Is a single (un-chained) command segment read-only? Every token is inspected, not just the
+/// program: a read-only program with a writing flag (`find … -delete`) is not read-only.
 fn segment_is_readonly(seg: &str) -> bool {
-    let mut toks = seg.split_whitespace();
-    let prog = match toks.next() {
-        Some(p) => program_name(p),
-        None => return false,
+    let toks: Vec<&str> = seg.split_whitespace().collect();
+    let Some(first) = toks.first() else {
+        return false;
     };
+    let prog = program_name(first);
+    let rest = &toks[1..];
     // Reject env-assignment prefixes (FOO=bar cmd) and absolute/path-qualified unknowns conservatively.
     if prog.contains('=') {
         return false;
     }
+    if BARE_ONLY.contains(&prog.as_str()) {
+        return rest.is_empty();
+    }
+    if let Some((_, gated)) = ARG_GATED.iter().find(|(p, _)| *p == prog) {
+        if rest.iter().any(|t| gated.iter().any(|g| t.starts_with(g))) {
+            return false;
+        }
+    }
     if READONLY_PROGS.contains(&prog.as_str()) {
         return true;
     }
-    if let Some((_, subs)) = READONLY_SUBCMDS.iter().find(|(p, _)| *p == prog) {
-        // Find the first non-flag token after the program = the subcommand.
-        if let Some(sub) = toks.find(|t| !t.starts_with('-')) {
-            return subs.contains(&sub);
-        }
-        return false; // bare `git` / `cargo` with no subcommand → ask
+    match prog.as_str() {
+        "git" => git_segment_is_readonly(rest),
+        "cargo" => cargo_segment_is_readonly(rest),
+        _ => READONLY_SUBCMDS
+            .iter()
+            .find(|(p, _)| *p == prog)
+            // The first non-flag token after the program is the subcommand; bare `npm` → ask.
+            .is_some_and(|(_, subs)| {
+                rest.iter()
+                    .find(|t| !t.starts_with('-'))
+                    .is_some_and(|sub| subs.contains(sub))
+            }),
     }
-    false
+}
+
+/// Does any token equal one of `set`, or start with it followed by `=` (`--output=f`)?
+fn has_flag(args: &[&str], set: &[&str]) -> bool {
+    args.iter().any(|t| {
+        set.iter()
+            .any(|s| t == s || (t.starts_with(s) && t[s.len()..].starts_with('=')))
+    })
+}
+
+/// `git <sub> …` read-only? Plain inspectors always; `branch`/`tag`/`remote` only in their LISTING
+/// shape — `git branch feature` creates, `git branch -d feature` deletes, `git tag v1` creates,
+/// `git remote add` writes config — and the subcommand-only check used to pass all of them.
+fn git_segment_is_readonly(rest: &[&str]) -> bool {
+    let Some(pos) = rest.iter().position(|t| !t.starts_with('-')) else {
+        return false; // bare `git` (or only global flags) → ask
+    };
+    let sub = rest[pos];
+    let args = &rest[pos + 1..];
+    let has_positional = args.iter().any(|t| !t.starts_with('-'));
+    match sub {
+        "status" | "diff" | "log" | "show" | "rev-parse" | "describe" | "blame" | "ls-files"
+        | "shortlog" => true,
+        "branch" => {
+            const MUTATING: &[&str] = &[
+                "-d",
+                "-D",
+                "-m",
+                "-M",
+                "-c",
+                "-C",
+                "-f",
+                "-u",
+                "--delete",
+                "--move",
+                "--copy",
+                "--force",
+                "--set-upstream-to",
+                "--unset-upstream",
+                "--edit-description",
+                "--track",
+                "--no-track",
+            ];
+            const LISTING: &[&str] = &[
+                "-l",
+                "--list",
+                "-a",
+                "-r",
+                "-v",
+                "-vv",
+                "--contains",
+                "--no-contains",
+                "--merged",
+                "--no-merged",
+                "--points-at",
+                "--show-current",
+                "--sort",
+                "--format",
+            ];
+            !has_flag(args, MUTATING) && (!has_positional || has_flag(args, LISTING))
+        }
+        "tag" => {
+            const MUTATING: &[&str] = &[
+                "-d",
+                "-D",
+                "--delete",
+                "-a",
+                "-s",
+                "-f",
+                "--force",
+                "-m",
+                "-F",
+                "-u",
+                "--sign",
+                "--annotate",
+            ];
+            const LISTING: &[&str] = &[
+                "-l",
+                "--list",
+                "-n",
+                "--contains",
+                "--no-contains",
+                "--points-at",
+                "--merged",
+                "--no-merged",
+                "--sort",
+                "--format",
+            ];
+            !has_flag(args, MUTATING) && (!has_positional || has_flag(args, LISTING))
+        }
+        "remote" => match args.iter().find(|t| !t.starts_with('-')) {
+            None => true, // `git remote`, `git remote -v`
+            Some(&"show") | Some(&"get-url") => true,
+            _ => false, // add / remove / rename / set-url / prune / update / set-head …
+        },
+        _ => false,
+    }
+}
+
+/// `cargo <sub> …` read-only? `check`/`tree`/`metadata` always (they build scripts, like every
+/// cargo invocation, but write nothing outside `target/`); `clippy` unless `--fix`; `fmt` ONLY with
+/// `--check` — plain `cargo fmt` rewrites the source tree. A `+toolchain` selector is skipped.
+fn cargo_segment_is_readonly(rest: &[&str]) -> bool {
+    let Some(pos) = rest
+        .iter()
+        .position(|t| !t.starts_with('-') && !t.starts_with('+'))
+    else {
+        return false;
+    };
+    let args = &rest[pos + 1..];
+    match rest[pos] {
+        "check" | "tree" | "metadata" => true,
+        "clippy" => !args.contains(&"--fix"),
+        "fmt" => args.contains(&"--check"),
+        _ => false,
+    }
 }
 
 /// Strip a path prefix and a `.exe` suffix from a program token → the bare name, lowercased.
@@ -394,6 +738,120 @@ fn program_name(tok: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_restore_recognises_direct_workspace_primitives() {
+        for command in [
+            "git restore .",
+            "git restore --source=HEAD --worktree src/main.rs",
+            "git restore --staged --worktree .",
+            "git restore -SW .",
+            "git restore --staged --work .",
+            "git restore --staged --no-staged .",
+            "git restore --staged -W .",
+            "git restore -SWsHEAD .",
+            "git reset --hard HEAD",
+            "git reset --merge HEAD~1",
+            "git reset --keep HEAD",
+            "git checkout -- src/main.rs",
+            "git checkout main",
+            "git switch -c feature",
+            "git checkout-index -af",
+            "git read-tree -u HEAD",
+            "git read-tree -mu HEAD",
+            "git read-tree --reset HEAD",
+            "aizen time restore checkpoint",
+            "aizen time undo",
+            "aizen time redo",
+            "aizen time doctor --repair",
+        ] {
+            assert!(delegated_restore_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn delegated_restore_handles_chains_quotes_and_global_options() {
+        for command in [
+            "git status && git restore .",
+            "echo ok;git reset --hard",
+            "false || git checkout -- .",
+            "git status | git read-tree -u HEAD",
+            "git diff & git restore .",
+            "git status\ngit restore .",
+            "git status\r\ngit restore .",
+            "git -C 'repo with spaces' -c advice.detachedHead=false restore .",
+            "git -Crepo -cadvice.detachedHead=false --no-pager reset --hard",
+            "git --git-dir='repo/.git' --work-tree repo restore .",
+            "git --namespace test --config-env advice.detachedHead=VALUE switch main",
+            "git --literal-pathspecs restore .",
+            "GIT_CONFIG_NOSYSTEM=1 git restore .",
+            "git re\"sto\"re .",
+            "git \\\nrestore .",
+            "git \\\r\nrestore .",
+            "git `\nrestore .",
+            "& 'C:\\Program Files\\Git\\cmd\\git.exe' restore .",
+            "\"C:\\Program Files\\Git\\cmd\\git.EXE\" -C repo restore .",
+            "'/usr/bin/git' checkout -- .",
+            "\"C:\\tools\\aizen.exe\" time undo",
+            "echo 'not a separator ;'; git restore .",
+            "echo ok # ignored ; git status\ngit restore .",
+        ] {
+            assert!(delegated_restore_command(command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn delegated_restore_leaves_inspection_and_index_only_commands_alone() {
+        for command in [
+            "",
+            "git status",
+            "git diff -- src/main.rs",
+            "git show HEAD:restore",
+            "git log --all",
+            "git -C repo diff",
+            "git -c alias.restore=status status",
+            "git restore --help",
+            "git checkout -h",
+            "git restore --staged .",
+            "git restore -S .",
+            "git restore -qS .",
+            "git restore --staged --source=HEAD .",
+            "git restore --staged --source --worktree .",
+            "git restore -SsHEAD .",
+            "git restore -S -s SW .",
+            "git restore --staged --pathspec-from-file --worktree",
+            "git restore --staged -- --worktree",
+            "git reset --soft HEAD~1",
+            "git reset --mixed HEAD",
+            "git reset HEAD -- --hard",
+            "git read-tree HEAD",
+            "aizen time doctor",
+            "aizen time doctor -- --repair",
+            "aizen time list",
+            "aizen time diff checkpoint",
+            "echo 'git restore .'",
+            "echo \"git reset --hard; git checkout -- .\"",
+            "printf '%s' 'git restore .'",
+            "echo git restore .",
+            "echo git\\ restore\\ .",
+            "echo ok\\;git restore .",
+            "echo ok # git restore .",
+            "git status && echo 'git restore .'",
+            "git diff -- 'a; git restore .'",
+        ] {
+            assert!(!delegated_restore_command(command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn delegated_restore_bounds_input_and_fails_closed_on_unterminated_quotes() {
+        assert!(delegated_restore_command(&"x".repeat(64 * 1024 + 1)));
+        assert!(delegated_restore_command(&"echo ".repeat(4097)));
+        assert!(!delegated_restore_command(&"echo ".repeat(4096)));
+        assert!(!delegated_restore_command(&"x".repeat(64 * 1024)));
+        assert!(delegated_restore_command("git 'restore ."));
+        assert!(delegated_restore_command("echo \"unterminated"));
+    }
 
     fn blocked(cmd: &str) -> bool {
         matches!(classify(cmd), Verdict::Blocked(_))
@@ -615,5 +1073,107 @@ mod tests {
         assert_eq!(classify("rg foo | xargs rm"), Verdict::Ask); // rm segment isn't read-only
         assert_eq!(classify("./deploy.sh"), Verdict::Ask); // unknown program
         assert_eq!(classify("git"), Verdict::Ask); // bare subcmd-gated program
+    }
+
+    #[test]
+    fn a_newline_is_a_command_separator_for_the_allow_path() {
+        // `ls\nrm -rf build` is two commands to every shell. Collapsing the newline first made it
+        // one segment whose program was `ls` — and `smart` auto-ran the `rm`.
+        assert_eq!(classify("ls\nrm -rf build"), Verdict::Ask);
+        assert_eq!(classify("ls -la\r\ncargo build"), Verdict::Ask);
+        assert_eq!(classify("cat a.txt\ncat b.txt"), Verdict::Allow); // two readers stay allowed
+        assert_eq!(classify("git status\n"), Verdict::Allow);
+    }
+
+    #[test]
+    fn ampersand_redirect_is_a_write_not_a_blanking() {
+        // bash's `&>` sends both streams to a file — a real write with a producing command. It
+        // used to trip the bare-redirect BLOCK (unappealable) because `&` counted as a segment
+        // start. It asks (redirection), never blocks.
+        assert_eq!(classify("cargo build &> build.log"), Verdict::Ask);
+        assert_eq!(classify("make &>log"), Verdict::Ask);
+        // A bare redirect after `&&` still blanks a file with nothing producing → still blocked.
+        assert!(blocked("true && > important.txt"));
+        assert!(blocked("> important.txt"));
+        assert!(blocked("ls; > important.txt"));
+    }
+
+    #[test]
+    fn read_only_programs_with_writing_flags_ask() {
+        assert_eq!(classify("find . -name '*.rs'"), Verdict::Allow);
+        assert_eq!(classify("find . -name '*.rs' -delete"), Verdict::Ask);
+        assert_eq!(classify("find . -type f -exec rm -rf {} +"), Verdict::Ask);
+        assert_eq!(classify("find . -execdir sh -c 'x' \\;"), Verdict::Ask);
+        assert_eq!(classify("fd -e rs -x rm"), Verdict::Ask);
+        assert_eq!(classify("fd -e rs"), Verdict::Allow);
+        assert_eq!(classify("sort -o out.txt in.txt"), Verdict::Ask);
+        assert_eq!(classify("sort in.txt"), Verdict::Allow);
+        assert_eq!(classify("date -s '2026-01-01'"), Verdict::Ask);
+        assert_eq!(classify("date"), Verdict::Allow);
+        // `env CMD` runs CMD; bare `env` only prints.
+        assert_eq!(classify("env"), Verdict::Allow);
+        assert_eq!(classify("env rm -rf target"), Verdict::Ask);
+        assert_eq!(classify("hostname"), Verdict::Allow);
+        assert_eq!(classify("hostname evil"), Verdict::Ask);
+        assert_eq!(classify("git log --output=/tmp/x --oneline"), Verdict::Ask);
+    }
+
+    #[test]
+    fn git_listing_shapes_are_read_only_and_mutating_shapes_ask() {
+        assert_eq!(classify("git branch"), Verdict::Allow);
+        assert_eq!(classify("git branch -a"), Verdict::Allow);
+        assert_eq!(classify("git branch --show-current"), Verdict::Allow);
+        assert_eq!(classify("git branch --list 'feat*'"), Verdict::Allow);
+        assert_eq!(classify("git branch --contains abc123"), Verdict::Allow);
+        assert_eq!(
+            classify("git branch feature"),
+            Verdict::Ask,
+            "creates a branch"
+        );
+        assert_eq!(
+            classify("git branch -d merged"),
+            Verdict::Ask,
+            "deletes (lowercase -d)"
+        );
+        assert_eq!(classify("git branch -m old new"), Verdict::Ask);
+        assert_eq!(classify("git branch -u origin/x"), Verdict::Ask);
+        assert_eq!(classify("git tag"), Verdict::Allow);
+        assert_eq!(classify("git tag -l 'v*'"), Verdict::Allow);
+        assert_eq!(classify("git tag v1.0"), Verdict::Ask, "creates a tag");
+        assert_eq!(classify("git tag -d v1.0"), Verdict::Ask);
+        assert_eq!(classify("git tag -a v1 -m msg"), Verdict::Ask);
+        assert_eq!(classify("git remote"), Verdict::Allow);
+        assert_eq!(classify("git remote -v"), Verdict::Allow);
+        assert_eq!(classify("git remote show origin"), Verdict::Allow);
+        assert_eq!(classify("git remote add fork https://x"), Verdict::Ask);
+        assert_eq!(classify("git remote remove origin"), Verdict::Ask);
+        assert_eq!(
+            classify("git remote set-url origin https://y"),
+            Verdict::Ask
+        );
+    }
+
+    #[test]
+    fn cargo_and_npm_only_in_their_read_only_shapes() {
+        assert_eq!(classify("cargo check"), Verdict::Allow);
+        assert_eq!(classify("cargo +nightly check"), Verdict::Allow);
+        assert_eq!(classify("cargo tree"), Verdict::Allow);
+        assert_eq!(classify("cargo clippy"), Verdict::Allow);
+        assert_eq!(
+            classify("cargo clippy --fix"),
+            Verdict::Ask,
+            "rewrites source"
+        );
+        assert_eq!(classify("cargo fmt --check"), Verdict::Allow);
+        assert_eq!(classify("cargo fmt"), Verdict::Ask, "rewrites source");
+        assert_eq!(classify("cargo test"), Verdict::Ask, "runs code");
+        assert_eq!(classify("npm ls"), Verdict::Allow);
+        assert_eq!(
+            classify("npm test"),
+            Verdict::Ask,
+            "runs package.json scripts"
+        );
+        assert_eq!(classify("npm audit"), Verdict::Ask, "network");
+        assert_eq!(classify("npm view react"), Verdict::Ask, "network");
     }
 }

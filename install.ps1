@@ -1,6 +1,6 @@
 # Aizen installer for Windows (PowerShell 5+).
 #
-#   irm https://raw.githubusercontent.com/aizen-stack/aizen/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/talmetis-labs/aizen/main/install.ps1 | iex
 #
 # Downloads the latest optimized `aizen.exe` from GitHub Releases, drops it in
 # %LOCALAPPDATA%\Aizen (override with $env:AIZEN_INSTALL), and adds that folder
@@ -8,14 +8,15 @@
 
 $ErrorActionPreference = 'Stop'
 
-$Repo   = 'aizen-stack/aizen'
+$Repo   = 'talmetis-labs/aizen'
 $Suffix = 'windows-x86_64.exe'
 $Dir    = if ($env:AIZEN_INSTALL) { $env:AIZEN_INSTALL } else { Join-Path $env:LOCALAPPDATA 'Aizen' }
 
 Write-Host "Installing aizen..." -ForegroundColor Cyan
 
 $rel = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'aizen-installer' }
-$asset = $rel.assets | Where-Object { $_.name -like "*$Suffix" } | Select-Object -First 1
+# `-voice` is a separate opt-in artifact: never what a plain install fetches.
+$asset = $rel.assets | Where-Object { $_.name -like "*$Suffix" -and $_.name -notlike "*-voice*" } | Select-Object -First 1
 if (-not $asset) { throw "No Windows asset (*$Suffix) found in release $($rel.tag_name)." }
 
 New-Item -ItemType Directory -Force $Dir | Out-Null

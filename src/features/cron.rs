@@ -94,7 +94,7 @@ fn add(name: &str, schedule: &str, task: &str) -> Result<()> {
     let exe = exe.display().to_string();
 
     std::fs::create_dir_all(cron_dir()).context("creating ~/.aizen/cron")?;
-    register_os(&task_name(name), schedule, &exe, name)?;
+    crate::core::config::harden_dir(&cron_dir());
 
     let job = CronJob {
         name: name.to_string(),
@@ -104,8 +104,17 @@ fn add(name: &str, schedule: &str, task: &str) -> Result<()> {
         base_url: cfg.base_url.clone(),
         created: crate::memory::learning::default_session_id(),
     };
-    std::fs::write(spec_path(name), serde_json::to_string_pretty(&job)?)
+    // E5.4 (quality plan S7): the spec is on disk, atomically, BEFORE the OS entry exists. A
+    // scheduler that fires between the two steps finds a job to run, and a failure between them
+    // leaves a spec to remove — never an OS entry pointing at nothing.
+    let spec = spec_path(name);
+    crate::core::persist::atomic_write(&spec, serde_json::to_string_pretty(&job)?.as_bytes())
         .with_context(|| format!("writing spec for '{name}'"))?;
+    crate::core::persist::harden_owner_only_checked(&spec)?;
+    if let Err(e) = register_os(&task_name(name), schedule, &exe, name) {
+        let _ = std::fs::remove_file(&spec);
+        return Err(e);
+    }
 
     println!(
         "scheduled '{name}' ({schedule}) → runs: {} cron run {name}\n  model: {}\n  spec:  {}",
@@ -188,17 +197,48 @@ async fn run(name: &str) -> Result<()> {
         Ok(out) => format!("\n===== {stamp} =====\n{out}\n"),
         Err(e) => format!("\n===== {stamp} (ERROR) =====\n{e}\n"),
     };
+    // Per-job logs are append-only and otherwise unbounded (only `cron remove` ever deleted one).
+    // Single-generation rotation at 1 MiB — a job that fires hourly writes for months before its
+    // first roll, and the tail is all anyone reads.
+    let log = log_path(name);
+    if std::fs::metadata(&log).is_ok_and(|m| m.len() >= 1024 * 1024) {
+        let rolled = log.with_extension("1.log");
+        let _ = std::fs::remove_file(&rolled);
+        let _ = std::fs::rename(&log, &rolled);
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path(name))
+        .open(&log)
     {
         use std::io::Write;
         let _ = f.write_all(entry.as_bytes());
     }
+    // The log holds the agent's output for a task run unattended — owner-only, like a session.
+    let _ = crate::core::persist::harden_owner_only_checked(&log);
+    // A failure nobody is at the keyboard to see goes to the configured notify channels.
+    if let Err(e) = &result {
+        notify_failure(name, e).await;
+    }
     // Echo to stdout too (the scheduler may capture it); surface errors as a non-zero exit.
     print!("{entry}");
     result.map(|_| ())
+}
+
+/// Post a scheduled run's failure to every configured notify channel (E5.4, quality plan S7): an
+/// unattended job that fails used to be visible only in a log nobody opens. Best-effort — a
+/// channel that cannot be reached is noted on stderr, never a second failure.
+async fn notify_failure(name: &str, err: &anyhow::Error) {
+    use crate::channels::notify;
+    let text = format!(
+        "aizen cron '{name}' failed: {}",
+        truncate(&format!("{err:#}"), 600)
+    );
+    for ch in notify::configured_channels() {
+        if let Err(e) = notify::send_to(ch, &text).await {
+            eprintln!("cron: could not notify {}: {e:#}", ch.label());
+        }
+    }
 }
 
 // ── schedule translation ─────────────────────────────────────────────────────

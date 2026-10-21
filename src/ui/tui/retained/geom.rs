@@ -13,12 +13,20 @@ pub(super) struct TranscriptGeom {
     pub(crate) visible: usize,
     pub(crate) total: usize,
     pub(crate) area: Rect,
-    /// Plain (SGR-stripped) wrapped rows of the full transcript at last draw — used to extract the
-    /// selected text on mouse-up without re-rendering on the input thread.
+    /// Plain (SGR-stripped) wrapped rows of the RENDERED WINDOW at last draw (the viewport plus
+    /// a margin, see `paint::RENDER_MARGIN_ROWS`) — used to extract the selected text on
+    /// mouse-up without re-rendering on the input thread. `plain_rows[i]` is transcript row
+    /// `rows_offset + i`.
     pub(crate) plain_rows: Vec<String>,
+    /// Absolute transcript row of `plain_rows[0]` / `sgr_rows[0]`.
+    pub(crate) rows_offset: usize,
+    /// The tool `seq` each rendered row belongs to (`None` for prose), parallel to `plain_rows`
+    /// — so a key press with a selection on a tool row can expand THAT tool's result.
+    pub(crate) row_tool_seq: Vec<Option<u64>>,
     /// Raw rendered rows WITH SGR colour codes — used by the hyperlink injector to re-print link
     /// spans baked inside OSC 8 sequences after `terminal.draw()`. Parallel to `plain_rows`.
     pub(crate) sgr_rows: Vec<String>,
+    pub(crate) paths: Vec<Vec<crate::ui::links::PathFragment>>,
     /// Screen rect of the floating "jump to bottom" button, present only while the transcript is
     /// scrolled up off the tail. `None` when at the tail (button hidden). The input thread hit-tests
     /// a left-click against this before anything else so the button lands the viewport back on tail.
@@ -28,6 +36,16 @@ pub(super) struct TranscriptGeom {
 pub(super) fn transcript_geom_slot() -> &'static Mutex<TranscriptGeom> {
     static SLOT: OnceLock<Mutex<TranscriptGeom>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(TranscriptGeom::default()))
+}
+
+/// The tool `seq` painted at absolute transcript row `abs_row` at last draw, if that row belongs
+/// to a tool block.
+pub(crate) fn tool_seq_at_row(abs_row: usize) -> Option<u64> {
+    let g = transcript_geom_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let i = abs_row.checked_sub(g.rows_offset)?;
+    g.row_tool_seq.get(i).copied().flatten()
 }
 
 /// Snapshot of the last transcript geometry for mouse hit-testing (selection / scrollbar drag).
@@ -45,6 +63,24 @@ pub(crate) fn jump_button_rect() -> Option<Rect> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     g.jump_button
+}
+
+/// Screen rect of the jobs strip painted under the composer (narrow terminals), present only while
+/// background work exists. A left-click inside it opens the jobs panel; cleared every frame the strip
+/// is not drawn so a stale rect can't swallow clicks.
+pub(super) fn jobs_strip_slot() -> &'static Mutex<Option<Rect>> {
+    static SLOT: OnceLock<Mutex<Option<Rect>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn set_jobs_strip(r: Option<Rect>) {
+    *jobs_strip_slot().lock().unwrap_or_else(|e| e.into_inner()) = r;
+}
+
+/// The jobs strip's rect at last draw, if it was painted. The input thread hit-tests a left-click
+/// against this before transcript selection so a click on the strip opens the panel.
+pub(crate) fn jobs_strip_rect() -> Option<Rect> {
+    *jobs_strip_slot().lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Where the last frame put a SELECTABLE overlay's option rows, so the input thread can turn a
@@ -237,10 +273,57 @@ pub(crate) fn extract_selection_text(sel: SelectionRange) -> String {
     let g = transcript_geom_slot()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    extract_from_plain_rows(&g.plain_rows, sel)
+    match shift_selection(sel, g.rows_offset, g.plain_rows.len()) {
+        Some(local) => extract_from_path_rows(&g.plain_rows, &g.paths, local),
+        None => String::new(),
+    }
 }
 
-fn extract_from_plain_rows(rows: &[String], sel: SelectionRange) -> String {
+/// A selection in the flat row space re-based onto a rendered window that starts at absolute
+/// row `offset` and holds `len` rows: rows before the window clamp to its first row, rows past
+/// it to its last. `None` when the selection lies entirely outside the window.
+pub(super) fn shift_selection(
+    sel: SelectionRange,
+    offset: usize,
+    len: usize,
+) -> Option<SelectionRange> {
+    if len == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (
+        (sel.anchor_line, sel.anchor_col),
+        (sel.cursor_line, sel.cursor_col),
+    );
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+    }
+    let end = offset + len;
+    if b.0 < offset || a.0 >= end {
+        return None;
+    }
+    let clamp = |(line, col): (usize, usize)| -> (usize, usize) {
+        if line < offset {
+            (0, 0)
+        } else if line >= end {
+            (len - 1, usize::MAX)
+        } else {
+            (line - offset, col)
+        }
+    };
+    let (a, b) = (clamp(a), clamp(b));
+    Some(SelectionRange {
+        anchor_line: a.0,
+        anchor_col: a.1,
+        cursor_line: b.0,
+        cursor_col: b.1,
+    })
+}
+
+pub(super) fn extract_from_path_rows(
+    rows: &[String],
+    paths: &[Vec<crate::ui::links::PathFragment>],
+    sel: SelectionRange,
+) -> String {
     if rows.is_empty() {
         return String::new();
     }
@@ -256,7 +339,25 @@ fn extract_from_plain_rows(rows: &[String], sel: SelectionRange) -> String {
     }
     let a_line = a_line.min(rows.len().saturating_sub(1));
     let b_line = b_line.min(rows.len().saturating_sub(1));
+    let mut coverage: std::collections::HashMap<_, (bool, bool, bool)> =
+        std::collections::HashMap::new();
+    for (i, fragments) in paths.iter().enumerate() {
+        for fragment in fragments {
+            let start = if i == a_line { a_col } else { 0 };
+            let end = if i == b_line { b_col } else { usize::MAX };
+            let selected = i >= a_line
+                && i <= b_line
+                && start <= fragment.span.col
+                && end >= fragment.span.col + fragment.span.width;
+            let entry = coverage.entry(fragment.id).or_insert((true, false, false));
+            entry.0 &= selected;
+            entry.1 |= fragment.first;
+            entry.2 |= fragment.last;
+        }
+    }
+    let complete = |id: &(u64, usize)| coverage.get(id).is_some_and(|v| v.0 && v.1 && v.2);
     let mut out = String::new();
+    let mut continuation = None;
     for (i, row) in rows.iter().enumerate().take(b_line + 1).skip(a_line) {
         let plain = console::strip_ansi_codes(row);
         let start_col = if i == a_line { a_col } else { 0 };
@@ -265,11 +366,31 @@ fn extract_from_plain_rows(rows: &[String], sel: SelectionRange) -> String {
         } else {
             console::measure_text_width(plain.as_ref()).saturating_add(1)
         };
-        let slice = slice_by_display_cols(plain.as_ref(), start_col, end_col);
-        if i > a_line {
+        let fragments = paths.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        let continuing = continuation.take().is_some_and(|id| {
+            fragments
+                .iter()
+                .any(|p| p.id == id && complete(&id) && !p.first && p.span.col == 0)
+        });
+        if i > a_line && !continuing {
             out.push('\n');
         }
-        out.push_str(&slice);
+        let mut col = start_col;
+        for fragment in fragments.iter().filter(|p| complete(&p.id)) {
+            out.push_str(&slice_by_display_cols(
+                plain.as_ref(),
+                col,
+                fragment.span.col,
+            ));
+            if fragment.first {
+                out.push_str(&fragment.actual.to_string_lossy());
+            }
+            col = fragment.span.col + fragment.span.width;
+            if !fragment.last && col == crate::ui::links::display_width(plain.as_ref()) {
+                continuation = Some(fragment.id);
+            }
+        }
+        out.push_str(&slice_by_display_cols(plain.as_ref(), col, end_col));
     }
     out
 }
@@ -281,11 +402,12 @@ fn slice_by_display_cols(s: &str, start_col: usize, end_col: usize) -> String {
     }
     let mut out = String::new();
     let mut col = 0usize;
-    for ch in s.chars() {
-        let w = console::measure_text_width(&ch.to_string()).max(1);
+    use unicode_segmentation::UnicodeSegmentation;
+    for glyph in s.graphemes(true) {
+        let w = crate::ui::links::display_width(glyph);
         let next = col.saturating_add(w);
         if next > start_col && col < end_col {
-            out.push(ch);
+            out.push_str(glyph);
         }
         col = next;
         if col >= end_col {

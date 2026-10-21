@@ -65,6 +65,7 @@ fn apply_model_endpoint(cfg: &mut cli_config::CliConfig, spec: &str) -> Result<(
             model,
             base_url,
             api_key_ref,
+            max_concurrent: None,
         });
     }
     cfg.model_endpoints = (!list.is_empty()).then_some(list);
@@ -519,7 +520,7 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             print_config(&cfg);
             Ok(())
         }
-        ConfigCmd::Provider { cmd } => run_provider_config(cmd),
+        ConfigCmd::Provider { cmd } => run_provider_config(cmd).await,
         ConfigCmd::Show => {
             print_config(&cli_config::load());
             Ok(())
@@ -537,17 +538,24 @@ pub(crate) fn provider_row(cfg: &cli_config::CliConfig, p: &cli_config::Provider
         .as_deref()
         .is_some_and(|name| name.eq_ignore_ascii_case(&p.name));
     format!(
-        "{} {:<16} · {} · {} · key {}",
+        "{} {:<16} · {} · {} · {}",
         if active { "●" } else { "○" },
         p.name,
         p.model,
         redact_url_userinfo(&p.base_url),
-        cli_config::mask(&p.api_key)
+        // A blank key is a real shape now — the Aizen row keeps its credential in `session.json`.
+        // Masking nothing into `key ***` would show a key that is not there, and send somebody
+        // looking for the one they think they stored.
+        if p.api_key.trim().is_empty() {
+            "signed in (no key stored)".to_string()
+        } else {
+            format!("key {}", cli_config::mask(&p.api_key))
+        }
     )
 }
 
 /// Manage named main endpoint profiles from the CLI.
-fn run_provider_config(cmd: ProviderConfigCmd) -> Result<()> {
+async fn run_provider_config(cmd: ProviderConfigCmd) -> Result<()> {
     let mut cfg = cli_config::load();
     match cmd {
         ProviderConfigCmd::Add {
@@ -652,6 +660,26 @@ fn run_provider_config(cmd: ProviderConfigCmd) -> Result<()> {
                         refs.join(", ")
                     );
                 }
+            }
+            // Removing an AIZEN row is a LOGOUT, not a row deletion — either way it can be one.
+            // If the pin names it, a plain removal leaves `gateway.json` behind claiming this
+            // machine is paired to a key that is no longer anywhere, and the "current endpoint
+            // kept" below (right for every other row) keeps a copy of the very key a logout has to
+            // leave nowhere. If instead the row stands on the account session, it holds no key at
+            // all — and deleting it while leaving the session behind is worse, because the session
+            // still spends and `resolve_endpoint` will pick it up again on the next turn.
+            if crate::llm::gateway::is_aizen_profile(&cfg, &name) {
+                // Ask the gateway to cut this machine while the credential still exists — it is
+                // what authenticates the request. What it answers changes what is printed and
+                // nothing else; the teardown below runs either way.
+                let unpaired = crate::llm::gateway::unpair(Some(&name)).await;
+                let mut left = crate::llm::gateway::leave_in(&mut cfg, &name);
+                left.unpaired = Some(unpaired);
+                cli_config::save(&cfg)?;
+                for line in leaving_lines(&name, &left) {
+                    println!("{line}");
+                }
+                return Ok(());
             }
             let was_active = cfg
                 .active_provider
@@ -841,6 +869,24 @@ fn print_config(cfg: &cli_config::CliConfig) {
             "model",
             format!("{}  {}", unset(), theme::faint("· run /model")),
         ),
+    }
+
+    if let (Some(base_url), Some(model)) = (cfg.base_url.as_deref(), cfg.model.as_deref()) {
+        let (base_url, model) = crate::llm::media::effective_image_destination(base_url, model);
+        row(
+            "vision",
+            format!(
+                "{} · {}",
+                vision_status(
+                    cli_config::session_vision_policy().support_in(cfg, &base_url, &model)
+                ),
+                vision_destination_label(&base_url, &model)
+            ),
+        );
+        row(
+            "setup",
+            " /config → Vision · capability only, disclosure approved separately".into(),
+        );
     }
 
     // ── Sub-agents & roles ──
@@ -1108,6 +1154,12 @@ fn print_roles_section(cfg: &cli_config::CliConfig) {
         "apply",
         role_row_value(roles.and_then(|r| r.apply.as_ref())),
     );
+    // Only the pinned Pantheon roles print — seven "not set" rows would bury the four above.
+    if let Some(map) = roles.and_then(|r| r.pantheon.as_ref()) {
+        for (name, rc) in map {
+            row(name.as_str(), role_row_value(Some(rc)));
+        }
+    }
     match cfg.agent_routes.as_deref().filter(|l| !l.is_empty()) {
         Some(routes) => row(
             "specialists",
@@ -1202,6 +1254,260 @@ pub(crate) async fn config_wizard() -> Result<()> {
     config_menu(cfg).await
 }
 
+fn vision_status(supported: Option<bool>) -> &'static str {
+    match supported {
+        Some(true) => "Supported",
+        Some(false) => "Unsupported",
+        None => "Unknown",
+    }
+}
+
+/// Capability display has no userinfo, query, fragment or terminal control characters. Identity
+/// matching still uses the original exact endpoint/model, not this deliberately sanitized label.
+pub(crate) fn vision_destination_label(base_url: &str, model: &str) -> String {
+    let endpoint = url::Url::parse(base_url)
+        .ok()
+        .map(|mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|| "(invalid endpoint)".into());
+    let model: String = model
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(160)
+        .collect();
+    format!("{endpoint} · {model}")
+}
+
+fn show_vision_destination(
+    cfg: &cli_config::CliConfig,
+    base_url: &str,
+    model: &str,
+) -> Option<bool> {
+    let supported = cli_config::session_vision_policy().support_in(cfg, base_url, model);
+    line_dim(&format!(
+        "Vision: {}",
+        vision_destination_label(base_url, model)
+    ));
+    line_dim(&format!(
+        "Status: {} (explicit declaration, not a provider probe)",
+        vision_status(supported)
+    ));
+    line_dim("Capability does not approve sending any particular image. Disclosure is approved separately.");
+    supported
+}
+
+/// Select a capability statement, with a safe cancel default. Nothing contacts a provider.
+fn prompt_vision_declaration(current: Option<bool>) -> Result<Option<Option<bool>>> {
+    let items = [
+        "Declare Supported for this exact destination — this session only",
+        "Declare Unsupported for this exact destination — this session only",
+        "Declare Unknown for this exact destination — this session only",
+        "Cancel — leave declaration unchanged",
+    ];
+    if current == Some(false) {
+        line_warn("Configured Unsupported: sending stays blocked unless you explicitly change the declaration.");
+    }
+    let pick = Select::with_theme(&ui_theme())
+        .with_prompt("Vision capability")
+        .report(false)
+        .items(&items)
+        .default(3)
+        .interact_opt()?;
+    Ok(vision_declaration_choice(pick))
+}
+
+fn vision_declaration_choice(pick: Option<usize>) -> Option<Option<bool>> {
+    match pick {
+        Some(0) => Some(Some(true)),
+        Some(1) => Some(Some(false)),
+        Some(2) => Some(None),
+        _ => None,
+    }
+}
+
+/// The persist decision is separate from declaring capability for the running session.
+fn prompt_vision_persistence(supported: Option<bool>) -> Result<bool> {
+    line_dim(&format!(
+        "Session declaration: {}. No image has been sent by setup.",
+        vision_status(supported)
+    ));
+    Ok(Select::with_theme(&ui_theme())
+        .with_prompt("Save for future sessions?")
+        .report(false)
+        .items(&[
+            "Keep session only (do not save)",
+            "Save this exact declaration in user config",
+        ])
+        .default(0)
+        .interact_opt()?
+        == Some(1))
+}
+
+/// Reachable from the config hub, including exact child destinations returned by worker errors.
+/// Existing role/model resolution is used; this screen never chooses a replacement provider.
+fn config_edit_vision(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let mut destinations = Vec::<(String, String, String)>::new();
+    if let Ok((base_url, _, model)) = crate::resolve_endpoint(None, None, None) {
+        destinations.push(("Current main route".into(), base_url.clone(), model.clone()));
+        let main = cli_config::ResolvedEndpoint {
+            base_url,
+            api_key: String::new(),
+            model,
+        };
+        if let Some(models) = &cfg.models_by_effort {
+            for (tier, model) in models {
+                let endpoint = cli_config::endpoint_for_model(model, &main);
+                destinations.push((format!("Effort: {tier}"), endpoint.base_url, endpoint.model));
+            }
+        }
+        let subagent = cli_config::subagent_endpoint(&main);
+        destinations.push((
+            "Sub-agent default".into(),
+            subagent.base_url.clone(),
+            subagent.model.clone(),
+        ));
+        for role in ["summarizer", "oracle", "apply"] {
+            let endpoint = cli_config::resolve_role(role, &main);
+            let endpoint = cli_config::endpoint_for_model(&endpoint.model, &endpoint);
+            destinations.push((format!("Role: {role}"), endpoint.base_url, endpoint.model));
+        }
+        for role in crate::agent::roles::ROLES {
+            let endpoint = cli_config::pantheon_endpoint(role.name, &subagent);
+            destinations.push((
+                format!("Role: {}", role.name),
+                endpoint.base_url,
+                endpoint.model,
+            ));
+        }
+        if let Some(routes) = &cfg.agent_routes {
+            for route in routes {
+                if let Some((_, endpoint)) = cli_config::resolve_agent_route(cfg, &route.agent) {
+                    destinations.push((
+                        format!("Specialist: {}", route.agent),
+                        endpoint.base_url,
+                        endpoint.model,
+                    ));
+                }
+            }
+        }
+    }
+    for provider in cfg.providers.iter().flatten() {
+        destinations.push((
+            format!("Provider: {}", provider.name),
+            provider.base_url.clone(),
+            provider.model.clone(),
+        ));
+    }
+    let destinations: Vec<_> = destinations
+        .into_iter()
+        .map(|(name, base_url, model)| {
+            let (base_url, model) =
+                crate::llm::media::effective_image_destination(&base_url, &model);
+            (name, base_url, model)
+        })
+        .collect();
+    let mut items: Vec<String> = destinations
+        .iter()
+        .map(|(name, base_url, model)| {
+            format!(
+                "{name} · {} · {}",
+                vision_status(cli_config::session_vision_policy().support_in(cfg, base_url, model)),
+                vision_destination_label(base_url, model)
+            )
+        })
+        .collect();
+    items.push("Exact endpoint/model from a setup requirement (manual, no probe)".into());
+    items.push("Back".into());
+    let Some(pick) = Select::with_theme(&ui_theme())
+        .with_prompt("Vision — choose a destination")
+        .report(false)
+        .items(&items)
+        .default(0)
+        .interact_opt()?
+    else {
+        return Ok(());
+    };
+    if pick == items.len() - 1 {
+        return Ok(());
+    }
+    let (base_url, model) = match destinations.get(pick) {
+        Some((_, base_url, model)) => (base_url.clone(), model.clone()),
+        None => {
+            line_dim("Paste the exact endpoint and wire model named in the setup requirement. No test request is sent.");
+            let base_url = Input::<String>::with_theme(&ui_theme())
+                .with_prompt("Endpoint")
+                .report(false)
+                .allow_empty(true)
+                .interact_text()?;
+            if base_url.trim().is_empty() {
+                return Ok(());
+            }
+            let model = Input::<String>::with_theme(&ui_theme())
+                .with_prompt("Wire model")
+                .report(false)
+                .allow_empty(true)
+                .interact_text()?;
+            if model.trim().is_empty() {
+                return Ok(());
+            }
+            crate::llm::media::effective_image_destination(base_url.trim(), model.trim())
+        }
+    };
+    let supported = show_vision_destination(cfg, &base_url, &model);
+    let Some(declaration) = prompt_vision_declaration(supported)? else {
+        return Ok(());
+    };
+    cli_config::declare_session_vision(&base_url, &model, declaration)?;
+    if prompt_vision_persistence(declaration)? {
+        cli_config::persist_vision_support(&base_url, &model, declaration)?;
+        cli_config::set_vision_support_in(cfg, &base_url, &model, declaration)?;
+        line_ok("Saved the exact vision declaration for future sessions");
+    } else {
+        line_ok("Vision declaration applies to this session only");
+    }
+    Ok(())
+}
+
+/// Guided top-level preflight. Workers never call this: a missing child capability is returned
+/// to its controller as an actionable setup requirement. This is not an image disclosure grant.
+/// The controller must build a NEW immutable request/config snapshot after this returns true.
+///
+/// An UNDECLARED destination defaults to vision-capable instead of opening a menu on every
+/// attachment. The menu asked a question whose answer never varied, and it interrupted the turn
+/// that was already carrying the image; a capability statement is not a disclosure approval, so
+/// defaulting it adds no transmission authority. An explicitly configured `Unsupported` is a real
+/// answer and is still honoured — `/config → Vision` remains the way to change either.
+pub(crate) fn guided_vision_setup(base_url: &str, model: &str) -> Result<bool> {
+    let (base_url, model) = crate::llm::media::effective_image_destination(base_url, model);
+    let cfg = cli_config::load();
+    let supported = cli_config::session_vision_policy().support_in(&cfg, &base_url, &model);
+    if supported == Some(true) {
+        return Ok(true);
+    }
+    if supported == Some(false) {
+        line_warn(&format!(
+            "Vision is configured Unsupported for {}. Attachments are not sent; \
+             change it in /config → Vision.",
+            vision_destination_label(&base_url, &model)
+        ));
+        return Ok(false);
+    }
+    // Undeclared: state the default once, remember it, and get out of the way.
+    cli_config::declare_session_vision(&base_url, &model, Some(true))?;
+    cli_config::persist_vision_support(&base_url, &model, Some(true))?;
+    line_dim(&format!(
+        "Vision: {} · Supported by default (explicit declaration, not a provider probe). \
+         Change it in /config → Vision.",
+        vision_destination_label(&base_url, &model)
+    ));
+    Ok(true)
+}
+
 /// A yes/no toggle with the shared gold theme (used by the section editors below).
 fn yn(theme: &ColorfulTheme, prompt: &str, default: bool) -> Result<bool> {
     Ok(Confirm::with_theme(theme)
@@ -1242,7 +1548,22 @@ struct ProviderPreset {
 /// and expects the `x-opencode-client` header — also attached in `client::with_provider_auth`. Its
 /// free models are the `-free`-suffixed ids in the live `/models` list; `sample_model` is only the
 /// manual-entry default if that fetch fails.
+/// The Aizen gateway is first in the list and drawn in green, and both are on purpose: it is the
+/// only row that needs no key from anywhere else — you approve a code in a browser and the endpoint,
+/// the model and the credential all arrive together — so it is the shortest path from a fresh
+/// install to a working turn, and burying it under seven providers you must go and sign up with
+/// hides the one that costs the least effort. Its `keys_url` names no key page for the same reason
+/// Codex's does not: nothing here will ever ask for a key it can mint. `sample_model` is only the
+/// manual-entry fallback — the account's real default arrives with the pairing, and the model
+/// picker is fed from the live `/models` list the fresh key can already reach.
 const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        label: "Aizen (subscription)",
+        slug: "aizen",
+        base: crate::llm::gateway::DEFAULT_OPENAI_BASE,
+        keys_url: "approve a code in your browser — no API key",
+        sample_model: "anthropic/claude-sonnet-5",
+    },
     ProviderPreset {
         label: "OpenAI",
         slug: "openai",
@@ -1348,6 +1669,11 @@ fn line_bad(msg: &str) {
     tui::emit_line(&format!("  {} {}", style("✗").red(), style(msg).red()));
 }
 
+/// `  <msg>` dimmed — guidance for the prompt that follows, kept off the prompt line itself.
+pub(crate) fn line_dim(msg: &str) {
+    tui::emit_line(&format!("  {}", style(msg).dim()));
+}
+
 /// `  ! <msg>` in the warn colour — something to know, but not a stop.
 fn line_warn(msg: &str) {
     tui::emit_line(&format!(
@@ -1379,25 +1705,40 @@ async fn prompt_validated_base_url(
     allow_skip: bool,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
     let mut suggestion: Option<String> = current.map(str::to_string);
+    // The guidance rides on its own dim line, not in the prompt: a long prompt plus a long
+    // URL wraps the live input line, and dialoguer redraws a wrapped line badly (fragments
+    // of the old text survive beside the new one). The prompt itself stays two words, and a
+    // kept value is announced on its own line for the same reason (Enter still keeps it).
+    line_dim("base URL must include the version path, e.g. https://api.openai.com/v1");
     loop {
         let mut input = Input::<String>::with_theme(theme)
-            .with_prompt("Base URL (must include the version path, e.g. https://api.openai.com/v1)")
+            .with_prompt("Base URL")
             .allow_empty(allow_skip);
         if let Some(s) = suggestion.clone() {
-            input = input.default(s);
+            line_dim(&format!("Enter keeps {s}"));
+            input = input.default(s).show_default(false);
         }
         let raw = input.interact_text()?;
-        let base = raw.trim().trim_end_matches('/').to_string();
-        if base.is_empty() {
+        let typed = raw.trim().trim_end_matches('/').to_string();
+        if typed.is_empty() {
             if allow_skip {
                 return Ok(None);
             }
             line_bad("a base URL is required");
             continue;
         }
-        if !(base.starts_with("http://") || base.starts_with("https://")) {
-            line_bad("must start with http:// or https://");
-            suggestion = Some(format!("https://{base}"));
+        // `htps://`, a missing scheme, `https://https://` from a paste over a prefilled
+        // field: read what was meant instead of bouncing the question back.
+        let base = normalize_scheme(&typed);
+        if base != typed {
+            line_warn(&format!("read as {base}"));
+        }
+        if base
+            .split_once("://")
+            .is_none_or(|(_, rest)| rest.is_empty())
+        {
+            line_bad("must name a host, e.g. https://api.openai.com/v1");
+            suggestion = None;
             continue;
         }
 
@@ -1445,6 +1786,32 @@ async fn prompt_validated_base_url(
             return Ok(None);
         }
     }
+}
+
+/// Read the scheme the way it was meant: a mistyped one (`htps://`, `http:/`) becomes
+/// `https://` (or `http://` when that is what was typed), a missing one is added, and a doubled
+/// one — a URL pasted over a prefilled `https://` — collapses to the last. Everything after the
+/// last scheme-looking prefix is kept verbatim; `localhost:8080/v1` has no scheme (a port is
+/// not a scheme) and gets `https://` in front.
+pub(crate) fn normalize_scheme(typed: &str) -> String {
+    let mut rest = typed.trim();
+    let mut scheme = "https";
+    while let Some((word, after)) = rest.split_once(':') {
+        let scheme_word = word.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if !scheme_word || !after.starts_with('/') {
+            break;
+        }
+        scheme = if word.eq_ignore_ascii_case("http") {
+            "http"
+        } else {
+            "https"
+        };
+        rest = after.trim_start_matches('/');
+    }
+    format!("{scheme}://{}", rest.trim_end_matches('/'))
 }
 
 /// `Some(base + "/v1")` when `base` has no version-looking final segment, else `None`.
@@ -1518,6 +1885,7 @@ async fn prompt_validated_api_key(
         let entered = Input::<String>::with_theme(theme)
             .with_prompt(prompt)
             .allow_empty(true)
+            .report(false) // the key is visible while typed, never echoed into the scrollback
             .interact_text()?;
         let entered = entered.trim().to_string();
         let candidate = if entered.is_empty() {
@@ -1570,16 +1938,43 @@ async fn prompt_validated_api_key(
     }
 }
 
+/// One row of the provider picker: a padded label and the endpoint behind it.
+///
+/// The gateway row is the only coloured one, and green is doing a job rather than decorating — it
+/// is the row that needs nothing from anywhere else, so somebody scanning eight providers for
+/// "which of these can I use right now" has exactly one thing to look for.
+///
+/// Two ordering details, both invisible in the source and obvious on screen:
+///
+/// * **Pad, then colour.** `{:<20}` counts bytes, and a styled string carries escape codes, so
+///   colouring first silently eats a dozen columns of alignment on exactly one row.
+/// * **Colour the WHOLE row as one span.** `dialoguer` wraps the selected item in its own style, and
+///   a colour that ends mid-row puts a reset inside that wrapper — which would drop the highlight
+///   from everything after it and leave the active row looking half-painted. One span ends at the
+///   end of the line, where a reset costs nothing.
+fn preset_row(p: &ProviderPreset) -> String {
+    let label = format!("{:<20}", p.label);
+    if p.slug == "aizen" {
+        // Its own row shows the root this build actually talks to: `AIZEN_GATEWAY_URL` moves it,
+        // and a row printing the shipped default while the pairing lands somewhere else is a row
+        // that lies about where the key is coming from.
+        theme::ok(format!(
+            "{label} {}",
+            crate::llm::gateway::openai_base(None)
+        ))
+        .to_string()
+    } else {
+        format!("{label} {}", p.base)
+    }
+}
+
 /// The provider step: pick a preset (URL pre-filled, version suffix already correct) or type a custom
 /// endpoint. Returns the chosen preset, or `None` for "custom / I'll type it".
 fn prompt_provider(
     theme: &ColorfulTheme,
     current_base: Option<&str>,
 ) -> Result<Option<&'static ProviderPreset>> {
-    let mut items: Vec<String> = PROVIDER_PRESETS
-        .iter()
-        .map(|p| format!("{:<20} {}", p.label, p.base))
-        .collect();
+    let mut items: Vec<String> = PROVIDER_PRESETS.iter().map(preset_row).collect();
     // An endpoint that matches no preset belongs to this row, so show it ON the row. Otherwise a
     // gateway/proxy/self-hosted user sees every preset's URL printed but not their own, which reads
     // as "my endpoint isn't in this list" rather than "it's the row I'm already standing on".
@@ -1589,6 +1984,8 @@ fn prompt_provider(
             !PROVIDER_PRESETS
                 .iter()
                 .any(|p| p.base.trim_end_matches('/') == *b)
+                // A gateway reached through an override is still the gateway's own row, not custom.
+                && !crate::llm::gateway::is_gateway_base(b)
         })
         .map(str::to_string);
     items.push(format!(
@@ -1605,7 +2002,10 @@ fn prompt_provider(
             let b = b.trim_end_matches('/');
             PROVIDER_PRESETS
                 .iter()
-                .position(|p| p.base.trim_end_matches('/') == b)
+                .position(|p| {
+                    p.base.trim_end_matches('/') == b
+                        || (p.slug == "aizen" && crate::llm::gateway::is_gateway_base(b))
+                })
                 .unwrap_or(items.len() - 1)
         }
         // Nothing configured yet (a fresh install, or "＋ Add provider"): start on the first preset
@@ -1675,11 +2075,13 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             format!("Reasoning       · {effort_h}"),
             format!("Approval        · {approval_h}"),
             format!("Display         · icons {icons_h} · visuals {visuals_h}"),
+            "Vision          · exact endpoint/model declarations (no probe)".to_string(),
             "Show full config".to_string(),
             "Done".to_string(),
         ];
         let pick = match Select::with_theme(&theme)
             .with_prompt("Config — pick a section (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -1687,7 +2089,13 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             Some(i) => i,
             None => break,
         };
-        // Sections 0..=8 edit + save; 9 shows the panel; 10 (or Esc) exits.
+        // Vision saves only on its separate explicit persistence action, never the hub auto-save.
+        if pick == 9 {
+            if let Err(e) = config_edit_vision(&mut cfg) {
+                tui::note_line(&format!("vision setup: {e}"));
+            }
+            continue;
+        }
         let edited = match pick {
             0 => config_edit_providers(&mut cfg).await,
             1 => config_edit_model(&mut cfg).await,
@@ -1698,7 +2106,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             6 => config_edit_reasoning(&mut cfg),
             7 => config_edit_approval(&mut cfg),
             8 => config_edit_display(&mut cfg),
-            9 => {
+            10 => {
                 print_config(&cfg);
                 continue;
             }
@@ -1752,7 +2160,12 @@ async fn prompt_connection(
     allow_skip: bool,
 ) -> Result<Option<Connection>> {
     let preset = prompt_provider(theme, current_base)?;
-    let (base, mut models) = match preset {
+    let (mut base, mut models) = match preset {
+        // The gateway is not probed either, and for a different reason from Codex: its `/models`
+        // wants the key the pairing has not minted yet, so a check here can only report "needs a
+        // key" — and the root it would check is a guess anyway. The pairing answers with the roots
+        // the gateway itself states, and those replace this one below.
+        Some(p) if p.slug == "aizen" => (crate::llm::gateway::openai_base(None), Vec::new()),
         // Codex has nothing to probe: the backend is a Responses surface with no `GET /models`, and
         // a reachability check against it would report a perfectly working provider as broken.
         Some(p) if crate::llm::oauth_codex::is_codex_base_url(p.base) => {
@@ -1778,7 +2191,24 @@ async fn prompt_connection(
     .then_some(current_key)
     .flatten();
 
-    let key = if crate::llm::oauth_codex::is_codex_base_url(&base) {
+    let key = if crate::llm::gateway::is_gateway_base(&base) {
+        match prompt_gateway_pin(theme, http).await? {
+            Some(pinned) => {
+                // What the gateway states beats what the preset guessed — including for a staging
+                // override, where the row above showed one root and the pairing landed on another.
+                base = pinned.base;
+                if !pinned.models.is_empty() {
+                    models = pinned.models;
+                }
+                pinned.key
+            }
+            None if allow_skip => return Ok(None),
+            None => anyhow::bail!(
+                "the Aizen endpoint needs one of the two: sign in with `aizen account login` \
+                 (the plan needs no key), or pin this machine with `aizen login`"
+            ),
+        }
+    } else if crate::llm::oauth_codex::is_codex_base_url(&base) {
         match prompt_codex_login(theme).await? {
             Some(k) => k.to_string(),
             None if allow_skip => return Ok(None),
@@ -1848,6 +2278,260 @@ async fn probe_preset(
     }
 }
 
+/// Run the browser sign-in and turn it into a connection, or say why it did not finish.
+///
+/// Failing is **not** fatal here, unlike in `aizen account login`: the wizard is holding a screen of
+/// answers that a process exit would throw away, and there is another way through. Offered from two
+/// places — the door itself, and after a pairing the gateway refused — which is why it is a
+/// function rather than a branch.
+async fn sign_in_door(http: &reqwest::Client) -> Option<PinnedConnection> {
+    match crate::cli::account_cmd::browser_login(&crate::llm::account::web_url()).await {
+        Ok(session) => {
+            if let Err(e) = crate::llm::account::save(&session) {
+                line_warn(&format!(
+                    "signed in, but the session could not be saved: {e}"
+                ));
+                return None;
+            }
+            line_ok(&if session.email.is_empty() {
+                "signed in".to_string()
+            } else {
+                format!("signed in as {}", session.email)
+            });
+            Some(session_connection(http).await)
+        }
+        Err(e) => {
+            line_warn(&format!("sign-in did not finish: {e}"));
+            None
+        }
+    }
+}
+
+/// What a sign-in hands back: the gateway's own root, no key, and whatever it will list for the
+/// session token.
+///
+/// The empty key is the point and not an oversight — `ProviderProfile::normalized` allows it for
+/// this endpoint alone, and `resolve_endpoint` fills it from `session.json` at call time. A
+/// placeholder string would be worse than nothing: it would go out as a bearer.
+async fn session_connection(http: &reqwest::Client) -> PinnedConnection {
+    let base = crate::llm::gateway::openai_base(None);
+    let models = match crate::llm::account::v1_token() {
+        Some(token) => client::fetch_models_info(http, &base, &token)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    PinnedConnection {
+        key: String::new(),
+        base,
+        models,
+    }
+}
+
+/// What a finished pairing hands back to the connection step.
+struct PinnedConnection {
+    key: String,
+    /// The OpenAI-shaped root the gateway itself stated, which is the authority — not the preset row.
+    base: String,
+    models: Vec<client::ModelInfo>,
+}
+
+/// The Aizen endpoint has two doors, and this asks which — because since 2026-09-06 the first one
+/// leaves nothing on the machine at all.
+///
+/// **Signing in is the door to take.** The plan is sold by sign-in: the session token opens `/v1`
+/// by itself, so the profile this writes carries no key and there is no string anywhere to leak,
+/// rotate or paste. **Pinning** is the older door, kept for the machine that cannot open a browser;
+/// it still mints a key.
+///
+/// Neither is a key anybody can paste, which is why this step never prompts for one.
+///
+/// `gateway::pair` writes the key into `cli-config.json` the moment it arrives — before this
+/// function returns, before the wizard asks for a profile name — because the raw string crosses the
+/// wire exactly once and a cancel in between costs it for good. What comes back here is a copy for
+/// the wizard to file under whatever name the person picks; the caller points the pin file at that
+/// name afterwards, so `aizen gateway status` still knows where its key lives.
+///
+/// It pairs with `activate: false`. Activating is the wizard's own last step ("Use this provider
+/// now?"), and doing it twice from two places is how a config ends up with a root endpoint nobody
+/// chose.
+async fn prompt_gateway_pin(
+    theme: &ColorfulTheme,
+    http: &reqwest::Client,
+) -> Result<Option<PinnedConnection>> {
+    use crate::llm::gateway;
+
+    // Signed in already — often from `aizen account login` in the terminal next door, since both
+    // sides read the same `session.json`. Nothing more is needed: say so and take the free door.
+    if crate::llm::account::signed_in() {
+        line_ok("already signed in — the plan needs no key on this machine");
+        if !yn(theme, "Pin this machine as well (mints a key)?", false)? {
+            return Ok(Some(session_connection(http).await));
+        }
+    } else if yn(
+        theme,
+        "Sign in with your browser? (recommended — no key is stored on this machine)",
+        true,
+    )? {
+        if let Some(conn) = sign_in_door(http).await {
+            return Ok(Some(conn));
+        }
+    }
+
+    // Already pinned: re-pairing works, but it mints a SECOND key against the ten-key ceiling and
+    // the old one keeps working until it is unpinned in the dashboard. Offer the one on hand first.
+    if let Some(pin) = gateway::load_pin() {
+        if let Some((_, key)) = gateway::key_for(None) {
+            line_ok(&format!(
+                "already pinned to {} (key {}…)",
+                pin.gateway, pin.key_prefix
+            ));
+            if !yn(theme, "Pin again (mints a second key)?", false)? {
+                return Ok(Some(PinnedConnection {
+                    key,
+                    base: pin.openai_base_url,
+                    models: Vec::new(),
+                }));
+            }
+        }
+    }
+
+    let opts = gateway::PairOpts {
+        name: None,
+        kind: "cli".into(),
+        profile: gateway::DEFAULT_PROFILE.into(),
+        activate: false,
+    };
+    let adopted = match gateway::pair(&opts, |start| {
+        // The same screen `aizen login` draws, warning included — one copy, so the sentence that
+        // stands between a user and a phished pin cannot go missing from one of the two doors.
+        crate::ui::gateway_ui::show_code(start);
+        crate::llm::oauth_codex::open_browser(start.link());
+    })
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            line_bad(&format!("pairing failed: {e}"));
+            // A refused pairing is not a refused endpoint. The plan needs no key at all, and
+            // several of the gateway's own refusals here say so in as many words — the 409 for a
+            // legacy key it cannot read back names the browser door itself. Ending the wizard on
+            // this would send somebody to fix an account that has nothing wrong with it.
+            if crate::llm::account::signed_in() {
+                line_ok("already signed in — using the account session, which needs no key");
+                return Ok(Some(session_connection(http).await));
+            }
+            if yn(
+                theme,
+                "Sign in with your browser instead? (no key needed)",
+                true,
+            )? {
+                if let Some(conn) = sign_in_door(http).await {
+                    return Ok(Some(conn));
+                }
+            }
+            return Ok(None);
+        }
+    };
+
+    // Not "key <prefix>…": since 2026-09-06 the prefix belongs to the PLAN KEY and this machine
+    // carries a credential of its own. The old line also invented a bare `ak_` when the gateway
+    // named no prefix, which showed a key head that was not a key head at all.
+    line_ok(&match (
+        adopted.pin.device_id.as_str(),
+        adopted.pin.key_prefix.as_str(),
+    ) {
+        ("", "") => "pinned".to_string(),
+        (device, "") => format!("pinned — device {device}"),
+        ("", plan) => format!("pinned — plan {plan}…"),
+        (device, plan) => format!("pinned — device {device}, plan {plan}…"),
+    });
+    if let Some(w) = &adopted.warning {
+        line_warn(w);
+    }
+
+    let key = gateway::key_for(Some(&adopted.pin.profile))
+        .map(|(_, k)| k)
+        // The pairing just wrote it, so this is unreachable in practice; bailing beats carrying an
+        // empty key into a profile that would then fail at the first turn with no explanation.
+        .ok_or_else(|| anyhow::anyhow!("the pairing saved no key — run `aizen login` again"))?;
+
+    // Now that there IS a key, ask the endpoint what it serves — the same list every other provider
+    // gets its model picker from, rather than a curated guess.
+    let models = match spin_while(
+        "asking the gateway what it serves",
+        client::check_endpoint(http, &adopted.pin.openai_base_url, Some(&key)),
+    )
+    .await
+    {
+        client::EndpointCheck::Ok(infos) => infos,
+        // A gateway that will not list is still usable: the pairing named a default model, and one
+        // row is a better picker than an empty prompt.
+        _ => adopted
+            .pin
+            .model
+            .is_empty()
+            .then(Vec::new)
+            .unwrap_or_else(|| {
+                vec![client::ModelInfo {
+                    id: adopted.pin.model.clone(),
+                    context_length: None,
+                    is_free: false,
+                }]
+            }),
+    };
+
+    Ok(Some(PinnedConnection {
+        key,
+        base: adopted.pin.openai_base_url,
+        models,
+    }))
+}
+
+/// The `cli-config.json` profile a gateway pin lives in: the one the pin file names, or the default
+/// when there is no pin file to read. That fallback is not paranoia — writing the pin file is
+/// best-effort by design and writing the key is not, so "no pin file" still has to land on the
+/// profile `adopt` used.
+fn pin_profile_name(recorded: Option<&str>) -> String {
+    recorded
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(crate::llm::gateway::DEFAULT_PROFILE)
+        .to_string()
+}
+
+/// Settle a connection that came from a gateway pairing, and say which profile it belongs in.
+///
+/// `gateway::adopt` loads, writes and saves `cli-config.json` the instant the key arrives, because
+/// the raw string crosses the wire exactly once. Every screen that called it is meanwhile holding a
+/// copy of the config from BEFORE that write, and will save that copy back when the section ends.
+/// Two things follow, and this handles both:
+///
+/// * **The name is not a question.** The pin file points at the row `adopt` made, so asking has
+///   exactly one right answer, and any other one splits the key from the pin: the config still
+///   works, and `aizen gateway status` reports on a profile the same save just dropped.
+/// * **The stale copy absorbs that row first**, or the save deletes the only place the key was ever
+///   written, and no command can ask the gateway for it a second time.
+///
+/// `None` for a connection that did not come from the gateway — those still name themselves.
+fn settle_gateway_pin(
+    cfg: &mut cli_config::CliConfig,
+    conn: &Connection,
+) -> Result<Option<String>> {
+    if !crate::llm::gateway::is_gateway_base(&conn.base) {
+        return Ok(None);
+    }
+    let name = pin_profile_name(
+        crate::llm::gateway::load_pin()
+            .as_ref()
+            .map(|p| p.profile.as_str()),
+    );
+    if let Some(written) = cli_config::load().provider(&name).cloned() {
+        cfg.upsert_provider(written)?;
+    }
+    Ok(Some(name))
+}
+
 /// Codex's credential is an OAuth token in `~/.aizen/provider-tokens/codex.json`, not a key anyone
 /// can paste — so this step signs in instead of prompting. Returns the placeholder that goes into the
 /// config (`ProviderProfile::normalized` and the endpoint resolver both recognise it), or `None` to
@@ -1910,6 +2594,7 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
         items.push("Back".to_string());
         let pick = match Select::with_theme(&theme)
             .with_prompt("Providers (Esc when done)")
+            .report(false)
             .items(&items)
             .default(items.len().saturating_sub(2))
             .interact_opt()?
@@ -1921,13 +2606,28 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
             return Ok(());
         }
         if pick == list.len() {
-            // Connection FIRST, name second: the preset knows what the provider is called, so the
-            // name prompt can default to it instead of asking the user to invent one.
+            // Connection FIRST, name second: the preset knows what the provider is called, so
+            // the name prompt can default to it instead of asking the user to invent one — and a
+            // gateway pairing knows it outright, so that prompt does not run at all.
             let Some(conn) = prompt_connection(&theme, &http, None, None, true).await? else {
                 continue;
             };
-            let Some(name) = prompt_provider_name(&theme, cfg, &conn, None)? else {
-                continue;
+            // A gateway pin names itself. The pairing wrote the key into its own profile, on
+            // disk, before this screen got control back — so there is nothing here to decide: the
+            // one name that keeps the key and the pin in the same row is the name already written,
+            // and every other answer files a second copy of one key under a name the person had to
+            // invent for a provider the project already knows the name of.
+            let name = match settle_gateway_pin(cfg, &conn)? {
+                Some(pinned) => {
+                    line_ok(&format!(
+                        "saved as `{pinned}` — the profile the pin lives in"
+                    ));
+                    pinned
+                }
+                None => match prompt_provider_name(&theme, cfg, &conn, None)? {
+                    Some(name) => name,
+                    None => continue,
+                },
             };
             let infos = fill_models(&http, &conn).await;
             let sample = conn.preset.map(|p| p.sample_model);
@@ -1947,6 +2647,7 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
         let existing = &list[pick];
         let action = Select::with_theme(&theme)
             .with_prompt(format!("{} (Esc cancels)", existing.name))
+            .report(false)
             .items(&["use now", "edit endpoint + key + model", "rename", "remove"])
             .default(0)
             .interact_opt()?;
@@ -1960,6 +2661,11 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
                 else {
                     continue;
                 };
+                // If that step ran a pairing, the key is already on disk under the pin's own
+                // profile. Take that row into this copy of the config now: a cancel below would
+                // otherwise let this screen's save delete the only place a string that crosses the
+                // wire exactly once was ever written.
+                let pinned = settle_gateway_pin(cfg, &conn)?;
                 let infos = fill_models(&http, &conn).await;
                 let Some(model) = prompt_required_provider_model(&theme, &infos, Some(&old.model))?
                 else {
@@ -1976,6 +2682,15 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
                 cfg.upsert_provider(replacement)?;
                 if active {
                     cfg.activate_provider(&old.name)?;
+                }
+                // The key now lives under the name being edited too, so move the pin here and drop
+                // the row the pairing made. Two rows holding one key is one row too many, and the
+                // one `gateway status` would read is the one nobody chose.
+                if let Some(pinned) = pinned {
+                    if !pinned.eq_ignore_ascii_case(&old.name) {
+                        let _ = cfg.remove_provider(&pinned);
+                    }
+                    crate::llm::gateway::point_pin_at(&old.name);
                 }
             }
             Some(2) => {
@@ -2002,11 +2717,55 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
                         continue;
                     }
                 }
-                cfg.remove_provider(&existing.name)?;
+                // Same as `config provider remove`: an Aizen row is a credential, not a
+                // preference. `leave_in` works on the config in hand rather than reloading, so the
+                // other edits made in this screen are not rolled back.
+                if crate::llm::gateway::is_aizen_profile(cfg, &existing.name) {
+                    let name = existing.name.clone();
+                    let unpaired = crate::llm::gateway::unpair(Some(&name)).await;
+                    let mut left = crate::llm::gateway::leave_in(cfg, &name);
+                    left.unpaired = Some(unpaired);
+                    for line in leaving_lines(&name, &left) {
+                        line_ok(&line);
+                    }
+                } else {
+                    cfg.remove_provider(&existing.name)?;
+                }
             }
             _ => {}
         }
     }
+}
+
+/// What to say when deleting an Aizen row logged somebody out. One copy, because the two delete
+/// paths must not drift into telling two different stories about the same teardown.
+///
+/// The "nothing was revoked" line is never optional: a local delete cannot revoke, and somebody who
+/// wanted the credential dead everywhere would otherwise stop here believing it is.
+fn leaving_lines(name: &str, left: &crate::llm::gateway::Left) -> Vec<String> {
+    let mut out = vec![format!(
+        "{} logged out — the '{name}' profile is gone from this machine",
+        crate::ui::theme::ok("✓")
+    )];
+    out.extend(
+        crate::ui::gateway_ui::unpair_lines(left.unpaired.as_ref())
+            .into_iter()
+            .map(|l| format!("  {}", l.trim_start())),
+    );
+    if left.key_profile.is_some() {
+        out.push("  Its gateway pin and the local credential went with it.".to_string());
+    }
+    if left.signed_out {
+        out.push(
+            "  The account session went too — that row's credential WAS the session, so"
+                .to_string(),
+        );
+        out.push("  leaving it behind would keep this machine able to spend.".to_string());
+        out.push(
+            "  The token is not revoked: it stays valid elsewhere until it expires.".to_string(),
+        );
+    }
+    out
 }
 
 /// The models to offer for a connection. The key check usually returned the list already; when it
@@ -2017,7 +2776,16 @@ async fn fill_models(http: &reqwest::Client, conn: &Connection) -> Vec<client::M
     if !conn.models.is_empty() {
         return conn.models.clone();
     }
-    client::fetch_models_info(http, &conn.base, &conn.key)
+    // A blank key is a real profile shape now — the Aizen plan keeps its credential in
+    // `session.json`. Asking with the blank one would 401 and report a working endpoint as empty.
+    let key = match conn.key.trim().is_empty() {
+        true => match crate::llm::account::v1_token() {
+            Some(t) => t,
+            None => return Vec::new(),
+        },
+        false => conn.key.clone(),
+    };
+    client::fetch_models_info(http, &conn.base, &key)
         .await
         .unwrap_or_default()
 }
@@ -2119,6 +2887,7 @@ fn subagent_hint(cfg: &cli_config::CliConfig) -> String {
         usize::from(r.summarizer.is_some())
             + usize::from(r.oracle.is_some())
             + usize::from(r.apply.is_some())
+            + r.pantheon.as_ref().map_or(0, |m| m.len())
     });
     let mut s = model;
     if mapped > 0 {
@@ -2140,7 +2909,7 @@ const ROLE_ROWS: [(&str, &str, &str); 4] = [
     (
         "summarizer",
         "Summarizer",
-        "compaction + handoff summaries (a cheap-fast model fits)",
+        "compaction summaries (a cheap-fast model fits)",
     ),
     (
         "oracle",
@@ -2154,15 +2923,19 @@ const ROLE_ROWS: [(&str, &str, &str); 4] = [
     ),
 ];
 
-fn role_slot<'a>(
-    roles: &'a mut cli_config::RolesConfig,
+/// Store one role row. The four routable slots are fields; any other name is a Pantheon role
+/// and goes into the map under its canonical name (`None` unpins it).
+fn role_set(
+    roles: &mut cli_config::RolesConfig,
     role: &str,
-) -> &'a mut Option<cli_config::RoleModelConfig> {
+    value: Option<cli_config::RoleModelConfig>,
+) {
     match role {
-        "summarizer" => &mut roles.summarizer,
-        "oracle" => &mut roles.oracle,
-        "apply" => &mut roles.apply,
-        _ => &mut roles.subagent_default,
+        "summarizer" => roles.summarizer = value,
+        "oracle" => roles.oracle = value,
+        "apply" => roles.apply = value,
+        "subagent_default" => roles.subagent_default = value,
+        other => roles.set_pantheon(other, value),
     }
 }
 
@@ -2175,7 +2948,71 @@ fn role_get<'a>(
         "summarizer" => r.summarizer.as_ref(),
         "oracle" => r.oracle.as_ref(),
         "apply" => r.apply.as_ref(),
-        _ => r.subagent_default.as_ref(),
+        "subagent_default" => r.subagent_default.as_ref(),
+        other => r.pantheon_entry(other),
+    }
+}
+
+/// One menu row's value for a role: what is pinned, or what it inherits.
+fn role_row_summary(rc: Option<&cli_config::RoleModelConfig>, inherits: &str) -> String {
+    let Some(rc) = rc else {
+        return inherits.to_string();
+    };
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(p) = rc.provider.as_deref() {
+        bits.push(format!("provider {p}"));
+    }
+    if let Some(m) = rc.model.as_deref() {
+        bits.push(m.to_string());
+    }
+    if rc.base_url.is_some() {
+        bits.push("own url".into());
+    }
+    if rc.api_key_ref.is_some() {
+        bits.push("own key".into());
+    }
+    if bits.is_empty() {
+        "not set".into()
+    } else {
+        bits.join(" · ")
+    }
+}
+
+/// The seven built-in sub-agent roles, each pinnable to its own provider/model above the
+/// shared sub-agent default: a reviewer on a strong model, a searcher on a cheap one.
+async fn config_edit_pantheon(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let roles = crate::agent::roles::ROLES;
+    let label = |p: &crate::agent::roles::RoleProfile| {
+        format!("{} ({})", p.name, p.aliases.first().copied().unwrap_or(""))
+    };
+    loop {
+        let mut items: Vec<String> = roles
+            .iter()
+            .map(|p| {
+                format!(
+                    "{:<22}· {}",
+                    label(p),
+                    role_row_summary(role_get(cfg, p.name), "sub-agent default")
+                )
+            })
+            .collect();
+        items.push("Back".to_string());
+        let pick = match Select::with_theme(&theme)
+            .with_prompt("Pantheon roles — each above the sub-agent default (Esc when done)")
+            .report(false)
+            .items(&items)
+            .default(0)
+            .interact_opt()?
+        {
+            Some(i) if i < roles.len() => i,
+            _ => return Ok(()),
+        };
+        let p = &roles[pick];
+        // The brief's first clause says what the role does; the rest is its tool scope.
+        let what = p.brief.split(". ").next().unwrap_or(p.brief);
+        tui::emit_line(&format!("  {}", style(what).dim()));
+        config_edit_one_role(cfg, p.name, &label(p)).await?;
     }
 }
 
@@ -2191,31 +3028,20 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
         let mut items: Vec<String> = ROLE_ROWS
             .iter()
             .map(|(key, label, _)| {
-                let cur = role_get(cfg, key)
-                    .map(|rc| {
-                        let mut bits: Vec<String> = Vec::new();
-                        if let Some(p) = rc.provider.as_deref() {
-                            bits.push(format!("provider {p}"));
-                        }
-                        if let Some(m) = rc.model.as_deref() {
-                            bits.push(m.to_string());
-                        }
-                        if rc.base_url.is_some() {
-                            bits.push("own url".into());
-                        }
-                        if rc.api_key_ref.is_some() {
-                            bits.push("own key".into());
-                        }
-                        if bits.is_empty() {
-                            "not set".into()
-                        } else {
-                            bits.join(" · ")
-                        }
-                    })
-                    .unwrap_or_else(|| "main endpoint".to_string());
+                let cur = role_row_summary(role_get(cfg, key), "main endpoint");
                 format!("{label:<22}· {cur}")
             })
             .collect();
+        let pinned = cfg
+            .roles
+            .as_ref()
+            .and_then(|r| r.pantheon.as_ref())
+            .map_or(0, |m| m.len());
+        items.push(format!(
+            "{:<22}· {pinned} of {} pinned",
+            "Pantheon roles",
+            crate::agent::roles::ROLES.len()
+        ));
         items.push(format!(
             "{:<22}· {} advanced entr(ies)",
             "Advanced overrides",
@@ -2230,6 +3056,7 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
 
         let pick = match Select::with_theme(&theme)
             .with_prompt("Sub-agents & roles (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -2243,11 +3070,12 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
                 tui::emit_line(&format!("  {}", style(what).dim()));
                 config_edit_one_role(cfg, key, label).await?;
             }
-            i if i == ROLE_ROWS.len() => {
+            i if i == ROLE_ROWS.len() => config_edit_pantheon(cfg).await?,
+            i if i == ROLE_ROWS.len() + 1 => {
                 line_warn("advanced model→endpoint overrides can supersede provider-based routing");
                 config_edit_model_registry(cfg).await?
             }
-            i if i == ROLE_ROWS.len() + 1 => config_edit_agent_pins(cfg).await?,
+            i if i == ROLE_ROWS.len() + 2 => config_edit_agent_pins(cfg).await?,
             _ => return Ok(()),
         }
     }
@@ -2269,18 +3097,24 @@ async fn prompt_probed_base_url(
     current: Option<&str>,
     inherit_label: &str,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
+    line_dim(&format!("empty = {inherit_label} · `-` clears"));
     let mut input = Input::<String>::with_theme(theme)
-        .with_prompt(format!("Base URL (empty = {inherit_label}, `-` clears)"))
+        .with_prompt("Base URL")
         .allow_empty(true);
     if let Some(c) = current {
-        input = input.default(c.to_string());
+        line_dim(&format!("Enter keeps {c}"));
+        input = input.default(c.to_string()).show_default(false);
     }
     let raw = input.interact_text()?;
     let raw = raw.trim();
     if raw.is_empty() || raw == "-" {
         return Ok(None);
     }
-    let url = raw.trim_end_matches('/').to_string();
+    let typed = raw.trim_end_matches('/').to_string();
+    let url = normalize_scheme(&typed);
+    if url != typed {
+        line_warn(&format!("read as {url}"));
+    }
     let check = spin_while(
         &format!("checking {url}"),
         client::check_endpoint(http, &url, None),
@@ -2369,6 +3203,7 @@ fn prompt_api_key_ref(theme: &ColorfulTheme, current: Option<&str>) -> Result<Op
             let key: String = Input::with_theme(theme)
                 .with_prompt("API key")
                 .allow_empty(true)
+                .report(false)
                 .interact_text()?;
             let key = key.trim();
             Ok((!key.is_empty()).then(|| key.to_string()))
@@ -2473,12 +3308,15 @@ async fn config_edit_one_role(
         None
     };
     let mut roles = cfg.roles.take().unwrap_or_default();
-    let slot = role_slot(&mut roles, role);
-    *slot = (provider.is_some() || model.is_some()).then_some(cli_config::RoleModelConfig {
-        provider,
-        model,
-        ..Default::default()
-    });
+    role_set(
+        &mut roles,
+        role,
+        (provider.is_some() || model.is_some()).then_some(cli_config::RoleModelConfig {
+            provider,
+            model,
+            ..Default::default()
+        }),
+    );
     cfg.roles = roles.has_any().then_some(roles);
     Ok(())
 }
@@ -2512,6 +3350,7 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
         items.push("Back".to_string());
         let pick = match Select::with_theme(&theme)
             .with_prompt("Model → endpoint (Esc when done)")
+            .report(false)
             .items(&items)
             .default(items.len().saturating_sub(2))
             .interact_opt()?
@@ -2526,6 +3365,7 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
             let existing = &list[pick];
             let action = match Select::with_theme(&theme)
                 .with_prompt(format!("{} (Esc cancels)", existing.model))
+                .report(false)
                 .items(&["edit", "remove"])
                 .default(0)
                 .interact_opt()?
@@ -2569,6 +3409,7 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
                 model: model.clone(),
                 base_url,
                 api_key_ref,
+                max_concurrent: None,
             });
             line_ok(&format!("mapped {model}"));
         } else {
@@ -2613,6 +3454,7 @@ async fn config_edit_agent_pins(cfg: &mut cli_config::CliConfig) -> Result<()> {
             .collect();
         let Some(pick) = Select::with_theme(&theme)
             .with_prompt("Specialist agent (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -2842,6 +3684,7 @@ where
         let entered = Input::<String>::with_theme(theme)
             .with_prompt(prompt)
             .allow_empty(true)
+            .report(false) // the key is visible while typed, never echoed into the scrollback
             .interact_text()?;
         let entered = entered.trim().to_string();
         if entered.is_empty() {
@@ -3325,6 +4168,10 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     .ok_or_else(|| anyhow::anyhow!("a connection is required"))?;
     cfg.base_url = Some(conn.base.clone());
     cfg.api_key = Some(conn.key.clone());
+    // Same reason as the provider editor: a pairing inside that step already wrote the key to disk
+    // under its own profile, and this `cfg` was read before it. Absorb the row before the save at
+    // the end of setup writes over the file it lives in.
+    settle_gateway_pin(cfg, &conn)?;
     let infos = conn.models;
     let preset = conn.preset;
 
@@ -3420,6 +4267,63 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
             .color256(crate::ui::theme::FAINT)
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod vision_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_declaration_choices_keep_cancel_distinct_from_unknown() {
+        assert_eq!(vision_declaration_choice(Some(0)), Some(Some(true)));
+        assert_eq!(vision_declaration_choice(Some(1)), Some(Some(false)));
+        assert_eq!(vision_declaration_choice(Some(2)), Some(None));
+        assert_eq!(vision_declaration_choice(Some(3)), None);
+        assert_eq!(vision_declaration_choice(None), None);
+        assert_eq!(vision_status(None), "Unknown");
+        assert_eq!(vision_status(Some(true)), "Supported");
+        assert_eq!(vision_status(Some(false)), "Unsupported");
+    }
+
+    #[test]
+    fn vision_destination_display_never_exposes_url_credentials_or_controls() {
+        let label = vision_destination_label(
+            "https://user:secret@example.test:8443/v1?api_key=secret#token",
+            "alias\n\u{1b}[31m",
+        );
+        assert!(!label.contains("secret"));
+        assert!(!label.contains("user"));
+        assert!(!label.contains("token"));
+        assert!(!label.contains('?'));
+        assert!(!label.chars().any(char::is_control));
+        assert!(label.contains("example.test:8443/v1"));
+    }
+
+    #[test]
+    fn codex_setup_uses_fixed_wire_destination_and_effort_stripped_model() {
+        let (endpoint, model) = crate::llm::media::effective_image_destination(
+            crate::llm::oauth_codex::CODEX_BASE_URL,
+            "gpt-5.4-mini-high",
+        );
+        assert_eq!(endpoint, crate::llm::oauth_codex::CODEX_RESPONSES_URL);
+        let (expected_model, _) =
+            crate::llm::codex_models::strip_effort_suffix("gpt-5.4-mini-high");
+        assert_eq!(model, expected_model);
+        let mut cfg = cli_config::CliConfig::default();
+        cli_config::set_vision_support_in(&mut cfg, &endpoint, &model, Some(true)).unwrap();
+        assert_eq!(
+            cli_config::vision_support_in(&cfg, &endpoint, &model),
+            Some(true)
+        );
+        assert_eq!(
+            cli_config::vision_support_in(
+                &cfg,
+                crate::llm::oauth_codex::CODEX_BASE_URL,
+                "gpt-5.4-mini-high"
+            ),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

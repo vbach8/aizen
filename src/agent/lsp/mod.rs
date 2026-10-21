@@ -21,7 +21,6 @@
 //!   range (Serena-style), so the model never dumps the file or thrash-matches `old_string`.
 
 pub mod discovery;
-pub mod jobobject;
 pub mod server;
 pub mod tools;
 pub mod uri;
@@ -68,6 +67,20 @@ pub struct SymbolEditPlan {
 /// The process-global LSP manager. One per CLI process; servers are spawned lazily and reused.
 pub static LSP: Lazy<LspManager> = Lazy::new(LspManager::new);
 
+/// The language [`discovery::detect`] would serve for the process cwd — i.e. what the lazy server
+/// WILL be once the first symbol query lands. Cached for the process lifetime: the sidebar asks on
+/// every status refresh, and the cwd does not move under a running session (the same assumption the
+/// renderer's `sidebar_cwd` makes).
+fn detected_workspace_lang() -> Option<&'static str> {
+    static DETECTED: Lazy<Option<&'static str>> = Lazy::new(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|d| discovery::detect(&d))
+            .map(|(spec, _)| spec.lang)
+    });
+    *DETECTED
+}
+
 /// A crashed server is respawned at most this many times per session before being marked disabled
 /// (never a tight restart loop — plan §2 decision 5). `/lsp restart` resets the counters.
 const MAX_RESPAWNS: u32 = 2;
@@ -76,6 +89,10 @@ const MAX_RESPAWNS: u32 = 2;
 pub struct LspStatus {
     pub enabled: bool,
     pub servers: Vec<ServerStatus>,
+    /// The language [`discovery::detect`] resolves for the process cwd — what the lazily-started
+    /// server WILL be, so status can name it before the first symbol query starts anything.
+    /// `None` = no supported project here, so no server will ever start.
+    pub detected: Option<&'static str>,
 }
 
 pub struct ServerStatus {
@@ -83,6 +100,19 @@ pub struct ServerStatus {
     pub root: PathBuf,
     pub indexed: bool,
     pub alive: bool,
+}
+
+impl ServerStatus {
+    /// One word for where the server is in its life: dead / ready / indexing….
+    fn state(&self) -> &'static str {
+        if !self.alive {
+            "dead"
+        } else if self.indexed {
+            "ready"
+        } else {
+            "indexing…"
+        }
+    }
 }
 
 impl LspStatus {
@@ -93,26 +123,46 @@ impl LspStatus {
                 .to_string();
         }
         if self.servers.is_empty() {
-            return "LSP: on — no server running yet (starts lazily on the first symbol query)."
-                .to_string();
+            return match self.detected {
+                Some(lang) => format!(
+                    "LSP: on — this repo looks like {lang}; the server starts lazily on the first \
+                     symbol query."
+                ),
+                None => "LSP: on — no rust/python/typescript project detected here, so no server \
+                         will start."
+                    .to_string(),
+            };
         }
         let mut s = String::from("LSP: on\n");
         for sv in &self.servers {
-            let state = if !sv.alive {
-                "dead"
-            } else if sv.indexed {
-                "ready"
-            } else {
-                "indexing…"
-            };
             s.push_str(&format!(
                 "  {} [{}]  {}\n",
                 sv.lang,
-                state,
+                sv.state(),
                 sv.root.display()
             ));
         }
         s.trim_end().to_string()
+    }
+
+    /// One-line chip for the retained sidebar: "off", the detected language while lazy ("rust
+    /// idle" — which server WOULD serve this repo, before any symbol query has started it), or the
+    /// live servers as `lang state` pairs.
+    pub fn chip(&self) -> String {
+        if !self.enabled {
+            return "off".to_string();
+        }
+        if self.servers.is_empty() {
+            return match self.detected {
+                Some(lang) => format!("{lang} idle"),
+                None => "no project".to_string(),
+            };
+        }
+        self.servers
+            .iter()
+            .map(|sv| format!("{} {}", sv.lang, sv.state()))
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 }
 
@@ -133,7 +183,39 @@ pub struct LspManager {
     /// lines), refreshed on every fetch. Post-edit feedback reports `now − baseline` only, so a
     /// pre-existing warning wall never spams every edit result.
     diag_baseline: Mutex<HashMap<PathBuf, std::collections::HashSet<String>>>,
+    /// Post-edit diagnostics jobs still running when their edit result went out. The loop drains
+    /// them into the next tool result or the done gate — see [`take_ready_feedback`].
+    pending_folds: Mutex<Vec<PendingFold>>,
+    /// Startup settlement charges for children THIS manager admitted. Shares the process-global
+    /// instance in production (LSP and MCP stdio pool one admission gate, so they must share one
+    /// classification); a test may hold a private instance to exercise the transition in isolation.
+    startup_unsettled: Arc<crate::agent::process::UnsettledOwnership>,
 }
+
+/// One post-edit diagnostics job that outran the inline wait.
+struct PendingFold {
+    file: PathBuf,
+    /// The server whose workspace snapshot the caller scan reads; `None` in tests.
+    server: Option<Arc<LspServer>>,
+    rx: std::sync::mpsc::Receiver<Option<Vec<DiagItem>>>,
+    started: std::time::Instant,
+}
+
+/// A fold that finished after its edit result had gone out.
+pub struct ReadyFold {
+    pub text: String,
+    /// At least one NEW error (the done gate turns such a fold into a demand).
+    pub has_error: bool,
+}
+
+/// How long an edit waits for its diagnostics before handing the job to the loop. Long enough for
+/// a warm TypeScript/Go server to answer in the same result, short enough that rust-analyzer's
+/// multi-second re-check never holds an edit hostage (it used to block up to 3.5 s per edit).
+const EDIT_FEEDBACK_INLINE_MS: u64 = 300;
+/// A parked job older than this is dropped unread — its file has moved on.
+const PENDING_FOLD_MAX_AGE_SECS: u64 = 60;
+/// Caller files reported per fold, three diagnostics each.
+const CALLER_FILES_MAX: usize = 3;
 
 impl LspManager {
     fn new() -> Self {
@@ -145,7 +227,25 @@ impl LspManager {
             servers: Mutex::new(HashMap::new()),
             restarts: Mutex::new(HashMap::new()),
             diag_baseline: Mutex::new(HashMap::new()),
+            pending_folds: Mutex::new(Vec::new()),
+            startup_unsettled: Arc::clone(&crate::agent::mcp::LOCAL_SIDECAR_UNSETTLED),
         }
+    }
+
+    /// A manager with its own settlement state, for tests that must exercise the charged→proven
+    /// transition without perturbing the process-global charges other tests share.
+    #[cfg(test)]
+    fn new_isolated() -> Self {
+        let mut manager = Self::new();
+        manager.startup_unsettled = Arc::new(crate::agent::process::UnsettledOwnership::new());
+        manager
+    }
+
+    /// Parent turn boundary must check this before new work, including lexical LSP fallbacks.
+    /// Checking never clears it by itself: a startup that handed a child to its monitor clears the
+    /// charge only when that monitor PROVES the tree exited (see `UnsettledOwnership`).
+    pub(crate) fn check_startup_effects(&self) -> Result<()> {
+        crate::agent::mcp::startup_effects_check(&self.startup_unsettled)
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -174,6 +274,7 @@ impl LspManager {
     /// Turn LSP on for this session: build the dedicated runtime if needed. Idempotent. Does NOT
     /// spawn any server yet — servers start lazily on first use.
     pub fn enable(&self) -> Result<()> {
+        self.check_startup_effects()?;
         let mut guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let rt = Builder::new_multi_thread()
@@ -247,6 +348,7 @@ impl LspManager {
         LspStatus {
             enabled: self.is_enabled(),
             servers,
+            detected: detected_workspace_lang(),
         }
     }
 
@@ -426,12 +528,15 @@ impl LspManager {
         }
         let handle = self.handle().ok()?;
         let f = file.clone();
+        let srv = Arc::clone(&server);
         let (tx, rx) = std::sync::mpsc::channel();
         handle.spawn(async move {
-            // Hard 3s wall-clock cap around re-open + re-analysis + (bounded) settle.
+            // The job runs on regardless of whether the edit waits for it: a generous wall-clock
+            // cap around re-open + re-analysis + (bounded) settle, since only the inline wait below
+            // is on the edit's critical path.
             let out = tokio::time::timeout(
-                Duration::from_secs(3),
-                server.diagnostics_bounded(&f, Duration::from_millis(1500)),
+                Duration::from_secs(20),
+                srv.diagnostics_bounded(&f, Duration::from_millis(4_000)),
             )
             .await;
             let _ = tx.send(match out {
@@ -439,31 +544,157 @@ impl LspManager {
                 _ => None,
             });
         });
-        let items = rx
-            .recv_timeout(Duration::from_millis(3_500))
-            .ok()
-            .flatten()?;
+        match rx.recv_timeout(Duration::from_millis(EDIT_FEEDBACK_INLINE_MS)) {
+            Ok(Some(items)) => Some(self.fold_items(&file, &items).0),
+            Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Still analysing: park it. The loop folds the result into the next tool result,
+                // or the done gate — whichever comes first. The edit returns now.
+                self.pending_folds
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(PendingFold {
+                        file,
+                        server: Some(server),
+                        rx,
+                        started: std::time::Instant::now(),
+                    });
+                None
+            }
+        }
+    }
 
+    /// `now − baseline` for one file, baseline refreshed: the fold text and whether it carries a
+    /// NEW error. The first fold of a file has no baseline and reports only its errors, labelled
+    /// `current` — a pre-existing warning wall must not spam every edit.
+    fn fold_items(&self, file: &Path, items: &[DiagItem]) -> (String, bool) {
         let fingerprints: std::collections::HashSet<String> =
             items.iter().map(diag_fingerprint).collect();
-        let had_baseline;
-        let new_items: Vec<&DiagItem> = {
-            let mut base = self.diag_baseline.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = base.get(&file);
-            had_baseline = prev.is_some();
-            let fresh: Vec<&DiagItem> = match prev {
+        let mut base = self.diag_baseline.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = base.get(file);
+        let had_baseline = prev.is_some();
+        let fresh: Vec<&DiagItem> = match prev {
+            Some(prev) => items
+                .iter()
+                .filter(|d| !prev.contains(&diag_fingerprint(d)))
+                .collect(),
+            None => items.iter().filter(|d| d.severity == "error").collect(),
+        };
+        let has_error = fresh.iter().any(|d| d.severity == "error");
+        let text = format_edit_feedback(&fresh, had_baseline);
+        base.insert(file.to_path_buf(), fingerprints);
+        (text, has_error)
+    }
+
+    /// Drain the post-edit jobs that have finished since the last call. Each becomes one fold
+    /// naming its file, plus up to [`CALLER_FILES_MAX`] other files whose NEW errors the server
+    /// published after the edit (a caller the edit broke). Jobs still running stay parked unless
+    /// older than [`PENDING_FOLD_MAX_AGE_SECS`]; a job whose task died is dropped.
+    pub fn take_ready_feedback(&self) -> Vec<ReadyFold> {
+        let pending: Vec<PendingFold> =
+            std::mem::take(&mut *self.pending_folds.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ready = Vec::new();
+        let mut keep = Vec::new();
+        for p in pending {
+            match p.rx.try_recv() {
+                Ok(Some(items)) => {
+                    let (text, mut has_error) = self.fold_items(&p.file, &items);
+                    let name = p
+                        .file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.file.display().to_string());
+                    let mut text = text.replacen("[lsp] ", &format!("[lsp] {name}: "), 1);
+                    if let Some(server) = &p.server {
+                        for (line, err) in self.caller_folds(server, &p.file) {
+                            text.push('\n');
+                            text.push_str(&line);
+                            has_error |= err;
+                        }
+                    }
+                    ready.push(ReadyFold { text, has_error });
+                }
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if p.started.elapsed().as_secs() < PENDING_FOLD_MAX_AGE_SECS {
+                        keep.push(p);
+                    }
+                }
+            }
+        }
+        let mut slot = self.pending_folds.lock().unwrap_or_else(|e| e.into_inner());
+        keep.append(&mut slot);
+        *slot = keep;
+        ready
+    }
+
+    /// NEW errors in files OTHER than the edited one, against their own baselines — the callers.
+    /// A file with no baseline yet only gets one recorded (its wall is pre-existing until a later
+    /// fold proves otherwise), so the scan can never dump a project's existing errors on the model.
+    fn caller_folds(&self, server: &LspServer, edited: &Path) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let mut base = self.diag_baseline.lock().unwrap_or_else(|e| e.into_inner());
+        let mut files = 0usize;
+        for (uri_str, items) in server.all_diagnostics() {
+            let Ok(path) = uri::uri_to_path(&uri_str) else {
+                continue;
+            };
+            let path = path.canonicalize().unwrap_or(path);
+            if path == edited {
+                continue;
+            }
+            let fps: std::collections::HashSet<String> =
+                items.iter().map(diag_fingerprint).collect();
+            let fresh: Vec<&DiagItem> = match base.get(&path) {
                 Some(prev) => items
                     .iter()
-                    .filter(|d| !prev.contains(&diag_fingerprint(d)))
+                    .filter(|d| d.severity == "error" && !prev.contains(&diag_fingerprint(d)))
                     .collect(),
-                // First edit with no baseline: report only ERRORS (a pre-existing warning wall
-                // must not spam), labeled `current` not `new`.
-                None => items.iter().filter(|d| d.severity == "error").collect(),
+                None => Vec::new(),
             };
-            base.insert(file.clone(), fingerprints);
-            fresh
-        };
-        Some(format_edit_feedback(&new_items, had_baseline))
+            base.insert(path.clone(), fps);
+            if fresh.is_empty() || files >= CALLER_FILES_MAX {
+                continue;
+            }
+            files += 1;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            for d in fresh.iter().take(3) {
+                let first: String = d
+                    .message
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(140)
+                    .collect();
+                out.push((
+                    format!("  caller {name}:{}:{}  {first}", d.line, d.col),
+                    true,
+                ));
+            }
+        }
+        out
+    }
+
+    /// Test seam: park a job whose sender the test controls.
+    #[cfg(test)]
+    pub(crate) fn park_fold_for_test(
+        &self,
+        file: PathBuf,
+        rx: std::sync::mpsc::Receiver<Option<Vec<DiagItem>>>,
+    ) {
+        self.pending_folds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(PendingFold {
+                file,
+                server: None,
+                rx,
+                started: std::time::Instant::now(),
+            });
     }
 
     /// Refresh the per-file fingerprint baseline (every fetch is the new truth).
@@ -479,9 +710,14 @@ impl LspManager {
     /// Fire-and-forget server spawn (a throwaway OS thread carries the blocking handshake) so the
     /// NEXT edit's fold finds a live server. Never blocks the caller.
     fn warm_spawn(&self, spec: &'static discovery::ServerSpec, root: PathBuf) {
+        if self.check_startup_effects().is_err() {
+            return;
+        }
         let Ok(handle) = self.handle() else { return };
         let timeout = self.request_timeout();
         std::thread::spawn(move || {
+            // A failed warm start needs no bookkeeping here: the child it admitted carries its own
+            // settlement charge and clears it by itself once the monitor proves the tree exited.
             let _ = LSP.get_or_spawn(spec, &root, &handle, timeout);
         });
     }
@@ -495,6 +731,7 @@ impl LspManager {
         F: FnOnce(Arc<LspServer>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
+        self.check_startup_effects()?;
         if !self.is_enabled() {
             bail!("LSP is off — enable it with `/lsp on`");
         }
@@ -542,6 +779,7 @@ impl LspManager {
         handle: &Handle,
         timeout: Duration,
     ) -> Result<Arc<LspServer>> {
+        self.check_startup_effects()?;
         let key = format!("{}\0{}", spec.lang, root.display());
         {
             let mut servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
@@ -578,13 +816,23 @@ impl LspManager {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let root_owned = root.to_path_buf();
+        let unsettled = Arc::clone(&self.startup_unsettled);
         handle.spawn(async move {
-            let r = LspServer::spawn(spec, &bin, &root_owned, init_timeout).await;
+            // `spawn` owns the charge: it releases it on a live handshake and marks it failed on any
+            // startup failure. An abandoned observer therefore cannot bless an unowned child.
+            let r = LspServer::spawn(spec, &bin, &root_owned, init_timeout, &unsettled).await;
             let _ = tx.send(r);
         });
-        let server = rx
-            .recv_timeout(init_timeout + Duration::from_secs(5))
-            .map_err(|_| anyhow!("LSP server did not start in time"))??;
+        let result = match rx.recv_timeout(init_timeout + Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(_) => {
+                // The spawn future may still be running and still holds its charge; if it never
+                // resolves, the charge stays failed and blocks until the monitor proves tree exit.
+                return Err(crate::agent::mcp::startup_failure_without_settlement(
+                    anyhow!("{} language-server startup observer timed out/disconnected; physical settlement unproven", spec.lang), true));
+            }
+        };
+        let server = result?;
         let server = Arc::new(server);
         self.servers
             .lock()
@@ -862,6 +1110,47 @@ fn format_diagnostics(root: &Path, file: &Path, items: &[DiagItem]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn startup_uncertainty_blocks_queries_and_clears_once_settlement_is_proven() {
+        let manager = LspManager::new_isolated();
+        assert!(manager.check_startup_effects().is_ok());
+        // A start still in flight must NOT block: somebody is awaiting it, so a slow cold index can
+        // never wedge the session.
+        let held: Arc<crate::agent::process::SettlementLifetime<u8>> =
+            Arc::new(crate::agent::process::SettlementLifetime::new(1, |_| {}));
+        let charge = manager.startup_unsettled.track(&held);
+        assert!(manager.check_startup_effects().is_ok());
+        // The start failed with no owner: now every LSP entry point refuses, and so does `enable`.
+        charge.mark_failed();
+        for _ in 0..2 {
+            let error = manager.check_startup_effects().unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+                    .unwrap()
+                    .0,
+                crate::agent::tools::ToolEffectState::UnknownWorker
+            );
+        }
+        let error = manager
+            .references(Path::new("owned-no-project"), "symbol", false)
+            .unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_some());
+        assert!(manager
+            .enable()
+            .unwrap_err()
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_some());
+        // Once the monitor proves the tree exited, LSP works again without restarting aizen — this is
+        // the whole point: a transient failed start must not poison the session.
+        held.prove_tree_settled();
+        assert!(manager.check_startup_effects().is_ok());
+        assert!(manager.enable().is_ok());
+        manager.disable();
+    }
+
     /// An absolute path spelled for the HOST platform: a drive path on Windows, POSIX elsewhere.
     ///
     /// Not cosmetic. `rel_display` strips the root by prefix, and a Windows literal like
@@ -886,6 +1175,39 @@ mod tests {
             message: msg.into(),
             code: code.map(String::from),
         }
+    }
+
+    #[test]
+    fn chip_names_the_detected_language_while_lazy() {
+        // Before any server runs, the sidebar chip must still answer "which LSP would this be?" —
+        // the lazy start used to hide the language behind a bare "idle".
+        let idle = LspStatus {
+            enabled: true,
+            servers: vec![],
+            detected: Some("rust"),
+        };
+        assert_eq!(idle.chip(), "rust idle");
+        assert!(
+            idle.render().contains("looks like rust"),
+            "`/lsp status` names it too: {}",
+            idle.render()
+        );
+        let nothing = LspStatus {
+            enabled: true,
+            servers: vec![],
+            detected: None,
+        };
+        assert_eq!(
+            nothing.chip(),
+            "no project",
+            "no manifest anywhere ⇒ no server will ever start — say so, don't imply one is pending"
+        );
+        let off = LspStatus {
+            enabled: false,
+            servers: vec![],
+            detected: Some("rust"),
+        };
+        assert_eq!(off.chip(), "off", "disabled wins over detection");
     }
 
     #[test]
@@ -923,6 +1245,48 @@ mod tests {
             "no baseline → honest 'current' label: {s2}"
         );
         assert_eq!(format_edit_feedback(&[], true), "[lsp] no new diagnostics");
+    }
+
+    #[test]
+    fn take_ready_feedback_folds_finished_jobs_and_keeps_pending() {
+        let file = PathBuf::from("/tmp/aizen-fold-test/x.rs");
+        let mine = |folds: &[ReadyFold]| folds.iter().any(|f| f.text.contains("x.rs:"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        LSP.park_fold_for_test(file.clone(), rx);
+        // Still running → nothing ready, and it stays parked.
+        assert!(!mine(&LSP.take_ready_feedback()));
+        tx.send(Some(vec![DiagItem {
+            line: 3,
+            col: 1,
+            severity: "error",
+            message: "mismatched types".into(),
+            code: Some("E0308".into()),
+        }]))
+        .unwrap();
+        let ready = LSP.take_ready_feedback();
+        let fold = ready
+            .iter()
+            .find(|f| f.text.contains("x.rs:"))
+            .expect("the finished job is folded");
+        assert!(fold.has_error);
+        assert!(
+            fold.text
+                .starts_with("[lsp] x.rs: 1 current diagnostic(s) after edit:"),
+            "{}",
+            fold.text
+        );
+        assert!(
+            fold.text.contains("error 3:1  mismatched types [E0308]"),
+            "{}",
+            fold.text
+        );
+        // Drained: a second call does not report it again.
+        assert!(!mine(&LSP.take_ready_feedback()));
+        // A job whose task died (sender dropped) is discarded, not kept forever.
+        let (tx2, rx2) = std::sync::mpsc::channel::<Option<Vec<DiagItem>>>();
+        LSP.park_fold_for_test(file, rx2);
+        drop(tx2);
+        assert!(!mine(&LSP.take_ready_feedback()));
     }
 
     #[test]

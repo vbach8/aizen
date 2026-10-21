@@ -1,14 +1,14 @@
 #!/bin/sh
 # Aizen installer for Linux and macOS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/aizen-stack/aizen/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/talmetis-labs/aizen/main/install.sh | sh
 #
 # Downloads the latest optimized `aizen` binary from GitHub Releases into
 # ~/.aizen/bin (override with $AIZEN_INSTALL) and makes it executable.
 # Pure static binary — no toolchain, no Node/Python.
 set -eu
 
-repo="aizen-stack/aizen"
+repo="talmetis-labs/aizen"
 os="$(uname -s)"
 arch="$(uname -m)"
 
@@ -24,7 +24,9 @@ case "$os" in
 esac
 
 api="https://api.github.com/repos/$repo/releases/latest"
-url="$(curl -fsSL "$api" | grep -o "https://github.com/[^\"]*aizen-[^\"]*${plat}" | head -1)"
+# The URL must END at the platform suffix: a `-voice` build is a separate, opt-in artifact and
+# must never be what a plain `curl | sh` installs (its Linux binary needs libasound.so.2).
+url="$(curl -fsSL "$api" | grep -o "https://github.com/[^\"]*-${plat}\"" | head -1 | tr -d '"')"
 if [ -z "$url" ]; then
   echo "aizen: no release asset for '$plat' yet (still building?) -- see $api" >&2
   exit 1

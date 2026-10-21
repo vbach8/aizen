@@ -5,7 +5,909 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
-## [Unreleased]
+## [0.7.2] — 2026-10-16
+
+### Changed
+- **A retry is one line that changes, not a column of notes.** Each attempt used to append
+  `⟳ rate-limited — retrying in 1s (1/3)`, then `(2/3)`, then `(3/3)` to the transcript, so a short
+  429 burst pushed the actual turn off the screen. The same text now rides the working line, which
+  replaces itself; nothing is appended. Off-TTY, where there is no working line, the single note
+  remains.
+- **`skill_load` reports what it loaded, not the skill's whole body.** The digest took the result's
+  first line, which for a skill is a multi-line header plus the procedure — so loading a skill
+  printed a block of its instructions above the conversation. It now reads `skill loaded · <name>`;
+  the body is still in history and opens with `Ctrl-E`.
+- **Checkpoint unavailability no longer prints on every phase boundary.** "not a git repository" is
+  a property of the working directory, not news about the turn; it repeats on every edit in a
+  non-repo folder. It now goes to the run log only. A real checkpoint FAILURE still warns.
+- **The dense embedder no longer announces a successful load at startup.** `[dense] loaded …`
+  appeared above the first turn on every launch. It now speaks only when the configured model was
+  missing and something else was substituted (naming both), or when loading failed.
+- **The `/workflows` panel is wide and no longer truncates.** The overlay was capped at 84 columns
+  and its rows were pre-cut at 72 chars (task labels at 160), so a child's brief and its progress
+  detail arrived as fragments and wrapped into four or five ragged lines each. It now takes almost
+  the full frame width and wraps instead of clipping; labels and details are kept whole up to a
+  generous bound that exists only to stop a pathological string from filling the screen.
+- **Attaching an image no longer opens a menu, and no longer prints a line per send.** Dropping an
+  image into the prompt asked two questions — "Vision capability" and "Use current attachments as
+  references?" — on every attachment, and answered the same way every time; both are gone. An
+  undeclared destination now defaults to vision-capable (an explicit `Unsupported` is still
+  honoured, and `/config → Vision` still changes either), and attachments become references for the
+  task automatically. This adds no transmission authority: a capability statement was never a
+  disclosure approval, and the reference grant stays the narrow one (this task, this
+  destination/account route, originals). The `Image send: N balanced preview(s), URI … → … bytes`
+  notice is removed as well — the numbers remain on `ImageSendStats` for tests, but nothing prints
+  them per request any more.
+- **A failed tool call is one line again.** A failure used to auto-expand its last six body lines
+  under the result row, so a run with several failed calls buried the transcript under indented log
+  rows. The row is now the call line, the error digest, and a `N more line(s) — Ctrl-E expands`
+  hint; the full tail still opens with `Ctrl-E`. A failed turn's own error line is likewise clipped
+  to its first line (with a `↵` marker when more followed), instead of dumping a child's partial
+  report or a workflow's infrastructure summary under the prompt.
+
+### Fixed
+- **A stalled provider stream can no longer look healthy, and a delegated child can no longer wait
+  forever.** Both come from the same place: the streaming reader treated *any* parsed frame as model
+  progress, so a gateway that answered `200` and then sent only keepalive/ping/role frames kept the
+  watchdog's clock fresh indefinitely, and every retry layer above it had its own separate
+  allowance. A child's model step now has ONE budget — three actual HTTP sends total, covering the
+  HTTP retry, the blank-stream replay and the compatibility retry — inside the existing 300 s call
+  limit, itself clamped by the dispatch and inherited parent deadline.
+- **Progress is now semantic, not byte-shaped.** Nonempty text, reasoning, and advancing tool-call
+  fragments renew the idle deadline; pings, empty deltas, repeated role-only chunks and unchanged
+  usage reports do not. `finish_reason` opens a bounded trailer window that still surfaces a late
+  provider error, instead of either waiting a full response window or declaring success instantly.
+- **A stream in another dialect is reported as a protocol error.** A native Anthropic Messages or
+  Codex Responses event, or a non-streaming completion body, served on the Chat Completions route
+  used to parse as an empty chunk and be silently swallowed; it is now a typed terminal failure that
+  is never replayed as a blank stream.
+- **Expired work is terminal, not renewable.** An expired dispatch deadline, an exhausted send
+  budget, an authentication/permanent provider error, a protocol failure, cancellation and uncertain
+  worker ownership keep their own categories instead of collapsing into a generic `error`; none of
+  them is restarted, sent to a recovery planner, or retried by a writer. A workflow task's deadline
+  is frozen before its first eligible admission and every restart/fix/recheck/planner/replacement
+  attempt shares the remaining budget — a resume cannot buy a fresh one, and a journal with no
+  recorded deadline is refused rather than granted new time.
+- **A child that outlives its observer is stopped, and its ownership is still not released early.**
+  A delegated read-only call now runs on its own cancellation token and a context clamped to the
+  observer deadline; observer expiry signals that child only — never the parent or its siblings —
+  then allows a bounded settlement grace. A worker that cannot be proven stopped stays charged and
+  visibly unsettled, and is ineligible for retry, replacement or dependent work.
+- **Waiting is visible.** A `task` row is created before it queues for a sub-agent slot, so a
+  dispatch waiting on admission no longer looks like a hung child, and transport progress is
+  reported as `HTTP n/3 · <phase>` rather than being mislabelled as an agent step.
+- **Deep fan-out no longer overflows a worker stack.** The per-step model future and each scheduler
+  attempt future are boxed: several whole child agent loops held inline in one state machine
+  overflowed the stack at real widths (the speculative real-executor tests caught it).
+
+## [0.7.1] — 2026-10-09
+
+### Added
+- **Clarify ask panel: several questions, multi-select, and answers that submit in one keystroke.**
+  The `clarify` tool grew a structured ask — one question (`question` + optional `options`) or several
+  at once (`questions`, each with a `header`, `options`, and `multi_select`), and options may carry a
+  `description`. Under the retained TUI an ask with suggested answers now opens a Claude-Code-style
+  panel over the composer: a tab per question (←→/Tab), checkbox rows for `multi_select` (Space), a
+  per-question free-text row, and **Enter submits every answer at once** as the next user message —
+  so answering no longer means retyping a choice into the box, and a bare Enter on a fresh panel is a
+  no-op rather than a re-render. Typing still dismisses the panel into the draft, so the free-text
+  path is unchanged. Every other surface (plain REPL, `aizen agent`, Telegram) prints the same
+  rendered questions and takes a typed answer.
+- **`/jobs` — background work at a glance, stop-able, and a live strip when there is no sidebar.**
+  Long-running `process` handles (dev servers, watchers) and live monitor runs (sub-agents ·
+  workflows) are now published to the UI by a background poller. A wide terminal shows them in the
+  sidebar under a `Jobs` section; a narrow one shows a clickable one-line summary (`▸ 3 running ·
+  monitor 2  npm run dev  /jobs ↵`) under the composer that opens the panel. `/jobs` opens the same
+  panel from the keyboard. The panel is selectable and interactive: ↑↓ pick a row, **Enter opens
+  that process's live log** (a tail that keeps updating while it is on screen; ↑↓/PgUp/PgDn scroll,
+  Esc returns to the list), **`x` stops the job** — a process is killed by handle, a monitor run gets
+  a stop request — and Esc closes. It refreshes in place every second, so a job that ends leaves the
+  list without a reopen.
+
+### Changed
+- **`/clear` now refreshes instead of forgetting.** A fresh start used to wipe the thread to a blank
+  system prompt, so the model woke up with no memory of what it had just been doing — a mid-task "new
+  conversation" felt like handing the work to a stranger. `/clear` (and its `new`/`reset` aliases) now
+  distills the previous thread into one dense seed note — goals, decisions, files touched, commands
+  run, open tasks, and a reflection on what was tried and failed — and seeds the fresh thread with it
+  behind the handoff marker, so the new thread continues the same work without re-deriving it. The full
+  previous transcript still stays saved under its own name (`/sessions` reopens it). The distillation is
+  one cancellable model call (Esc leaves the thread untouched), and an empty or first-turn thread skips
+  it. `/clear hard` (also `fresh`/`wipe`/`blank`) keeps the old blank-slate behaviour. This revives the
+  retired `/handoff` idea — a fresh thread that remembers beats a summarized one — but wires it into the
+  refresh people actually reach for instead of a separate command nobody ran.
+- **A long but healthy turn no longer stops mid-task to ask you to type "continue".** The step cap
+  exists to bound a *wandering* loop, but the continuation budget was tuned so tight (3 fresh budgets
+  on `medium`) that an ordinary large edit on the interactive surface hit the wall while still making
+  progress, synthesized a "here's how far I got" summary, and handed back partial work. The budgets
+  that govern a *still-progressing* run are now far more generous: the interactive default extends
+  once to ~80 steps (was ~50) and then grants up to 8 continuations (was 3), and every `/effort` tier
+  scales up to match (`low` 12/24/2, `medium` 25/80/8, `high` 40/120/12, `xhigh` 60/180/16,
+  `max` 90/300/24 for iters/auto-extend/continuations). Nothing about the safety model changed — the
+  stall ledger still ends a run the moment two turns in a row add no evidence, so the extra room only
+  ever buys steps for genuine progress; a flat or looping run still stops exactly as before. Delegated
+  sub-agents and workflow children are untouched (they set their own budgets and run no continuation
+  loop).
+
+### Fixed
+- **Skill marketplace errors now tell the whole story.** When the agentskill.sh search index is
+  down (it currently answers HTTP 500 to every query), `skill_search`/`skill_install` fall back to
+  browsing the public catalogue — but that catalogue only serves the registry's most recent
+  entries, so an older skill can exist yet be unreachable. The combined error now says both things
+  ("index down AND no match in the recent catalogue") instead of a bare HTTP 500 that read as
+  "marketplace down, give up", so retrying later vs. falling back to local skills is the user's
+  informed choice. The by-slug install route's docs are corrected to match what it actually does:
+  it reads the same index, so it rescues installs *while* the index is down, not installs *of*
+  skills the index no longer lists.
+- **No more escape-code garbage and broken scrolling on the bare Linux console.** Resuming a session
+  on a terminal that cannot host the full-screen UI — the Linux VT (`TERM=linux`), a `dumb`/empty/
+  unset `TERM`, or a BSD console — printed the alternate-screen / mouse / bracketed-paste mode-sets as
+  literal `^[[?1049h` / `[200~` text while the transcript scrolled out from under the frame. The replay
+  only made it loud: the TUI should never have taken those terminals at all. `retained::preferred()`
+  now checks `$TERM` as well as `is_terminal()`, so an incapable console falls back to the plain
+  line-REPL (which needs nothing but raw mode and a cursor) instead of a frame it can't paint. Capable
+  emulators and multiplexers (xterm, foot, alacritty, kitty, screen/tmux, …) are unaffected, and
+  `AIZEN_NO_STICKY=1` still forces the plain REPL anywhere.
+
+## [0.7.0] — 2026-10-06
+
+Multi-agent orchestration lands its first three phases: durable run logs with real resume, a
+barrier-free scheduler, and supervision with cost reporting.
+
+### Added
+- **Run log + real resume (Phase 1).** Every workflow run appends to an append-only JSONL event
+  log under `.aizen/runs/<run-id>.jsonl` (override with `AIZEN_RUNS_DIR`). New event kind `task`
+  records each workflow task's outcome; `runlog::plan()` derives a skip/run plan from the log as a
+  pure function. New CLI: `aizen resume <run-id> --spec <path>` (alias `run-resume`) replays the
+  log, injects recorded outcomes for finished tasks (zero LLM tokens re-spent — verified E2E with a
+  killed run), and re-runs only the rest; without `--spec` it dry-runs the plan. `aizen status
+  <run-id>` (alias `run-status`) reads a log without writing. `aizen workflow --resume <run-id>`
+  resumes inline.
+- **Ready-queue scheduler (Phase 2a).** `schedule()` no longer runs wave-by-wave: a task starts the
+  moment its `after` dependencies finish and a slot frees. Writers now serialize globally, not just
+  per-wave. The fix loop runs immediately after its task instead of at wave end.
+- **Live blackboard + coordinator signals (Phase 2b/2c).** A running child sees new sibling findings
+  on its next tool turn via a collapsing `[blackboard]` nudge, and drains coordinator instructions
+  from `<run-id>.signals.jsonl` as `[signal]` nudges each loop iteration.
+- **Slot queue (Phase 2d).** A task that hits the sub-agent concurrency limit parks and polls
+  (200ms × up to 60s) instead of returning a soft error the model had to retry around.
+- **Supervision + restart policy (Phase 3).** A child that fails with `error`/`deadline` gets one
+  same-task restart after a 500ms backoff (one_for_one, max 1); a permanent failure escalates to a
+  metis re-plan that writes a replacement task from what the failures taught. Retry prompts are
+  diff-feedback ("smallest patch on what you just wrote"). Per-model concurrency budgets via
+  `model_endpoints[].max_concurrent` in config, enforced beside the global gate. Every workflow now
+  prints a one-line cost report (`cost: X→Y tok across N task(s)`), and the `workflow` tool
+  description carries the effort-scaling table (cheap lookup / default implement / strongest design).
+- **Design doc:** `docs/design/multi-agent-orchestration.md` — the phased plan this release
+  implements (Phases 0–3).
+
+### Tests
+- New integration tests: `tests/resume_plan.rs` (E2E resume plan from a fabricated log) and
+  `tests/eval.rs` (20-task eval harness with keyword checks + LLM judge; `#[ignore]`d by default —
+  run with `--ignored --nocapture`, needs a live endpoint). Unit tests for the ready-queue
+  (no-wave-barrier timing, global writer serialization, restart-once, no-second-restart) and the
+  runlog `plan()` skip policy. Suite: 2069 passed, 0 failed.
+
+## [0.6.9] — 2026-10-01
+
+Quality-of-life fixes: the time machine survives a wrong cwd, the verify gate stops timing out
+on cold compiles, the diff box no longer repeats the file path, and the UI gets a steady-streaming
+rework with universal glyphs.
+
+### Fixed
+- **Time machine no longer dies when the harness cwd is not the repo.** `RepoContext::current()`
+  now prefers the `AIZEN_WORKSPACE_ROOT` env var over the process cwd before falling back to
+  `git rev-parse` discovery — the pre-edit checkpoint "os error 267" is gone when aizen is
+  spawned from a parent directory or a task runner.
+- **Verify gate timeout raised to 180 s.** Cold `cargo build --tests` on a large Tauri or Rust
+  workspace no longer gets killed at 90 s; the custom `.aizen/verify.json` warm-up command
+  (compile first, test second) keeps the gate green without burning CI time on cached runs.
+- **Diff-box header drops the redundant path.** The tool row immediately above already names
+  the file being edited — the header now reads `diff  +A −D` instead of `diff · <path>  +A −D`.
+- **Edit digest drops the absolute path.** `edited · +A −D` instead of `edited /abs/path · +A −D`
+  in the tool-use digest line.
+
+### Changed
+- **Steady streaming frames.** The retained TUI re-renders at a fixed cadence instead of
+  racing the token stream — no more flicker or scroll jumps when the model types faster than
+  the terminal draws.
+- **Universal geometric glyphs in the splash panel.** Tool-group icons switch from Nerd Font
+  PUA codepoints to glyphs any font renders (◉ ✦ ▤ ❯ ◎ ☰ ◐ ⇄), so the panel looks correct on
+  stock Windows Terminal, macOS Terminal.app, and Linux console fonts.
+- **`.cargo/config.toml` with rust-lld for the MSVC target.** Incremental test-compile link
+  time drops from ~53 s to ~2 s on Windows when the default toolchain is
+  `stable-x86_64-pc-windows-msvc`.
+
+## [0.6.8] — 2026-09-16
+
+The 2026-09 quality upgrade (`docs/execution-plan-2026-09-14.md`, phases 0 to 6). The harness now
+measures what it sends — a usage ledger per request, `prompt-size --live` for the cache prefix,
+record/replay tapes and a task suite in CI — and on that evidence it got lighter: a coding turn's
+fixed prefix is 59 KB instead of 80 KB, older tool results collapse to one line, and three
+context mechanisms that the saved sessions showed doing nothing are gone. The loop verifies
+before it says Done, the seven sub-agents can be pinned, chained and held to a budget, an
+approval shows the exact payload it is for, and `aizen agent` speaks Claude Code's `stream-json`
+so a front-end or a CI script drives it with a parser it already has. Everything is client-side;
+nothing here needs a server change.
+
+### What the model is shown, and what it costs
+#### Added
+- **Per-request usage ledger in every session file.** Each model call's input, output, cached
+  and cache-write tokens are appended to `meta.usage` on autosave (rows capped, totals exact,
+  turn-numbered, safe across `/resume` and across processes). `/cost` shows the session's cached
+  share of input plus the current turn's own hit rate, and the status line's `⛁ N% cached` chip
+  now uses the shape-corrected input as its denominator (Anthropic-style gateways report
+  `prompt_tokens` *exclusive* of the cache read, so the old figure could exceed 100 %) and shows a
+  `0%` miss once the session has ever hit — the signal that something rewrote the prefix.
+- **`aizen prompt-size --live`** — the lanes as a prompt cache sees them: every block's size, a
+  rebuild check (two consecutive builds byte-identical?), and any content that will differ on the
+  next turn (ages, message counts, clock times), with a STABLE / VOLATILE verdict.
+- **Effort tiers with teeth.** The resolved tier now sets the loop's step cap and extension,
+  continuation budget, verify-and-fix rounds, self-review (`xhigh`/`max`) and log budget — not
+  only the `reasoning_effort` wire string, which half the providers ignore. `models_by_effort`
+  (`{"low": "cheap-model", "max": "strong-model"}`) sends a tier to another model on the same
+  endpoint; the effort line names it.
+- **Turn shapes, and a lean tool surface.** Each turn is classified from the prompt (English or
+  Vietnamese) as a question, a small edit, a multi-file change or research. A pure question skips
+  the memory-recall and gated-skills blocks and is answered in one request against the cached
+  prefix. The conversation's widest shape picks which rarely-used built-ins ride behind
+  `tool_search` instead of on every request — `workflow`, `persona_create`, the time machine, the
+  memory and skill write surface, `team_status`, `notify`, the crawler outside research, and for
+  questions also `process`, `file_move` and `task`. On this build a coding turn advertises 20.5 KB
+  of the 40.8 KB schema block, and its fixed prefix is 59.2 KB against 79.6 KB with every tool
+  advertised. On by default for first-party APIs only (`api.anthropic.com`, `api.openai.com`),
+  because some gateways cannot call a tool that was not advertised; `lean_tools` in
+  `cli-config.json` turns it on or off explicitly. The effort line now names the shape, and `aizen
+  prompt-size` prints the lean size beside the full one.
+- **Compaction for single-turn runs.** One prompt followed by fifty tool steps — the canonical
+  agent shape — could never auto-compact (the cut needed two user turns). It now cuts on an
+  assistant step boundary, keeps the prompt verbatim and the last six steps, and every
+  auto-compaction summary opens with the files and skills the summarized block touched so the
+  continuation does not re-search for paths it already had. The one-shot `aizen agent` run gets
+  the same mid-loop compaction the REPL has.
+- **Older tool results collapse to one line; big results spill to disk.** A tool result older
+  than the eight most recent and longer than 800 chars becomes `[collapsed] shell_run cargo test ·
+  412 lines · 28.4 KB · full text at <scratch>/tool-output/0003-shell_run.txt`, once eight of them
+  qualify (one history rewrite per batch, so the prompt cache breaks rarely). Independent of
+  context %, so a 32k local model and a 200k hosted one see the same recent-window shape. A raw
+  result over 16 KB is written to the scratch dir in full *before* the budget cut and the cut
+  result ends with the path — nothing a tool produced is lost, and the model reads the part it
+  needs instead of re-running the command. `file_read` is exempt (its file is already on disk).
+- **`format: concise | detailed` on `shell_run`, `process` and `search_files`**, concise by
+  default. A short result is unchanged. A log over 4,000 chars keeps its status line, the head,
+  the first error and the tail, states on its second line how many lines and bytes there were,
+  and names the scratch file holding all of it; a search past 40 rows shows the first 40 and
+  counts the rest per file, with the whole list on disk. `detailed` returns everything up to the
+  loop budget. A 15 KB `cargo test` log used to ride whole in every later request until it aged
+  out.
+- **Log- and report-shaped result budgets.** `shell_run` / `process` / `git_inspect` output is
+  cut to 16 k chars around the FIRST error line with a large tail (the verdict lives at the end),
+  never head-⅔/tail-⅓ — a `cargo test` with three failures reaches the model with all three.
+  `task` / `workflow` reports are cut to 24 k chars by whole `## ` sections with the omitted
+  sections named, so a reviewer's findings 4–9 are no longer the part that vanishes.
+
+#### Changed
+- **One compaction trigger.** The REPL's post-turn auto-compaction is gone; the `/config`
+  threshold (`compact_threshold_pct`, default 80 %) now arms the loop's own mid-turn compaction,
+  which the one-shot `aizen agent` already used — one trigger for both surfaces, firing between
+  the agent's steps instead of after a turn had already overrun.
+- **Leaner tool schemas.** Tighter descriptions on the always-on tools, and — where `lean_tools`
+  defers — the language-server query and symbolic-edit tools, `codebase_search` and
+  `session_recall` ride behind `tool_search` too (4 of ~2,800 calls across 79 saved sessions).
+  A coding turn's advertised schema drops from 29.6 KB to 20.5 KB; the full surface from 43.4 KB
+  to 40.8 KB. `aizen prompt-size` shows both.
+
+#### Fixed
+- **The dynamic prompt lane is byte-stable within a conversation**, so a warm prefix cache holds
+  across turns. `<sessions>` rows carry the file's calendar day instead of "3m ago", drop the live
+  message count, never list the conversation being autosaved, and are adopted once per
+  conversation; session working memory (rewritten by the learning pass between turns) rides the
+  user turn beside recall and skills; the persona's `<self>` block is adopted at the boundary like
+  the frozen core. `prompt-size --live` reports STABLE on this build; it reported two volatile
+  markers before.
+- **`file_read` is cut exactly once, by itself.** The loop used to re-slice a read by keywords
+  taken from the file *path* and hand the model a head + "…elided…" + keyword-window splice — text
+  that does not exist in that order, so an `old_string` copied across the seam never matched.
+  Ranged (`start`/`end`) and `number:true` reads, which bypassed the budget entirely, now get a
+  contiguous head of the requested range with a marker naming the exact `start` to continue from.
+  Relevance cuts on `search_files` / `web_fetch` keep the tool's trailing "…capped at N — narrow
+  the query" hint, which the old cut deleted.
+- **One token estimator** (`core::tokens`) for the context guards, memory caps, schema ratchet,
+  codebase index and MCP budget: ASCII is exactly chars/4 as before; CJK, Hangul, combining marks
+  and precomposed Vietnamese count 1/1.8 per char. Every "N-token" cap used to admit roughly twice
+  that in Vietnamese.
+- **The todo list is scoped to the turn.** Cleared at each user turn unless the previous turn
+  ended abnormally (step cap, deadline, cancel, failed verification, a clarifying question) — then
+  its open items are the continuation plan. A stale item from an edit turn used to cost the next
+  plain question up to two todo-poke round-trips.
+- **Nudges retire, and ride the right role.** Loop nudges (divergence, budget, step limit, todo,
+  …) are stripped at the start of the next run instead of living in history forever; on
+  non-Anthropic endpoints they are delivered as tagged user-turn messages, because the Codex path
+  hoists every system message into its instructions blob (a permanent "you repeated the same
+  call") and many local chat templates reject a mid-history system role.
+- **A failed auto-compaction no longer arms the cooldown** on its first failure (a summarizer
+  blip used to silence compaction for the rest of the cooldown while context climbed); two in a
+  row do.
+- **Context overflow recovery retries up to three shrinks**, not one, while evictable tool
+  results remain.
+
+#### Removed
+- **`/handoff`.** Zero uses in 64 saved sessions since it landed; mid-turn compaction, `/clear`
+  and `/resume` cover what it did. A saved session that carries a handoff seed still loads.
+- **Percentage-based tool-result clearing** (`clear_at_pct`) and its save-before-clear nudge.
+  Observation collapsing (the newest eight results stay whole, older ones become digests that
+  name their spill file) keeps the same window and leaves nothing older than that to clear; the
+  overflow shrink behind a provider's context-length rejection stays as the safety net.
+
+### Tools, and the verify gate before Done
+#### Added
+- **Edit tool polish.** `replace_all` now applies on every matching rung, not only the exact
+  one — two identically indent-drifted blocks used to make the tolerant rung refuse with "add
+  more context" and cost a round-trip each. `dry_run: true` on `file_edit` computes and shows the
+  diff without writing (single, batch and create-new forms). The diff the model gets back keeps
+  the removed lines, the `@@` anchor and one `+N line(s)` row per hunk, at most three hunks; the
+  TUI still draws the full diff. A ten-edit batch used to echo ~800 lines of the model's own text
+  and hit the result cut. `file_glob` takes `ignore: true` to honour `.gitignore` and skip
+  `target/`, `node_modules/`, `.git/` like `search_files` (the default still sees everything, as
+  asked), and the five repository search tools end their descriptions with one shared routing
+  sentence instead of five partial cross-references.
+- **Diagnostics after an edit no longer hold the edit.** The post-edit LSP fold waits 300 ms
+  instead of up to 3.5 s; a slower analysis keeps running and lands on the next tool result (or,
+  if the model is about to finish, as a demand before Done), naming the file and up to three
+  CALLER files whose new errors the server published after the edit. After every three
+  successful edits the loop runs the project's fast check itself (`cargo check`, `tsc`, …) and
+  appends the verdict to the last edit's result; a pass satisfies the verify gate, so the model
+  neither spends a round-trip on the check nor waits for it again at Done.
+  `harness_check_after_edits` (3, `0` off) is the knob.
+- **Lenient tool-call recovery.** Arguments that are almost JSON — a trailing comma, a raw newline
+  inside a string, Python quotes and `True`/`None`, a brace cut off by `max_tokens` — are repaired
+  and traced instead of failing the call; `{not json` still fails. A call the provider left in the
+  text — `<tool_call>…</tool_call>` (Hermes/Qwen templates), a ```json fence, a bare
+  `{"name": …, "arguments": {…}}` reply (Llama 3) or `[TOOL_CALLS] [...]` (Mistral) — is lifted
+  into a real call when `tool_calls` is empty and every name is a registered tool; prose is left
+  alone. Local models used to have such turns echoed to the user as the final answer, or re-sent
+  unchanged as an empty-200 retry.
+- **Verify gate for Go, Maven, Gradle, .NET and Python.** `go build ./...` then `go vet`,
+  `mvn -q -DskipTests compile`, `gradle -q compileJava` (through the repo's wrapper), `dotnet
+  build`, and a Python byte-compile pass. A toolchain that is not installed is "nothing ran", not
+  a failure. When nothing could run at all after an edit, the model is asked once to run the
+  project's own build or test command and quote the result before finishing, instead of reaching
+  "done" unverified in silence.
+- **The verify gate climbs a ladder before Done.** After the typecheck it runs the narrowest
+  test the edited files name — `cargo test -- module::` (or `--test file` for an integration
+  test), the sibling `test_x.py` under pytest or unittest, `go test ./pkg/`, the sibling
+  `x.test.ts` under vitest or jest — and, on a change that touched more than one file, the whole
+  suite (`cargo test`, `npm test`, `go test ./...`, `pytest`, …), but only while the suite fits
+  the verify budget: the first run times it, and a suite that blew the budget once is skipped
+  with a note from then on rather than re-run into a timeout. `/init` now detects the commands
+  and the suite and times the fast rung; the record lives in `~/.aizen/verify/`, never in the
+  checkout. A trusted `.aizen/verify.json` may name the `suite` beside its `commands`.
+
+### The model client
+#### Added
+- **Two-phase stream deadline.** `AIZEN_STREAM_FIRST_FRAME_SECS` (600) until the first frame
+  parses, then `AIZEN_STREAM_STALL_SECS` (90) between frames. A reasoning model silent for three
+  minutes before its first token was "never started", replayed twice, and billed three times.
+- **Request-shape quirks learned per model.** A 400 that names `max_tokens` (o-series/gpt-5 want
+  `max_completion_tokens`), `parallel_tool_calls`, `tool_choice`, `cache_control` or
+  `reasoning_effort` drops or renames that field, re-sends, and remembers the model for the
+  session. Previously only `reasoning_effort` was handled; the others needed config edits.
+- **The ChatGPT Codex path streams like every other.** A Codex turn used to buffer its whole
+  response before showing anything — a frozen spinner for the entire generation, no eager tool
+  starts, and no stall deadline short of the 300 s socket timeout. It now reads the SSE frame
+  by frame on the same two-phase watchdog as the chat-completions path, paints text as it
+  arrives, offers each completed call to the eager starter, keeps the completed calls when the
+  stream drops, and replays a stream that died blank.
+
+#### Fixed
+- **Streamed usage is recorded once, from the last report the stream carried**, whatever chunk
+  carries it. Providers that attach usage to the final content chunk (llama.cpp, Ollama shims,
+  LiteLLM) never registered, so `/cost` stayed blank and the real-usage anchor never armed;
+  cumulative-usage gateways (vLLM, OpenRouter) are no longer at risk of being summed N times. The
+  plain chat path now asks for `stream_options.include_usage` like the tool paths do.
+- **A refreshed Codex token the backend still rejects no longer loops forever.** The 401
+  branch refreshed and re-sent with no attempt counter; it now refreshes once, then asks for
+  `aizen auth login codex`. The overload and capacity markers are matched against the error
+  envelope only — an answer that merely quoted `server_is_overloaded` was being discarded and
+  re-billed.
+
+### Machine-readable output, and hooks
+#### Added
+- **`aizen agent --output-format stream-json`** — the run as one JSON record per line on stdout,
+  in the shape Claude Code's `stream-json` uses (the Claude Agent SDK message types): `system` /
+  `init`, `stream_event` deltas, `assistant` and `user` messages carrying `tool_use` /
+  `tool_result` blocks, `control_request` for a destructive call (answered on stdin with a
+  `control_response`), `result` last with the stop reason, the answer and this run's tokens. A
+  delegated sub-agent's records point at the call that spawned it (`parent_tool_use_id`) and
+  name the child (`dispatch`). `--output-format json` prints only the closing `result`. The
+  contract a front-end or a CI script builds on with the parser it already has for Claude Code,
+  instead of parsing the transcript's glyphs, which every cosmetic change used to break in
+  silence.
+- **Hooks.** `hooks` in `cli-config.json` runs your own commands around the loop: `pre_tool`
+  (after the safety floor, before the prompt — exit `2` denies, `{"decision":"allow"}`
+  pre-approves), `post_tool` (what it prints joins the tool result the model reads) and `stop`.
+  One JSON object on stdin, the same sandbox runner as every child, and a hook that merely fails
+  never blocks the run. `aizen hooks` lists them; `AIZEN_NO_HOOKS=1` turns them off.
+
+### Delegation — the Pantheon
+#### Added
+- **Per-role model pins, and budgets sized to the work.** `roles.pantheon.<role>` in
+  `cli-config.json` (or `/config` → Sub-agents → Pantheon roles; env `AIZEN_<ROLE>_MODEL` wins)
+  pins one of the seven built-in sub-agent roles to its own provider or model — above the shared
+  sub-agent default, below an explicit per-dispatch `model` — so a reviewer runs on a strong
+  model and a searcher on a cheap one in the same fan-out, from the `task` tool and from a
+  workflow spec alike. Default step budgets differ by role instead of a flat 25: argus 15, clio
+  20, metis / nemesis / mnemosyne 25, themis 30, daedalus 45; a workflow child without
+  `max_steps` takes the same number. The historian's brief no longer ships three runs of
+  seventeen spaces to every dispatch.
+- **A delegated child starts from the parent's position.** A `task` dispatch and every
+  workflow task open the child's brief with a `<parent_context>` block: the parent's
+  in-progress todo item, the findings it passes as the new `context` arg (up to ten short
+  lines), and up to fifteen locations the parent already read in this conversation, as
+  `path:start-end` from its own read cache — so the child goes to those lines instead of
+  searching for them, and does not re-derive what the parent already knows. Capped at 2,500
+  chars, reads dropped before findings; nothing is added when there is nothing to hand over.
+- **Workflows chain, and the writer is verified.** A workflow task may name the tasks it waits
+  for (`after`); tasks run in dependency waves, and a chained task receives its dependencies'
+  latest reports in an `<upstream>` block ahead of its brief. Within a wave the read-only tasks
+  fan out first and the wave's one writer runs alone, so a reviewer never reads a tree the
+  implementer is mutating; two writers may share a workflow only when `after` orders them. A
+  task that names `retry_on_fail` and reports `VERDICT: FAIL` re-runs that upstream task once
+  with the failure attached, then runs again; both attempts stay in the trace as `id` and
+  `id#2`. `workflow(mode="implement", prompt=…)` prebuilds daedalus → themis → nemesis with
+  that fix loop, and a workflow writer now runs under the verify gate like a `task` writer.
+- **Architect mode: a strong model thinks, a fast model types.** Under `/effort max` a
+  multi-file turn is planned first by `metis` on the strongest configured model
+  (`models_by_effort.max`, else `xhigh`, else the turn's model) — an ordered plan in prose with
+  file:line anchors and a check per step, no code — and then applied by the turn's own loop on
+  the fastest (`models_by_effort.low`, else the same model) at low wire effort, with the plan
+  folded into the request and the `max` tier's harness budgets untouched. Single-file turns,
+  questions and research never enter it; a planner that produces nothing usable leaves the
+  turn as it would have run. `architect_mode: false` in `cli-config.json` or `AIZEN_ARCHITECT=0`
+  turns it off. Works in both REPLs and in `aizen agent`.
+- **The writer lease is scoped, and children leave notes for each other.** The workspace
+  writer lease is now keyed by the run's resource scope: a delegated child (a descendant scope)
+  still reenters its parent's lease, but a sibling scope in the same process — the next `serve`
+  lane on the same worktree, a parallel dispatch — waits for the OS lock and, at the timeout, is
+  told which scope holds it. Reentrancy used to be process-wide, so two `serve` lanes shared the
+  lease that was meant to keep them apart. Every delegated child's full report is also filed on
+  a per-conversation blackboard under the scratch dir (`blackboard/<scope>/<child>.md`,
+  append-only), and every child's `<environment>` names the board and the notes already on it,
+  so a later child can `file_read` a sibling's whole report instead of the parent's cut-down
+  relay. No new tool.
+- **A child's approval says who is asking, its cost is its own, and a writer gets one retry.**
+  An approval raised by a delegated child now reads `daedalus · fix parser wants: Run …` in the
+  TUI, over Telegram and on a plain terminal, instead of looking like the parent's own request.
+  `/workflows` rows show `step 7 · file_edit` while a child runs and `12.3k→1.2k tok` when it
+  has finished; a `task` result header, a workflow status line and `--trace` carry the same
+  per-child tokens (summed from each call's usage, so the session total is no longer the only
+  number). A write-capable `task` child that runs out of time or fails verification is re-run
+  once with a tightened brief carrying its own partial report; if the retry also fails, the tree
+  is restored to the checkpoint taken before the dispatch and the result says so, so half-done
+  edits from two attempts never stay behind unannounced.
+- **Delegation guidance says when not to, and a thin brief is refused.** The system prompt now
+  tells the model what earns a fresh context (a multi-file search, a review, a test run, a
+  scoped change) and what does not (one file it can read, a question it can answer), what a
+  brief carries, and that `nemesis` reads while `themis` runs. A `task` or workflow brief under
+  80 chars that names no file or symbol is refused with the shape of a usable one instead of
+  sending a child to search for its parent's question. `aizen workflow <spec>` caps its
+  synthesis request like the in-conversation tool does (two chars per token of the model's
+  window) instead of building an unbounded one from every task's report.
+
+### Approval, grants and the command guard
+#### Added
+- **You approve what a call will do, not a basename.** Before a destructive call asks for
+  approval, the tool computes its pre-flight payload without doing anything: `file_edit` shows
+  the patch (its own dry-run) in the diff box, `file_write` says create or overwrite and shows
+  the patch against the current content, `shell_run` shows the directory it will run in and the
+  full command line (`python deploy.py --prod --force-delete` used to ask as `deploy.py`), and
+  `file_move` names both ends. The same payload rides the Telegram approval message. Headers
+  and diff-box titles for edits now carry the repo-relative path, so two `mod.rs` edits in one
+  turn are told apart. Nothing is drawn under a session allow-all.
+- **Grant scopes narrower than allow-all.** The approval menu gains `Yes — always for <tool>
+  this session` and `Yes — always for <tool> under <dir> this session` (`t` / `d` on the
+  keyboard); a later call the grant covers runs without asking and says so in the transcript
+  (`auto-approved by grant: file_edit under src/parser`). A project can ship standing grants in
+  `.aizen/approvals.json` (`{"allow": [{"tool": "shell_run", "under": "scripts"}]}`,
+  read on every check). `/approval grants` lists what runs without asking; `/clear` forgets the
+  session's grants with its allow-all. The hard command guard still runs before any grant.
+- **`/approval <mode>` is session-scoped; `--persist` saves it.** A `/yolo` in one window used to
+  write `yolo` into the shared config and arm every other window and every cron job on the
+  machine. `/yolo` and `/smart` now toggle this window only; `/approval yolo --persist` is the
+  explicit way to change the saved default.
+
+#### Fixed
+- **`smart` no longer auto-runs a multi-line command by its first word.** `ls\nrm -rf build` was
+  one segment whose program was `ls`; newlines are command separators now. Read-only programs
+  with writing flags ask (`find -delete`/`-exec`, `fd -x`, `sort -o`, `env CMD`, `git log
+  --output=`), `git branch`/`tag`/`remote` are read-only only in their listing shapes
+  (`git branch feature` creates, `git branch -d` deletes), `cargo fmt` only with `--check`,
+  `cargo clippy` not with `--fix`, and `npm test` / `audit` / `view` / `outdated` ask. bash's
+  `&>` redirect (`cargo build &> build.log`) is no longer misread as file blanking and blocked.
+- **`cli-config.json` is written atomically** (staged temp + rename + owner-only), with the last
+  good file kept as `cli-config.prev.json`; a crash mid-save used to leave a truncated file that
+  loaded as defaults, endpoint and key gone.
+
+### The terminal
+#### Added
+- **A long session paints the viewport, not the session.** The transcript painter now keeps
+  each block's rendered height and walks prefix sums to place the viewport, rendering only the
+  blocks that intersect it plus a page of margin on each side; the row cache is a real LRU
+  (least-recently-used quarter evicted when full) instead of being flushed at 512 entries,
+  which past 512 blocks had re-rendered the whole transcript on every frame. Selection, copy,
+  the scrollbar and hyperlink injection work on the rendered window through a row offset.
+  The first frame after a `/resume`, a resize or a theme switch still measures every block
+  once.
+- **Tool results expand, and a retry says so.** A failed tool row (`exit 101`) now shows the
+  last six lines of its output under the digest with a `… N more line(s) — Ctrl-E expands`
+  hint; `Ctrl-E` opens a result in the scrollable text overlay — the tool under your selection
+  when the selection sits on a tool row, else the most recent (the last 64 results, 12 k chars
+  of tail each, are kept). A send that backs off on a 429/5xx now says `rate-limited —
+  retrying in 43s (2/3)` on the working line and once in the transcript instead of spinning
+  mutely.
+- **Rewind you can review.** `/rewind` now exists (an alias of `/undo` — the verification
+  message had been pointing at a command that did not). Both show the rewind's diff stat
+  (files, `+added −deleted`) before applying, refuse to discard work no checkpoint holds unless
+  you add `--yes`, and name the files they restored in the receipt. On the retained TUI
+  `/diff --patch` renders each file through the same diff box an edit result gets instead of a
+  monochrome dump.
+- **The screensaver waits for a quiet screen, and CJK wraps to the budget.** The idle
+  screensaver (sixel hosts) now needs 15 s without a key AND 60 s without new transcript output,
+  so it no longer covers a long diff or answer you are still reading. Over-long tokens in
+  rendered markdown are split by display width, not by character count — CJK paragraphs came
+  out about twice the width budget.
+- **LSP servers and the `/init` index warm up in the background after the first frame.** The
+  REPL starts as before (nothing runs before the screen is up), then a background task enables
+  the LSP runtime, starts the servers for the languages the project's files use, and refreshes
+  an existing `/init` index incrementally — so the first edit of a session already gets
+  diagnostics and the first `codebase_search` sees today's files. Startup time is unchanged;
+  `AIZEN_NO_WARMUP=1` turns the warm-up off.
+
+#### Fixed
+- **The provider wizard leaves a clean transcript.** Navigation menus (the config hub, the
+  provider list, a provider's actions, the switch and model pickers, the sub-agent screens)
+  no longer print a `· prompt  pick` line for every step; an API key is visible while typed
+  and never echoed into the scrollback afterwards; the Base URL prompt is two words with its
+  guidance and the kept value on their own lines, so a long URL no longer wraps the live input
+  line into redraw fragments; and a scheme is read the way it was meant — `htps://`, a
+  missing `https://`, or the `https://https://…` a paste over a prefilled field produced — instead
+  of bouncing the question back with a doubled prefix. The same rules now hold across the
+  apps, channel, skills, persona, sessions, time-machine and slash-palette menus: navigation
+  leaves no trace, a webhook URL or auth header is never echoed, and the long-value prompts
+  (channel ids, channel URL, skill URL, a role's Base URL) keep their guidance on a line of
+  their own.
+
+### Memory, persona and project context
+#### Added
+- **Memory dedup that actually fires, and `aizen memory consolidate`.** A new fact is now
+  checked in two stages — the lexical match at the usual 0.78, then, for the 0.45–0.78 band, a
+  character-level MinHash (≥ 0.60) together with the accent-folded token measure (≥ 0.55) — and
+  against the other tiers too, so a sentence the store already holds as a `user` fact
+  reinforces that row instead of getting a `project` twin. The same tier at another anchor or
+  device still stays separate. `aizen memory consolidate [--apply]` runs the same check over
+  the whole live store without a model call: dry run by default; `--apply` retires each
+  duplicate (revivable with `aizen memory revive <id>`) and reinforces its survivor, in rounds
+  until nothing surfaces, which is what finally lets an inferred fact reach the frozen core.
+  Every merge is on the audit log with the stage that decided it.
+- **A fact that names the work is filed as a project fact, never a user fact.** A learned
+  sentence that carries a path (`src/core/config.rs`, `C:\work`), a source or manifest file, a
+  project marker ("this repo", "repo này") or the name of the project directory is placed
+  with the work, whatever grammar it was written in — so another project's architecture notes
+  no longer travel with you as preferences. `node.js` is a product, `and/or` and `24/7` are
+  not paths. `aizen bench profile` gains a golden tier-hints set that runs such sentences
+  through the real classifier. Rows learned before this stay where they are.
+- **Recall that clears its own gate, and identifiers that match their words.** The per-turn
+  memory recall gate now judges the block it will show: query words are weighted by how rare
+  they are in your store, only the six most telling count, and a word is covered when any of
+  the top three facts carries it — a long Vietnamese question is no longer refused for its
+  particles. The tokenizer emits an identifier's words alongside the identifier itself
+  (`get_by_id`, `getById`, `rate-limit`), so "get by id" finds `get_by_id` instead of
+  scoring zero. `aizen bench memory` prints the gate's admissions per split with a threshold
+  sweep, which is what the gate is tuned on.
+- **The next prompt no longer waits for the last turn's learning.** The end-of-turn secretary
+  and the persona reflection now run in the background on a copy of the turn; the next turn
+  waits at most 5 s for them (so what the last turn taught is visible to recall) and otherwise
+  goes ahead while they finish. `/quit` waits up to 60 s for a pass still running (Esc skips).
+  Auto-compaction stays inline, since it rewrites the conversation. Chore calls — summaries,
+  the secretary, reflections, reconcile — are capped at 60 s each (`AIZEN_CHORE_CALL_SECS`)
+  instead of 300 s, and when no `summarizer` role is configured they go to
+  `models_by_effort.low` before falling back to the main model.
+- **The prompt-build path stops re-reading the world.** The `<sessions>` rows are cached per
+  transcript file by its modification time and size, and the memory store is parsed
+  incrementally — a recall, the secretary and reconcile each used to re-read and re-parse
+  every fact file; now only new or changed files are parsed and deleted ones drop out.
+- **`CLAUDE.md` is honoured beside `AGENTS.md`, edits are live on the next message, and a
+  character does not learn the same lesson twice.** A directory's `AGENTS.md` and `CLAUDE.md`
+  are both read into `<project_context>` (`AGENTS.md` first, same total cap) — before, the
+  first file found won, so a one-paragraph `AGENTS.md` pointer hid a full `CLAUDE.md`. A
+  convention file added, edited or removed during a conversation is noticed at the next user
+  turn by a stat, and only then are the prompt lanes rebuilt. A persona reflection that
+  restates an insight already on disk reinforces that insight instead of writing a twin.
+- **A persona stays out of coding turns unless you keep it.** The character card, its
+  self-memory and the agent identity — up to ~1,900 tokens a turn — are left out of the prompt
+  on a turn that is an edit, or that follows a turn which used file or shell tools; a question
+  or research turn keeps them, and so does the first turn. `/persona coding on` keeps them on
+  every turn (`persona_for_coding` in config). Telegram and other hosted lanes are untouched.
+
+### Sessions, updates, the time machine and cron
+#### Added
+- **`aizen update` verifies what it installs and keeps the way back for a week.** Every
+  release now ships a `<asset>.sha256` beside each binary; the updater digests the download as
+  it streams and refuses to install on a mismatch (the staged file is discarded, nothing is
+  renamed). A release from before checksums still installs, with a plain "unverified" line.
+  The staged binary is synced to disk before it replaces the live one, and the previous
+  build's backup stays for seven days instead of vanishing at the next launch.
+- **Sessions stop growing without bound, and a long one stops costing a rewrite per turn.**
+  The autosave appends each turn to `<session>.jsonl` and rewrites the full transcript only
+  when the conversation was rewritten (a compaction, a rewound turn) or the delta has grown past
+  20 lines or 1 MiB. A pasted image of 4 KB or more is stored once under `sessions/blobs/` and
+  referenced from the transcript, so the same screenshot never bloats two files. The pool is
+  pruned at autosave — oldest first, never the live conversation — to `sessions_keep` (200)
+  and `sessions_max_bytes` (256 MiB), and blobs nothing references go with them.
+
+#### Fixed
+- **`/undo` now removes the file the agent just created.** A restore used to leave behind any
+  file that was created after the target checkpoint and never committed, then fail its own
+  verification and roll back — the most common rewind of all. The restore now stages the
+  working tree the way a checkpoint sees it, records the files the target lacks in the restore
+  journal before touching anything, removes them with the rest of the update, and names them
+  (`time restore`, `time undo`, `time redo`, `/undo`). Every one of them is in the checkpoint
+  the restore saved first, so `aizen time redo` brings them back.
+- **Scheduled jobs are registered after their spec exists, log owner-only, and report
+  failures; `aizen time gc` finally reclaims space.** `aizen cron add` writes the job spec
+  atomically before the OS entry and removes it if registration fails; the job log is
+  owner-only; a failed run is posted to your configured notify channels. `aizen time gc` now
+  removes the objects no checkpoint reaches — retention used to delete checkpoints while the
+  store kept every byte — re-packing what is kept before it deletes anything.
+
+### Measurement
+#### Added
+- **Record/replay tapes for model calls (`AIZEN_TAPE=record|replay|strict`).** Every model
+  call in the process passes through one tape: `record` appends each answer (with its usage and
+  a fingerprint of what the model was shown, normalised for paths, dates and durations) to
+  `AIZEN_TAPE_FILE`; `replay` answers from the file with no request sent and reports drift;
+  `strict` fails on drift or an exhausted tape. Tools run for real either way.
+- **`aizen bench tasks` — the task suite.** Four fixture crates under `bench-tasks/`
+  (`fix-failing-test`, `fix-build-error`, `add-feature`, and the zero-edit control) are driven
+  through the real loop with the verify gate on; each run is judged on the files — Done reached,
+  `cargo test` exit 0, only `allowed_files` changed — and on steps/tokens against
+  `bench-fixtures/loop-baseline.json` (1.25× slack, repeat-call rate under 2 %). `--record` makes
+  the live calls once and writes the tapes; CI replays them on ubuntu and windows (new `bench`
+  job, which also runs `bench loop`). Tasks without a recorded tape are skipped, not failed.
+- **Measurement that keeps running.** The task suite grows to six fixtures
+  (`refactor-with-tests`, `multi-file-wire`); `aizen bench sessions [--json]` reports the
+  turn-shape statistics of your saved conversations (calls per turn, result sizes and how many
+  sit at the cut, repeated calls, the call mix, read : edit) so a loop change can be judged on
+  real turns; CI gates `cargo fmt --check`, a weekly workflow tests the release profile on
+  Windows, and the REPL turn has its first test — one turn through the real wiring on a tape.
+
+## [0.6.7] — 2026-09-11
+
+Subscriptions arrive. An Aizen plan is now sold by **signing in**, not by pasting a key: sign in
+through the browser and the plan calls models straight away, with a family of commands to buy and
+manage the three subscription kinds — a plan, a marketplace model/combo, and a paid plugin. Every
+line of it is client-side; there are **no server changes** in this release. Ships alongside the
+Pantheon sub-agent roster and the Tool Search slimming carried over from the prior cycle.
+
+### Added
+- **Sign in to Aizen — the subscription is the credential, no key on disk.** `aizen account login`
+  opens the browser (a loopback redirect on `127.0.0.1`, guarded by a random `state`), trades the
+  returned code for a session JWT, and stores it in `~/.aizen/session.json` (owner-only `0600`,
+  kept in a *separate* file from the gateway key so neither is ever handed to the wrong door). Since
+  2026-09-06 that session token opens `/v1` on its own — so after signing in there is nothing to
+  paste and nothing to fetch. `aizen account login --password` remains for the minority of accounts
+  that actually have a password (most are Google/GitHub, whose hash is null); `aizen account whoami`
+  reports who is signed in and **never prints the token**; `aizen account logout` drops the session
+  alone. The token lives ~30 days with no refresh — a 401 mid-run means sign in again, not a retry.
+- **`aizen sub` — buy and manage the three subscription kinds.** `plan`, marketplace `model`/`combo`,
+  and paid `plugin`, each with `ls` / `buy` / `add` / `confirm` / `rm`, plus `quote` and `download`
+  where they apply. Built around the traps that make spending unsafe: **no retry on any call that
+  spends** (a lost answer resent is karma charged twice), the coupon price is the server's quote and
+  never recomputed locally, a `needs_review` hold is surfaced rather than swallowed, `gone`/
+  `cancelled` are shown plainly, and a spend confirms first — with a hard stop (exit `2`) in a
+  non-TTY unless `--yes` is passed. Exit codes are stable: `401/403 → 4`, `429 → 5`,
+  `400/404/409/410/422 → 2`.
+- **`aizen custom` — bring your own provider endpoints (BYOK).** `ls` · `add` · `set` · `rm` for
+  your own OpenAI-compatible roots, managed against the account rather than hand-edited into the
+  config. Needs a session (`aizen account login` first).
+- **`aizen key` — see what the plan key can call, and manage your own keys.** `ls` · `show` ·
+  `rotate` · `reveal` · `loadout` · `models`. The plan's key is shown for reference but has no string
+  to copy — the plan is bought by signing in, and no route mints a string for it. Needs a session.
+- **`aizen login` / `aizen logout` — device pairing, and one word to leave.** `aizen login` pairs
+  this machine by approving a short code (for a box with no browser — SSH, a container, CI) and comes
+  back with a **per-device** credential; `aizen gateway login|logout|status|env` are the narrow verbs
+  for the key alone. `aizen logout` leaves Aizen entirely — the account session **and** the local
+  gateway key — and says plainly that it revokes neither (the token stays valid elsewhere until it
+  expires; the device row stays live until unpinned in the dashboard).
+- **`/login` and `/logout` inside the REPL.** Renew a session that just 401'd, or leave, without
+  dropping the running conversation. `/logout` runs the same teardown and prints the same words as
+  `aizen logout`.
+- **The CLI and the desktop app now recognise each other's sign-in.** Both read the one
+  `~/.aizen/session.json`, so signing in on either side signs in on both. A CLI whose first launch
+  finds a desktop sign-in skips the setup wizard, the splash and status bar name the session
+  endpoint and "signed in as …" instead of "not set", and the turn after the desktop signs out
+  points at `/login` rather than the setup screen. In the reverse direction the desktop window
+  watches the shared files and updates the account card live when `aizen account login` / `aizen
+  logout` runs in a terminal beside it.
+
+- **The Pantheon — seven sub-agent roles, declared in one table.** The four generic sub-agent
+  roles grow into seven named ones: `argus` finds code (read-only, repo-local — no web), `metis`
+  plans, `daedalus` implements (the only role that edits), `nemesis` reviews, `themis` runs
+  tests/builds (shell, no edit), `clio` researches dependencies and docs on the web, and
+  `mnemosyne` recovers prior decisions from memory and session history (read-only recall — the
+  only role holding `session_recall`, and it cannot write memory). Each role carries a short
+  embedded working-method prompt with a fixed report shape (findings with severity for nemesis, a
+  PASS/FAIL verdict with commands for themis, a chronology with superseded decisions for
+  mnemosyne, …), not just a one-line brief — and everything about a role — name, legacy alias,
+  brief, prompt, tool grants, access class (read-only / execute / write), step budget,
+  project-context switch — lives in a single declarative table (`src/agent/roles.rs`), so the
+  tool scoping and the prompt can no longer drift apart. The legacy names
+  `coder`/`planner`/`reviewer`/`tester` remain accepted everywhere, forever (result headers
+  answer with the canonical name); saved workflow specs keep working unchanged.
+  The safety edges that went with the rename:
+  - every sub-agent scope gains `git_inspect`, a closed read-only git window
+    (status/log/diff/show/blame, exec-form argv through the sandbox runner — no shell), so a
+    reviewer can finally read the diff it was dispatched to review;
+  - an `agent` slug or `role` that doesn't resolve is refused with recovery guidance instead of
+    silently running under a substituted scope — and a dispatch with NO role now defaults to
+    read-only `argus`, never a writer;
+  - a specialist card with no `tools:` line runs READ-ONLY (it used to inherit the full coder
+    scope implicitly); cards that edit or run commands now say so in frontmatter
+    (`tools: Edit, Bash` — a shell grant carries the scoped `process` pool);
+  - telegram/notify left the sub-agent toolset — reaching the user is the parent's channel.
+- **Workflow tasks carry the same contract a `task` dispatch does.** Per-task `boundaries`,
+  `expected_output`, `max_steps`, and `expects` now travel from a workflow spec into each child —
+  the same `<contract>` block, the same step-budget clamps, and the same `expects` validation
+  (one repair attempt; the task's status reports `json:ok`/`json:invalid` honestly) as the
+  single-dispatch path, built by the same code rather than a parallel implementation.
+- **Tool Search — dozens of MCP connectors no longer bloat every request.** Connecting a
+  schema-heavy server (GitHub-sized: tens of tools, thousands of schema tokens) used to tax every
+  single turn, called or not, and enough of them crowded real context out of the window. Now the
+  deferral plan keeps the request small: a server pinned `"defer": true` in mcp.json — or picked by
+  the opt-in automatic budget (`"deferAutoTokens"` estimated tokens; largest servers defer first
+  until the advertised remainder fits) — registers its tools as *deferred*: fully callable, but
+  their schemas leave the request. The agent reaches them through a
+  new `tool_search` tool (searches name/server/description/argument names; no query = browse) whose
+  results carry each match's full schema in-band, then calls the found tool directly by its exact
+  name. Because schemas travel in results rather than the `tools` array, that array stays
+  byte-stable all session — connecting more integrations never invalidates the provider's prefix
+  cache — and the mechanism is client-side, so it works on every OpenAI-compatible endpoint. The
+  top-level prompt gains a two-line "Deferred integrations" note (per-server counts, nothing more),
+  `/mcp` marks deferred servers with `deferred → tool_search`, a skill that `requires:` a deferred
+  tool stays applicable, and disabling the `mcp` toolset removes the door along with the rooms.
+  Deferral is deliberately opt-in (nothing defers until `deferAutoTokens` is set or a server is
+  pinned): it needs a provider that accepts a call to an unadvertised tool name, and a measured
+  A/B on one hosted gateway showed its decoder grammar-locking call names to the advertised set —
+  the same model called the tool instantly when advertised and could not produce the call when
+  deferred.
+- **"Continue the most recent session" works again — and this time the model can see it.** Until
+  0.5.0 the request worked by accident: every autosave duplicated the transcript into a fixed
+  `last.json` the model could read blind, and retiring that pointer (right for provenance) silently
+  removed the model's only route to prior work — the startup resume hint prints to the terminal,
+  which the model never sees, so it went spelunking the filesystem instead. Now a fresh
+  conversation's prompt carries a `<sessions>` block naming up to three recent same-project
+  conversations (topic snippet, size, age; a foreign one is offered only when this project has
+  none, labeled with its origin), and a new read-only `session_recall` tool returns a clipped
+  digest — opening request + latest exchanges — to continue from. Restoring a full transcript
+  stays the user's move (`/resume`); no tool loads history.
+- **A per-run scratch directory the prompt actually names.** "Use a temp dir" with no path meant
+  helper scripts, probes and notes landed in the repo or the cwd and stayed there. `<environment>`
+  now carries `scratch: <path>` (per run, under the OS temp dir; sub-agents share the parent's),
+  both prompt tiers direct throwaway files there — the strict tier previously had NO cleanup
+  guidance at all — and abandoned scratch dirs are swept a week after their run dies.
+- **`/theme` — an opt-in `lanes` colour theme.** The default look is unchanged: `moonlight`, the
+  calm all-silver transcript. `/theme lanes` switches to a theme where every kind of work has its
+  own colour, folded straight from the one name→capability routing table: blue = reading/searching
+  the repo, gold = mutating files (deliberately the same warm family as the yolo chip and warnings
+  — "this changes things"), mauve = shell and processes, cyan = the web/browser/MCP, violet =
+  memory/skills/persona, pink = sub-agents and questions to you, teal = plan and checkpoints. Under
+  `lanes`, tool rows and the approval prompt tint the icon + name by lane, the working caption
+  types out in the running tool's hue (the sidebar's "Now" agrees), the plan checklist box wears
+  the plan lane's teal frame, and a diff box's title goes edit-gold to match the row that produced
+  it. Unknown tools stay silver; results keep their meaning — green ok, salmon error — and no lane
+  colour collides with either. Bare `/theme` lists both themes with a live swatch; the choice
+  persists (`"theme": "lanes"`) and switching repaints the transcript in place.
+
+### Changed
+- **The edit diff box grew into side-by-side review panes.** Wide enough, an edit's boxed preview
+  now reads like a review tool instead of a raw patch: the old version on the left pane, the new
+  on the right, real file line numbers in both gutters, removed rows on a deep-red background
+  tint and added rows on a deep-green one, with the surrounding context lines quiet between them
+  — a removed/added pair shares one row, so what replaced what is a single glance. A narrow
+  transcript stacks the same numbered rows in one unified column, and multiple hunks are split by
+  a broken rule. Feeding it, `diff_preview` now opens each window with a standard
+  `@@ -N,c +N,c @@` hunk header (the model gets a line anchor for follow-up edits; the TUI gets
+  its gutter numbers), and the retained renderer's SGR parser learned background colours — which
+  it previously measured and threw away. From 125 columns up, the right edge carries a live
+  dashboard the way the maximized window's spare width deserves: brand + endpoint health; what
+  the agent is doing right now and for how long; the live todo checklist (wrapped to two rows per
+  item, `… +N more` past the fold); the conversation's autosave name over the token tally; the
+  provider the requests go to (the active profile's name, or the endpoint host for a hand-edited
+  `base_url`); connected MCP servers; the LSP chip (off / idle / per-server `lang state`); the
+  memory store (live facts + how many recall injected this session); and the working directory
+  pinned to the bottom row. Model, effort, approval mode, persona and the context gauge
+  deliberately stay OFF the sidebar — the composer's HUD row already shows all five, and
+  repeating them was dead weight. The facts arrive typed (`SessionFacts`), published from the
+  same call site that formats the HUD string, so the two surfaces can never drift apart — and
+  below the threshold every column stays with the conversation.
+- **The splash: wordmark centred above the panel, the sun docked inside on its right flank.** The
+  AIZEN wordmark + tagline sit OUTSIDE the frame, centred over its full width; the braille sun
+  lives INSIDE the frame to the right of the text column, so the panel reads content wall-to-wall
+  instead of a narrow card floating in a wide window. The layout is chosen against the width the
+  transcript pane will ACTUALLY have (`tui::splash_width()` — the retained sidebar's columns
+  already subtracted); the old docked layout measured the raw terminal, and the difference pushed
+  the panel's right edge under the sidebar and clipped it (the "hidden text" report). A pane too
+  narrow for the flank stacks the sun above the wordmark; the sixel (raster) logo always renders
+  above — an image is pixels, not columns, and cannot sit inside a character border.
+
+- **The working clock counts in minutes once it earns them.** The spinner's elapsed readout used to
+  tick raw seconds forever — a long run read `754s` and made the user do the division. Past 60s it
+  now rolls into the same `12m34s` / `2h05m` units the tool-result lines already use, on both the
+  footer working line and the sidebar's "Now" block. Riding beside the clock, a new `↑N tok` chip
+  shows what the turn's latest request carried — estimated the moment each call leaves, corrected
+  to the provider's real input count (cache reads/writes included) when the reply lands, and reset
+  at every turn start.
+- **The diff panes take the whole pane now.** The boxed diff clamped itself to 100 columns, so on
+  a maximized window both panes clipped code at `…` while the right half of the transcript sat
+  empty. The clamp is gone: the box spans the width the transcript pane actually has, and every
+  extra column goes to code.
+- **The sidebar's LSP chip names the language before a server ever starts.** Servers spawn lazily
+  on the first symbol query, and until then the chip said only `idle` — true, but useless. It now
+  reads the project the way the lazy start will (`rust idle`), says `no project` when no supported
+  manifest resolves (so nothing is implied to be pending), and `/lsp status` carries the same
+  detection in prose.
+
+### Fixed
+- **Sandboxed `git` (and any child) can reach `/dev/null` again on Linux.** The Landlock backend
+  granted only the workspace roots, so a sandboxed child that opened a standard pseudo-device died
+  with `Permission denied` on a path that belongs to no workspace — `git status` opens `/dev/null`
+  read-write and fell over exactly there, which broke `git_inspect` under the sandbox runner on
+  Landlock kernels (Windows and macOS were unaffected; the macOS backend already allows `/dev`). The
+  Linux ruleset now also grants the safe pseudo-devices `/dev/{null,zero,full,random,urandom,tty}`.
+- **A window resize can no longer shred the frame.** Dragging the terminal edge — especially with
+  the transcript scrolling at the same time — could leave the screen a collage of torn glyphs and
+  stale rows that no amount of further scrolling repaired. ratatui does clear on every resize it
+  observes, but Windows ConPTY (and VS Code's xterm.js) re-encode the screen themselves during the
+  drag and can mangle cells at a final size the renderer already believes in — after which the
+  cell-diff painter keeps patching tiny deltas on top of garbage forever; only Ctrl-L healed it.
+  The renderer now arms a settle timer on every observed size change (including those seen
+  mid-scroll, when the idle probe never runs) and, 400ms after the storm goes quiet, forces one
+  full clear + repaint to reconcile the screen with the model.
+- **The context gauge is live and honest now.** It used to be computed only at idle from the
+  chars/4 estimate, so it sat frozen through an entire agent run — tool results piling into the
+  context moved it not at all until the turn ended, and the estimate could drift far from what the
+  provider actually counts. The gauge now updates on EVERY model call of the interactive
+  conversation: the outgoing request's estimated size moves it the moment the request leaves, and
+  the provider-reported usage on the reply corrects it to the real number (cache reads/writes
+  included, whichever wire shape the gateway uses), which the idle HUD refresh then prefers over
+  re-estimating. Sub-agent and background chore calls never touch it — they answer for other
+  contexts. The real number is forgotten on `/clear`, `/resume` and compaction, where it no longer
+  describes the history.
+- **Long boot notes fold instead of running off the right edge.** The `sandbox:` degradation
+  warning, the `[dense] loaded …` model line and friends are one long line each; the retained
+  transcript kept non-assistant text rows verbatim and the paint clipped them at the pane edge,
+  so the tail of the message was simply gone. Intro/Generic rows now word-wrap to the pane, and
+  the fold is SGR-aware — a coloured note re-opens its colour on the continuation row, escapes
+  never count toward the width, and pre-aligned whitespace is preserved byte-for-byte.
+- **The binary now cleans up after itself.** A pile of leaks, each individually small and none
+  ever collected: `.aizen-update-*.part` from a download killed mid-stream (now swept at startup
+  once an hour old); `.{name}.aizen-tmp-*` staging orphans from a writer killed mid-rename, in
+  ANY directory `atomic_write` touches — the old sweep only covered the sessions dir (now every
+  destination dir self-heals, once per dir per run); an embedding-model `.part` left by a network
+  error mid-download (every error path now removes it); sandbox private-tmp dirs, previously swept
+  only by `aizen sandbox doctor` (now also at startup); `aizen time gc --all --apply`'s `.trash`,
+  which nothing ever emptied (now purged past 30 days on the next apply); and the two append-only
+  logs with no ceiling, `learning-audit.jsonl` (2 MiB) and per-job cron logs (1 MiB), which now
+  rotate to a single `.1` generation like the sandbox audit log always did.
+- **The identical-re-read short-circuit now fires where the reads actually happen.** Three
+  structural bypasses, found by audit: the cache was a loop local, so it died at the end of every
+  user turn while history (where the proof lives) persisted — it now survives per conversation and
+  every hit still re-proves itself byte-level against the current history and the current file
+  bytes; an eager-started call was exempt, which in a batched turn exempted every call but the
+  last — a proven hit now replaces the eager result instead of yielding to it; and the
+  `files:[…]` batch form was never recorded at all — it now fingerprints every file in the call.
+  The `[unchanged]` pointer also names the earlier tool-result id, so a model that cannot find the
+  content re-uses it instead of re-asking with slightly different args and missing the cache.
 
 ## [0.6.6] — 2026-08-21
 

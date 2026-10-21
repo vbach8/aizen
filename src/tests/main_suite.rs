@@ -349,7 +349,7 @@ async fn a_total_deadline_truncates_a_healthy_stream_but_the_shared_client_has_n
     );
 }
 
-/// A background chore call (secretary, persona reflection, compaction, reconcile, handoff,
+/// A background chore call (secretary, persona reflection, compaction, reconcile,
 /// persona-distill) must be TIME-BOUNDED, not merely byte-bounded.
 ///
 /// Every one of those routes the NON-streaming `chat_with_tools`, whose only native guard is
@@ -365,6 +365,10 @@ async fn a_total_deadline_truncates_a_healthy_stream_but_the_shared_client_has_n
 /// awaiting a byte that never comes. `AIZEN_SUBAGENT_CALL_SECS=1` shrinks the ceiling so the test
 /// finishes in ~1s; the env lock keeps it from racing the other env-touching tests.
 #[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "The env fixture lock must cover the awaited request; the loopback server does not acquire it"
+)]
 async fn a_chore_call_against_a_silent_gateway_returns_err_not_a_permanent_park() {
     use tokio::io::AsyncReadExt;
 
@@ -475,6 +479,10 @@ fn the_steer_guard_closes_the_mailbox_and_requeues_what_the_turn_never_took() {
 /// wrapper must (a) report in-flight so Esc routes to cancel, (b) actually return on cancel
 /// rather than waiting out the call, and (c) leave the slot clean for the next turn.
 #[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "Serialize the global cancel fixture for the full request; the presser only uses the cancel slot"
+)]
 async fn cancellable_slash_lets_esc_abort_a_hung_model_call() {
     let _g = tui::TEST_CANCEL_LOCK
         .lock()
@@ -700,6 +708,58 @@ fn most_recent_session_prefers_this_project_over_a_newer_foreign_one() {
         Some("from else (path gone)"),
         "a vanished origin must be flagged, not presented as a live project"
     );
+
+    std::env::remove_var("AIZEN_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The `<sessions>` block and `session_recall` are the model-visible replacement for the retired
+/// `last.json` pointer: a fresh conversation must SEE this project's recent conversations and be
+/// able to pull a digest, or "continue the most recent session" degrades to the model spelunking
+/// the filesystem for transcripts (the regression that motivated both).
+#[test]
+fn sessions_block_and_digest_surface_recent_work_to_the_model() {
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let home = std::env::temp_dir().join(format!("aizen-sess-block-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::env::set_var("AIZEN_HOME", &home);
+    set_session_slug(None);
+    std::fs::create_dir_all(sessions_dir()).unwrap();
+
+    let history = vec![
+        Message::system("lane".to_string()),
+        Message::user("please fix the composer wrapping bug".to_string()),
+        Message::assistant("done — the composer now wraps downward".to_string()),
+    ];
+    save_session(&history, "fix-composer-0821", Some("m1")).unwrap();
+
+    let block = crate::core::session_store::recent_sessions_block()
+        .expect("a non-empty pool must render a block");
+    assert!(block.starts_with("<sessions>") && block.trim_end().ends_with("</sessions>"));
+    assert!(block.contains("fix-composer-0821"), "row names the file");
+    assert!(
+        block.contains("please fix the composer"),
+        "row carries the topic snippet: {block}"
+    );
+    assert!(
+        block.contains("session_recall"),
+        "the block must say HOW to continue"
+    );
+
+    // Default digest resolves to the newest same-project conversation; both ends of the
+    // conversation appear, and the restore path is stated as the user's move.
+    let digest = crate::core::session_store::session_digest(None).unwrap();
+    assert!(digest.contains("fix-composer-0821"));
+    assert!(digest.contains("please fix the composer wrapping bug"));
+    assert!(digest.contains("wraps downward"));
+    assert!(digest.contains("/resume"));
+    // By-name works; a name that does not exist reports plainly instead of guessing.
+    assert!(crate::core::session_store::session_digest(Some("fix-composer-0821")).is_ok());
+    let err = crate::core::session_store::session_digest(Some("no-such-session"))
+        .expect_err("unknown name must error");
+    assert!(err.to_string().contains("no-such-session"));
 
     std::env::remove_var("AIZEN_HOME");
     let _ = std::fs::remove_dir_all(&home);
@@ -1108,7 +1168,8 @@ fn restoring_the_legacy_last_pointer_rehomes_it_to_a_named_file() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// The `/handoff` seed is conversation content, not prompt prefix: a lane rewrite (what
+/// A handoff seed (the retired `/handoff` wrote one; saved sessions may still carry it) is
+/// conversation content, not prompt prefix: a lane rewrite (what
 /// `/config` and `/model` do via `refresh_prompt_lanes_in_place`) must splice AROUND it.
 /// Before the marker, the splice consumed it and the fresh thread silently lost its context.
 #[test]
@@ -1266,19 +1327,22 @@ fn classify_health_probe_rules() {
 fn effort_turn_line_names_the_tier_or_default() {
     // The per-turn status line must contain the tier name (or "default" when the field is
     // omitted), regardless of colour stripping under the test harness.
-    assert!(effort_turn_line(Some("high")).contains("high"));
-    assert!(effort_turn_line(Some("low")).contains("low"));
+    assert!(effort_turn_line(Some("high"), None).contains("high"));
+    assert!(effort_turn_line(Some("low"), None).contains("low"));
     assert!(
-        effort_turn_line(Some("xhigh")).contains("xhigh"),
+        effort_turn_line(Some("xhigh"), None).contains("xhigh"),
         "xhigh rung named"
     );
     assert!(
-        effort_turn_line(Some("max")).contains("max"),
+        effort_turn_line(Some("max"), None).contains("max"),
         "max rung named"
     );
-    assert!(effort_turn_line(None).contains("default"), "None ⇒ default");
     assert!(
-        effort_turn_line(Some("high")).contains("effort:"),
+        effort_turn_line(None, None).contains("default"),
+        "None ⇒ default"
+    );
+    assert!(
+        effort_turn_line(Some("high"), None).contains("effort:"),
         "always prefixed"
     );
 }
@@ -1547,7 +1611,7 @@ fn suggested_name_drops_credential_shaped_tokens() {
         "ghp_abcdefghijklmnopqrstuvwxyz0123",
     ];
     for k in keyish {
-        let name = suggest_session_name(&[Message::user(&format!("{k}"))]);
+        let name = suggest_session_name(&[Message::user(k)]);
         assert!(
             name.starts_with("chat-"),
             "a lone key must fall back to the generic stem, got {name}"
@@ -1558,7 +1622,7 @@ fn suggested_name_drops_credential_shaped_tokens() {
             "key material reached the name: {name}"
         );
         // With surrounding prose the topic survives and only the key is dropped.
-        let mixed = suggest_session_name(&[Message::user(&format!("set my api key to {k}"))]);
+        let mixed = suggest_session_name(&[Message::user(format!("set my api key to {k}"))]);
         assert!(mixed.starts_with("set-my-api-key"), "topic lost: {mixed}");
         assert!(
             !mixed.contains(&core.to_lowercase()),
@@ -1689,4 +1753,28 @@ fn exit_flush_persists_the_live_conversation_for_sessions() {
     set_session_slug(None);
     std::env::remove_var("AIZEN_HOME");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The product name is part of the software's contract, not decoration: the binary name, the home
+/// directory every saved session lives under, and the update channel all derive from it. A rename
+/// that lands here by accident — a "consistency" pass, a fork's find-and-replace — would silently
+/// strand existing installs, so the identity is pinned where the test suite runs.
+///
+/// A fork that deliberately rebrands is expected to change these assertions along with everything
+/// in `TRADEMARK.md`'s checklist. That is the point: the change becomes a decision someone made,
+/// visible in the diff, rather than a side effect.
+#[test]
+fn the_product_identity_is_pinned() {
+    assert_eq!(
+        env!("CARGO_PKG_NAME"),
+        "aizen",
+        "the package/binary name is the update channel's and every installer's contract"
+    );
+    // The data root is `<home>/.aizen`. Checked through the resolver rather than by reading the
+    // environment, so this holds in a test process with any HOME/AIZEN_HOME.
+    let probe = std::path::Path::new("/tmp/identity-probe");
+    assert!(
+        crate::core::config::resolve_default_home_for_test(probe).ends_with(".aizen"),
+        "the home directory holds every saved session; renaming it strands them"
+    );
 }

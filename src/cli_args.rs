@@ -24,6 +24,10 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Parsed once per invocation; keep the clap command schema and dispatch types unboxed"
+)]
 pub(crate) enum Commands {
     /// Stream a chat completion from an OpenAI-compatible endpoint.
     Chat(ChatArgs),
@@ -33,6 +37,30 @@ pub(crate) enum Commands {
     /// Run a workflow: fan out a set of role-scoped sub-agents (from a JSON spec), then
     /// synthesize their results into one answer (mixture-of-agents).
     Workflow(WorkflowArgs),
+    /// Read a run's event log (JSONL) and report its state: which events completed, which are
+    /// unresolved (failed tool calls), and the next sequence number a resume would start from.
+    /// Read-only — never writes. Alias of `run-status` (the name the Phase-1 design doc uses).
+    #[command(alias = "run-status")]
+    Status {
+        /// The run id (as passed to `aizen status <id>`). Matches the JSONL filename under
+        /// the run's scratch dir, without the `.jsonl` extension.
+        run_id: String,
+    },
+    /// Resume an interrupted workflow run: read the run's event log, skip the tasks already
+    /// recorded as done, and re-run only the rest (zero LLM tokens re-spent on finished work).
+    /// Without `--spec` this is a dry-run. Alias of `run-resume`.
+    #[command(alias = "run-resume")]
+    Resume {
+        /// The run id (as passed to `aizen resume <id>`; also printed by `workflow` at start).
+        run_id: String,
+        /// Path to the workflow spec (JSON or YAML). Required for a real resume: the log holds
+        /// outcomes, not prompts, so re-running the surviving tasks needs the original spec.
+        #[arg(long, value_name = "path")]
+        spec: Option<String>,
+        /// Skip the confirmation prompt before a real resume.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Manage the CLI's memory brain.
     Memory {
         #[command(subcommand)]
@@ -70,8 +98,52 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         cmd: AuthCmd,
     },
+    /// Pin this machine to the Aizen gateway: one domain, a short code you approve in a browser,
+    /// and the key + endpoints come back. Same as `aizen gateway login`.
+    Login(GatewayLoginArgs),
+    /// Leave Aizen on this machine: sign out AND drop the local gateway key. Revokes nothing.
+    ///
+    /// Use `aizen account logout` for the session alone, or `aizen gateway logout` for the key.
+    Logout(GatewayLogoutArgs),
+    /// The Aizen gateway: pin this machine (`login`), see what the key is allowed to do
+    /// (`status`), hand the two base URLs to another tool (`env`), or drop the key (`logout`).
+    Gateway {
+        #[command(subcommand)]
+        cmd: GatewayCmd,
+    },
+    /// Your Aizen account session (email + password → `/auth/*`), which is NOT the gateway key:
+    /// `login` · `whoami` · `logout`. Required before `aizen sub`.
+    Account {
+        #[command(subcommand)]
+        cmd: AccountCmd,
+    },
+    /// Buy and manage subscriptions: `plan`, `combo`, marketplace `model`, and paid `plugin`.
+    /// Needs an account session — run `aizen account login` first.
+    Sub {
+        #[command(subcommand)]
+        cmd: SubCmd,
+    },
+    /// Your own provider endpoints (BYOK): `ls` · `add` · `set` · `rm`.
+    /// Needs an account session — run `aizen account login` first.
+    Custom {
+        #[command(subcommand)]
+        cmd: CustomCmd,
+    },
+    /// Your API keys and what the plan key can call: `ls` · `show` · `rotate` · `reveal` ·
+    /// `loadout` · `models`.
+    /// Needs an account session — run `aizen account login` first.
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
+    },
     /// List the models the provider advertises (GET {base}/models).
     Models(ModelsArgs),
+    /// Show the lifecycle hooks configured under `hooks` in ~/.aizen/cli-config.json — your own
+    /// commands run before/after tool calls and when a run ends — and whether they are enabled.
+    Hooks {
+        #[arg(long)]
+        json: bool,
+    },
     /// Crawl a website (katana-style): BFS over HTTP, extract links from HTML + endpoints from JS.
     Crawl(CrawlArgs),
     /// Reach doctor: live-probe every web-access backend and show which serves each platform.
@@ -139,6 +211,12 @@ pub(crate) enum Commands {
     },
     /// Show where aizen keeps THIS project's state: root, zone slug, git executable, home dirs.
     Where,
+    /// List this workspace's durable artifacts and this process's managed scratch (read-only).
+    Files {
+        /// Omit to list both roots; never reads file contents or deletes files.
+        #[arg(value_enum)]
+        kind: Option<crate::cli::files_cmd::FilesKind>,
+    },
     /// The OS sandbox around model/repo-influenced commands: status · doctor · explain · run.
     Sandbox {
         #[command(subcommand)]
@@ -182,6 +260,30 @@ pub(crate) enum Commands {
     /// (newer or older). The running terminal keeps the version it started with; the next terminal
     /// picks up the installed one.
     Update,
+    /// Build (or refresh) the codebase index non-interactively — the engine behind `/init`, for
+    /// scripts and the desktop app's Codebase map tab.
+    Init {
+        /// Only report the existing index's state, don't build.
+        #[arg(long)]
+        status: bool,
+        /// Rebuild from scratch, ignoring the stored chunk cache.
+        #[arg(long)]
+        force: bool,
+        /// Machine-readable progress: `PROGRESS {json}` lines on stdout.
+        #[arg(long)]
+        progress: bool,
+        /// After indexing, detect + run the fast verify commands once (same as `/init`).
+        /// Off by default here: a headless run must not surprise-launch builds.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Voice input (F9/F10 hold-to-talk): install the sherpa-onnx engine + speech models.
+    /// (`--features voice` builds only.)
+    #[cfg(feature = "voice")]
+    Voice {
+        #[command(subcommand)]
+        cmd: VoiceCmd,
+    },
     /// Show a byte breakdown of what every turn resends: the system prompt (static base +
     /// environment + memory lanes) and the JSON tool schemas. Runs offline — no request is made.
     #[command(name = "prompt-size")]
@@ -192,12 +294,30 @@ pub(crate) enum Commands {
         /// Per-tool schema sizes, largest first.
         #[arg(long)]
         tools: bool,
+        /// Audit the lanes as a prompt cache sees them: every block's size, a rebuild check
+        /// (are two consecutive builds byte-identical?), and any content that will differ on the
+        /// next turn — ages, message counts, clock times — which is exactly what breaks the cached
+        /// prefix.
+        #[arg(long)]
+        live: bool,
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
     },
     /// Render the moonlit braille art scene (one frame) to the terminal.
     Art,
+}
+
+/// `aizen voice …` — the opt-in speech engine (`--features voice` builds only).
+#[cfg(feature = "voice")]
+#[derive(Subcommand, Debug)]
+pub(crate) enum VoiceCmd {
+    /// Download, verify, and extract the sherpa-onnx engine + speech models into ~/.aizen/voice/.
+    Install {
+        /// Also install the English streaming pack for F10 (~484 MiB compressed).
+        #[arg(long)]
+        with_english: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -336,7 +456,8 @@ pub(crate) enum McpCmd {
     /// aizen's specialists. Serves the repo it is started in.
     Serve {
         /// Allow dispatches that can edit files or run shell. Without it the server refuses any
-        /// coder/tester role and any specialist whose card grants a destructive tool.
+        /// write-capable role (daedalus/themis — legacy coder/tester) and any specialist whose
+        /// card grants a destructive tool.
         #[arg(long)]
         yes: bool,
     },
@@ -399,7 +520,7 @@ pub(crate) enum SkillCmd {
     Fetch {
         /// Absolute http(s) URL to a markdown skill file (e.g. a gist/raw GitHub link).
         url: String,
-        /// Override the skill name (else taken from frontmatter, else the URL filename).
+        /// Local lookup alias (else frontmatter name, else the URL filename); preserves the source name.
         #[arg(short, long)]
         name: Option<String>,
     },
@@ -411,10 +532,24 @@ pub(crate) enum SkillCmd {
         #[arg(short, long)]
         limit: Option<usize>,
     },
-    /// Install a skill from agentskill.sh by "owner/name" (or exact name) and save it locally.
+    /// Install a marketplace skill or a public GitHub skill directory (never replaces a copy).
+    #[command(group(clap::ArgGroup::new("source").required(true).multiple(false).args(["slug", "github"])))]
     Install {
-        /// The skill id, e.g. `NousResearch/spike` (from `aizen skill search`).
-        slug: String,
+        /// Marketplace id, e.g. `NousResearch/spike` (from `aizen skill search`).
+        #[arg(conflicts_with_all = ["github", "path", "reference", "name"])]
+        slug: Option<String>,
+        /// Public GitHub repository, in OWNER/REPO form.
+        #[arg(long, value_name = "OWNER/REPO", requires = "path")]
+        github: Option<String>,
+        /// Directory containing SKILL.md, relative to the GitHub repository root.
+        #[arg(long, value_name = "PATH", requires = "github")]
+        path: Option<String>,
+        /// Branch, tag, or commit (default: the repository's default branch; resolved to a SHA).
+        #[arg(long = "ref", value_name = "REF", requires = "github")]
+        reference: Option<String>,
+        /// Local lookup alias; the upstream name and document stay unchanged.
+        #[arg(long, value_name = "NAME", requires = "github")]
+        name: Option<String>,
     },
 }
 
@@ -575,14 +710,33 @@ pub(crate) enum TimeCmd {
         #[arg(short, long)]
         keep: Option<usize>,
     },
+    /// Delete specific checkpoints by id (disk is reclaimed by the next `aizen time gc`).
+    Rm {
+        /// Checkpoint ids (from `aizen time list`). The active point is refused — restore
+        /// somewhere else first.
+        #[arg(required = true)]
+        ids: Vec<u32>,
+    },
     /// Inspect ledger/refs/sidecars/journal without mutating the working tree.
     Doctor {
         /// Emit a machine-readable JSON report.
         #[arg(long)]
         json: bool,
         /// Recover/rollback a valid interrupted transaction before reporting.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["cohort", "prepared", "resources", "record_observation"])]
         repair: bool,
+        /// Select one speculative cohort; inspection is read-only unless --record-observation is set.
+        #[arg(long, requires = "prepared")]
+        cohort: Option<String>,
+        /// Exact immutable integration-prepared record ID for --cohort.
+        #[arg(long, requires = "cohort")]
+        prepared: Option<String>,
+        /// Caller-selected exact file; repeat for every prepared file. Never inferred from evidence.
+        #[arg(long = "resource", value_name = "PATH", requires_all = ["cohort", "prepared"])]
+        resources: Vec<String>,
+        /// Append a nonterminal inspection observation only; never settles, replays or changes source.
+        #[arg(long, requires_all = ["cohort", "prepared"], conflicts_with = "repair")]
+        record_observation: bool,
     },
     /// Remove orphan Time Machine refs/sidecars after validating the authoritative ledger.
     ///
@@ -695,6 +849,374 @@ pub(crate) struct CrawlArgs {
     pub(crate) show_source: bool,
 }
 
+/// `aizen gateway …` — device pairing against the Aizen gateway, and what the key can do.
+#[derive(Subcommand, Debug)]
+pub(crate) enum GatewayCmd {
+    /// Pin this machine: print a short code, wait for it to be approved in a browser, save the key.
+    Login(GatewayLoginArgs),
+    /// What the gateway says this key is: endpoints, default model, limits, karma left.
+    Status(GatewayStatusArgs),
+    /// The two base URLs as environment variables, for a tool that is not this CLI.
+    Env(GatewayEnvArgs),
+    /// Remove the local key. Does NOT revoke it — unpin the device in the dashboard for that.
+    Logout(GatewayLogoutArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayLoginArgs {
+    /// What this machine is called in the dashboard. Defaults to the hostname.
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+    /// The config profile the key is written into.
+    #[arg(long, default_value = "aizen")]
+    pub(crate) profile: String,
+    /// Save the endpoint without making it the one this CLI uses.
+    #[arg(long)]
+    pub(crate) no_activate: bool,
+    /// Do not try to open a browser — a server, an SSH session, a headless box.
+    #[arg(long)]
+    pub(crate) no_browser: bool,
+    /// Print the result as JSON. The key is never included.
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Gateway root (overrides AIZEN_GATEWAY_URL). Only for staging.
+    #[arg(long, value_name = "URL")]
+    pub(crate) gateway: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayStatusArgs {
+    /// Which config profile's key to ask with. Defaults to the pinned one.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+    /// Print the gateway's own answer as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Gateway root (overrides AIZEN_GATEWAY_URL). Only for staging.
+    #[arg(long, value_name = "URL")]
+    pub(crate) gateway: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayEnvArgs {
+    /// Prefix each line so it can be sourced (`export …`, or `$env:…` on Windows).
+    #[arg(long)]
+    pub(crate) export: bool,
+    /// Also print the API key. Off by default: this puts a live secret in your scrollback.
+    #[arg(long)]
+    pub(crate) with_key: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayLogoutArgs {
+    /// Which config profile to clear. Defaults to the pinned one.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+}
+
+/// `aizen account …` — the session that opens `/auth/*` (plans, subscriptions, plugins).
+#[derive(Subcommand, Debug)]
+pub(crate) enum AccountCmd {
+    /// Sign in through the browser and store the session token (never the gateway key).
+    Login(AccountLoginArgs),
+    /// Show the signed-in account. Never prints the token.
+    Whoami {
+        /// Print as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the stored session, and nothing else. `aizen logout` drops the pinned key too.
+    Logout,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct AccountLoginArgs {
+    /// Sign in with an email and password instead of through the browser.
+    ///
+    /// Only works for an account that HAS a password. Most do not: an account created through
+    /// Google or GitHub has a null hash, and no string typed at a prompt can match it.
+    #[arg(long)]
+    pub(crate) password: bool,
+    /// Account email. Prompted if omitted. Used only with `--password` — the browser flow takes the
+    /// address from the session it opens.
+    #[arg(long)]
+    pub(crate) email: Option<String>,
+    /// Web host for the session API. Defaults to the saved one, else the built-in
+    /// (overridable with AIZEN_WEB_URL). Not derived from the gateway URL.
+    #[arg(long, value_name = "URL")]
+    pub(crate) web_url: Option<String>,
+}
+
+/// `aizen sub …` — what an account can buy.
+///
+/// `combo` and `model` are two names for one door: both are marketplace *listings*, both are
+/// subscribed to and cancelled through `/auth/subscriptions`, and the server decides which kind a
+/// listing id names. They are separated here only because they are browsed differently — a combo is
+/// a shelf you look at before buying, a subscription is a thing you already hold.
+#[derive(Subcommand, Debug)]
+pub(crate) enum SubCmd {
+    /// The account plan.
+    Plan {
+        #[command(subcommand)]
+        cmd: PlanCmd,
+    },
+    /// Marketplace combos on offer (subscribe with `aizen sub model add <listing-id>`).
+    Combo {
+        #[command(subcommand)]
+        cmd: ComboCmd,
+    },
+    /// Listing subscriptions you hold — combos and seller models alike.
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCmd,
+    },
+    /// Paid plugins.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ComboCmd {
+    /// List the combos on offer, with what each costs and whether you can call it.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PlanCmd {
+    /// List available plans.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Buy or switch to a plan (spends karma — confirms first unless --yes).
+    Buy {
+        plan_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ModelCmd {
+    /// List your model subscriptions (cancelled ones hidden unless --all).
+    Ls {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Subscribe to a listing — a seller model or a combo (e.g. aizen/deepseek).
+    Add {
+        listing_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm a price change so a blocked subscription works again.
+    Confirm {
+        listing_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a model subscription.
+    Rm {
+        listing_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PluginCmd {
+    /// List plugins and what you own.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the final price (after a coupon). Does not buy.
+    Quote {
+        slug: String,
+        #[arg(long)]
+        code: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Buy a plugin (spends karma — confirms first unless --yes).
+    Buy {
+        slug: String,
+        #[arg(long)]
+        code: Option<String>,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download a plugin you own.
+    Download {
+        slug: String,
+        /// Where to save the file (default: the server's filename, else <slug>.zip).
+        #[arg(short = 'o', long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+/// `aizen custom …` — your own provider endpoints, called with your own key (BYOK).
+///
+/// Calls through one of these are billed by the provider directly, so they spend no karma and eat
+/// no plan quota. They are still logged: a "what did my agent do" table missing half the calls is a
+/// table that lies.
+#[derive(Subcommand, Debug)]
+pub(crate) enum CustomCmd {
+    /// List your endpoints (never shows a key — only whether one is stored).
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add an endpoint. The prefix becomes the model namespace: `mine` → call `mine/gpt-4o`.
+    Add {
+        /// A name for you. Must be unique across your endpoints.
+        name: String,
+        /// Model prefix: lowercase letters, digits and dashes only.
+        prefix: String,
+        /// Upstream base URL. Must be http(s); private/internal addresses are refused (SSRF guard).
+        base_url: String,
+        /// The provider key to call it with. Prompted (no echo) if omitted.
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
+        /// Request timeout in seconds.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change an endpoint. Only the flags you pass are touched.
+    Set {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, value_name = "URL")]
+        base_url: Option<String>,
+        /// Replace the stored key. Prompted (no echo) if given with no value.
+        #[arg(long, value_name = "KEY", num_args = 0..=1, default_missing_value = "")]
+        key: Option<String>,
+        /// Forget the stored key, leaving the endpoint otherwise intact.
+        #[arg(long, conflicts_with = "key")]
+        clear_key: bool,
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u32>,
+        /// Stop routing to it without deleting it.
+        #[arg(long)]
+        disable: bool,
+        /// Route to it again.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete an endpoint.
+    Rm {
+        id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `aizen key …` — your API keys, and what your plan is allowed to call.
+///
+/// Your plan is not a key you can copy: the subscription is sold by signing in, and
+/// `aizen account login` is the whole of it. A row still stands behind the account server-side —
+/// marked by the `plan_key` flag, never by its label — because that row carries the loadout, the
+/// ceiling and the budget. Nothing emits its string, so nothing here prints one.
+///
+/// It behaves unlike every other key: it calls Aizen's own plan items only, and an EMPTY loadout
+/// means it can call nothing at all — the opposite of what an empty allow-list means elsewhere.
+///
+/// There is deliberately no `revoke`, and no `show`/`rotate`: the plan's row cannot be re-made, and
+/// the two routes that once printed and replaced its string were withdrawn before they shipped.
+#[derive(Subcommand, Debug)]
+pub(crate) enum KeyCmd {
+    /// List your API keys. Shows the visible head only, never the key itself.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the full string of a key you made yourself. Requires --id.
+    ///
+    /// There is no default: your plan has no string to reveal, so guessing one here could only
+    /// produce a refusal that reads like a bug.
+    Reveal {
+        /// Which key — `aizen key ls` lists them.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The plan key's loadout — the plans it may call, in `auto` preference order.
+    Loadout {
+        #[command(subcommand)]
+        cmd: LoadoutCmd,
+    },
+    /// What each loadout entry can actually call, resolved through the marketplace.
+    Models {
+        /// Only this loadout entry.
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum LoadoutCmd {
+    /// Show the loadout in order. `auto` picks the first entry that is callable right now.
+    Ls {
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace the whole loadout. Order matters — it is `auto`'s preference order.
+    Set {
+        /// Plan names, best first. Max 10.
+        models: Vec<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append to the loadout (read, modify, write — the route only takes a whole list).
+    Add {
+        models: Vec<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove entries from the loadout.
+    Rm {
+        models: Vec<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// `aizen auth …` — experimental provider OAuth (ChatGPT Codex).
 #[derive(Subcommand, Debug)]
 pub(crate) enum AuthCmd {
@@ -710,6 +1232,10 @@ pub(crate) enum AuthCmd {
 }
 
 #[derive(Subcommand, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "One-shot config parsing; preserve flag and dispatch types instead of boxing only for lint"
+)]
 pub(crate) enum ConfigCmd {
     /// Set one or more config fields (only the flags you pass are changed).
     Set {
@@ -852,7 +1378,7 @@ pub(crate) enum ConfigCmd {
         /// Saved provider profile the summarizer runs on (`roles.summarizer.provider`). Empty clears.
         #[arg(long)]
         summarizer_provider: Option<String>,
-        /// Model for compaction/handoff summaries (`roles.summarizer`) — the classic cheap-model
+        /// Model for compaction summaries (`roles.summarizer`) — the classic cheap-model
         /// slot. Empty clears.
         #[arg(long)]
         summarizer_model: Option<String>,
@@ -996,6 +1522,37 @@ pub(crate) enum BenchCmd {
     /// Offline loop-behavior eval (P4): drive the real agent loop with scripted models over ~15
     /// scenarios and report the Section-10 metrics (steps/task, loop-stop rate, verified-done).
     Loop,
+    /// Task suite: the real loop and real tools on the fixture crates under `bench-tasks/`, with
+    /// the model's answers replayed from recorded tapes (offline, no key). `--record` makes the
+    /// live calls once and writes the tapes; a task without a tape is reported as skipped.
+    Tasks {
+        /// Run only this task id.
+        #[arg(long)]
+        task: Option<String>,
+        /// Make the real model calls and write a fresh tape per task (spends tokens).
+        #[arg(long)]
+        record: bool,
+        /// Make the real model calls and leave the tapes alone.
+        #[arg(long)]
+        live: bool,
+        /// Tape name under `bench-tasks/<id>/tapes/`.
+        #[arg(long, default_value = "default")]
+        tape: String,
+        /// Write the passing tasks' steps and tokens as the new baseline.
+        #[arg(long)]
+        update_baseline: bool,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Turn-shape statistics over this machine's saved conversations: tool calls per user turn,
+    /// result sizes and how many sit at the cut, repeated calls, the call mix, read : edit. The
+    /// numbers behind the fast-lean plan's §1.2; run before a release and after a loop change.
+    Sessions {
+        /// Print the statistics as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -1018,6 +1575,9 @@ pub(crate) struct ChatArgs {
 pub(crate) struct AgentArgs {
     /// The task for the agent to accomplish.
     pub(crate) task: String,
+    /// Session-scoped visual design guidance: auto | on | off. Never writes saved configuration.
+    #[arg(long, value_name = "MODE", default_value = "auto")]
+    pub(crate) design: crate::agent::design::DesignMode,
     /// OpenAI-compatible base URL (else AIZEN_BASE_URL / saved config).
     #[arg(long, env = "AIZEN_BASE_URL")]
     pub(crate) base_url: Option<String>,
@@ -1038,6 +1598,13 @@ pub(crate) struct AgentArgs {
     /// invocation would bury the pool the picker reads.
     #[arg(long)]
     pub(crate) save_session: bool,
+    /// Resume a saved session by slug: the stored transcript is loaded in place of a fresh
+    /// conversation (prompt lanes rebuilt for the current project/model, the same contract as
+    /// /resume in the REPL) and the task is appended as the next user turn. With --save-session
+    /// the run keeps saving back into that same slug, so a front-end can chain runs into one
+    /// continuous conversation.
+    #[arg(long, value_name = "SLUG")]
+    pub(crate) resume: Option<String>,
     /// Reasoning effort for this run: auto | low | medium | high | xhigh | max. `auto` classifies
     /// the task the way the REPL classifies a typed turn. Omitted ⇒ the configured
     /// `reasoning_effort` is used, exactly as before. This flag never writes the config.
@@ -1049,6 +1616,18 @@ pub(crate) struct AgentArgs {
     /// attach produce. A path that is not a readable image fails the run rather than being dropped.
     #[arg(long = "image", value_name = "PATH")]
     pub(crate) image: Vec<String>,
+    /// Authorize current --image attachments as exact references for this task and same-route
+    /// delegates. Does not grant another provider/account or declare vision capability.
+    #[arg(long, requires = "image")]
+    pub(crate) reference_images: bool,
+    /// Output format. `text`: the human transcript (answer on stdout, trace on stderr).
+    /// `stream-json`: one JSON record per line on stdout in Claude Code's stream-json shape —
+    /// `system`/`init`, `stream_event` deltas, `assistant` and `user` messages with `tool_use` /
+    /// `tool_result` blocks, `control_request` for approvals (answered on stdin with a
+    /// `control_response`), `result` last — for a front-end or script driving this run. `json`:
+    /// only the closing `result` object. The contract is in REFERENCE.md.
+    #[arg(long, value_name = "FORMAT", value_parser = ["text", "json", "stream-json"], default_value = "text")]
+    pub(crate) output_format: String,
 }
 
 #[derive(Parser, Debug)]
@@ -1071,6 +1650,10 @@ pub(crate) struct WorkflowArgs {
     /// Write a JSON audit trace of the fan-out (per-task model + outcome + synthesis model) here.
     #[arg(long)]
     pub(crate) trace: Option<String>,
+    /// Resume an interrupted workflow run: reuse its run id so tasks already logged as done
+    /// are skipped instead of re-run. Pass the same id shown in `run-list`.
+    #[arg(long, value_name = "run_id")]
+    pub(crate) resume: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1219,6 +1802,13 @@ pub(crate) enum MemoryCmd {
     },
     /// Run anti-bloat maintenance (enforce the inferred-fact LRU cap → archive victims).
     Compact,
+    /// Merge near-duplicate facts locally, no model call: the two-stage check the write path uses
+    /// (lexical, then MinHash + normalised tokens), run once over the whole live store. Dry run
+    /// unless `--apply`; applying retires each duplicate (revivable) and reinforces its survivor.
+    Consolidate {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Judge suspicious near-duplicate pairs in one model call (dry run unless `--apply`).
     Reconcile {
         /// Actually write the verdicts. Without this the pass only reports what it would do —
@@ -1304,4 +1894,270 @@ pub(crate) enum ZoneCmd {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[cfg(test)]
+mod time_recovery_report_args_tests {
+    use super::*;
+
+    #[test]
+    fn observation_append_is_explicit_requires_selection_and_conflicts_with_repair() {
+        for args in [
+            vec!["--record-observation"],
+            vec!["--record-observation", "--cohort", "cohort"],
+            vec!["--record-observation", "--prepared", "prepared"],
+            vec![
+                "--record-observation",
+                "--cohort",
+                "cohort",
+                "--prepared",
+                "prepared",
+                "--repair",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err()
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "aizen",
+            "time",
+            "doctor",
+            "--cohort",
+            "cohort",
+            "--prepared",
+            "prepared",
+            "--record-observation",
+            "--resource",
+            "a.txt",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Time {
+                cmd:
+                    TimeCmd::Doctor {
+                        json,
+                        repair,
+                        cohort,
+                        prepared,
+                        resources,
+                        record_observation,
+                    },
+            }) => {
+                assert!(record_observation && json && !repair);
+                assert_eq!(cohort.as_deref(), Some("cohort"));
+                assert_eq!(prepared.as_deref(), Some("prepared"));
+                assert_eq!(resources, ["a.txt"]);
+            }
+            _ => panic!("expected explicit recovery observation selection"),
+        }
+    }
+
+    #[test]
+    fn report_selection_is_explicit_and_cannot_run_repair() {
+        for args in [
+            vec!["--cohort", "cohort"],
+            vec!["--prepared", "prepared"],
+            vec!["--resource", "a.txt"],
+            vec!["--cohort", "cohort", "--prepared", "prepared", "--repair"],
+            vec![
+                "--cohort",
+                "cohort",
+                "--prepared",
+                "prepared",
+                "--resource",
+                "a.txt",
+                "--repair",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err()
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "aizen",
+            "time",
+            "doctor",
+            "--cohort",
+            "cohort",
+            "--prepared",
+            "prepared",
+            "--resource",
+            "a.txt",
+            "--resource",
+            "b.txt",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Time {
+                cmd:
+                    TimeCmd::Doctor {
+                        json,
+                        repair,
+                        cohort,
+                        prepared,
+                        resources,
+                        record_observation,
+                    },
+            }) => {
+                assert!(!record_observation);
+                assert!(json);
+                assert!(!repair);
+                assert_eq!(cohort.as_deref(), Some("cohort"));
+                assert_eq!(prepared.as_deref(), Some("prepared"));
+                assert_eq!(resources, ["a.txt", "b.txt"]);
+            }
+            _ => panic!("expected exact recovery report doctor selection"),
+        }
+        assert!(Cli::try_parse_from([
+            "aizen",
+            "time",
+            "doctor",
+            "--cohort",
+            "cohort",
+            "--prepared",
+            "prepared"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["aizen", "time", "doctor"]).is_ok());
+        assert!(Cli::try_parse_from(["aizen", "time", "doctor", "--repair"]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod agent_reference_args_tests {
+    use super::*;
+
+    fn parse_agent(args: &[&str]) -> Result<AgentArgs, clap::Error> {
+        let cli = Cli::try_parse_from(["aizen", "agent"].into_iter().chain(args.iter().copied()))?;
+        match cli.command {
+            Some(Commands::Agent(args)) => Ok(args),
+            _ => unreachable!("agent arguments must parse as an agent command"),
+        }
+    }
+
+    #[test]
+    fn images_alone_do_not_grant_reference_purpose() {
+        let args = parse_agent(&["--image", "ref.png", "inspect the image"]).unwrap();
+        assert!(!args.reference_images);
+        assert_eq!(args.image, ["ref.png"]);
+    }
+
+    #[test]
+    fn reference_images_is_explicit_and_requires_current_attachments() {
+        assert!(parse_agent(&["--reference-images", "match the reference"]).is_err());
+        let args = parse_agent(&[
+            "--reference-images",
+            "--image",
+            "ref.png",
+            "match the reference",
+        ])
+        .unwrap();
+        assert!(args.reference_images);
+        assert_eq!(args.image, ["ref.png"]);
+    }
+}
+
+#[cfg(test)]
+mod skill_install_args_tests {
+    use super::*;
+
+    fn parse_install(args: &[&str]) -> Result<SkillCmd, clap::Error> {
+        let cli = Cli::try_parse_from(
+            ["aizen", "skill", "install"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )?;
+        match cli.command {
+            Some(Commands::Skill { cmd }) => Ok(cmd),
+            _ => unreachable!("skill install must parse as a skill command"),
+        }
+    }
+
+    #[test]
+    fn skill_install_keeps_registry_slug_syntax() {
+        let SkillCmd::Install {
+            slug,
+            github,
+            path,
+            reference,
+            name,
+        } = parse_install(&["NousResearch/spike"]).unwrap()
+        else {
+            panic!("expected install");
+        };
+        assert_eq!(slug.as_deref(), Some("NousResearch/spike"));
+        assert!(github.is_none() && path.is_none() && reference.is_none() && name.is_none());
+    }
+
+    #[test]
+    fn skill_install_accepts_github_default_and_explicit_ref_alias() {
+        let SkillCmd::Install {
+            slug,
+            github,
+            path,
+            reference,
+            name,
+        } = parse_install(&["--github", "owner/repo", "--path", "skills/release"]).unwrap()
+        else {
+            panic!("expected install");
+        };
+        assert!(slug.is_none());
+        assert_eq!(github.as_deref(), Some("owner/repo"));
+        assert_eq!(path.as_deref(), Some("skills/release"));
+        assert!(reference.is_none() && name.is_none());
+
+        let SkillCmd::Install {
+            reference, name, ..
+        } = parse_install(&[
+            "--github",
+            "owner/repo",
+            "--path",
+            "skills/release",
+            "--ref",
+            "v1.2",
+            "--name",
+            "my-release",
+        ])
+        .unwrap()
+        else {
+            panic!("expected install");
+        };
+        assert_eq!(reference.as_deref(), Some("v1.2"));
+        assert_eq!(name.as_deref(), Some("my-release"));
+    }
+
+    #[test]
+    fn skill_install_rejects_missing_or_conflicting_sources_and_replace() {
+        for args in [
+            vec![],
+            vec!["--github", "owner/repo"],
+            vec!["--path", "skills/release"],
+            vec!["--ref", "main"],
+            vec!["--name", "local"],
+            vec![
+                "owner/skill",
+                "--github",
+                "owner/repo",
+                "--path",
+                "skills/release",
+            ],
+            vec!["owner/skill", "--path", "skills/release"],
+            vec!["owner/skill", "--ref", "main"],
+            vec!["owner/skill", "--name", "local"],
+            vec!["--github", "owner/repo", "--path"],
+            vec!["owner/skill", "--replace"],
+            vec![
+                "--github",
+                "owner/repo",
+                "--path",
+                "skills/release",
+                "--replace",
+            ],
+        ] {
+            assert!(parse_install(&args).is_err(), "must reject {args:?}");
+        }
+    }
 }

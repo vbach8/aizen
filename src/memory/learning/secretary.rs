@@ -456,6 +456,7 @@ pub fn apply_facts(
                 tier: f.tier,
                 anchor: f.anchor.clone(),
                 mentions_machine: tiering::mentions_machine(&f.text),
+                mentions_project: tiering::mentions_project(&f.text, &lin),
             },
             &lin,
             &tiering::fs_exists,
@@ -504,7 +505,7 @@ pub fn apply_facts(
 
         match verdict {
             reconcile::Verdict::Same { id } => {
-                if injected_ids.iter().any(|i| *i == id) {
+                if injected_ids.contains(&id) {
                     continue; // echo, not evidence — see the guard note above
                 }
                 if let Some(e) = pool.iter().find(|e| e.id == id) {
@@ -905,7 +906,7 @@ mod tests {
         // And the id derived from it inherits whole words only.
         let id = crate::memory::store::slugify(&name);
         assert!(
-            !id.split('-').next_back().is_some_and(|w| w.len() == 1),
+            id.split('-').next_back().is_none_or(|w| w.len() != 1),
             "id must not end in an orphan letter: {id}"
         );
     }
@@ -996,7 +997,11 @@ mod tests {
             // Now the recall block shows that fact, and the secretary dutifully repeats it back.
             // Crediting this would make `confirmations` measure ECHO — a fact promoted for being
             // shown to the model, which is exactly the defect that made `reinforced` worthless.
-            let r2 = apply_facts(&out_with(vec![user_fact(text)]), &[id.clone()], "s2");
+            let r2 = apply_facts(
+                &out_with(vec![user_fact(text)]),
+                std::slice::from_ref(&id),
+                "s2",
+            );
             assert!(
                 r2.confirmed.is_empty(),
                 "an injected fact must not confirm itself: {r2:?}"

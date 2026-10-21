@@ -7,6 +7,8 @@ pub mod channel_markdown;
 pub mod config_ui;
 pub mod context_report;
 pub mod effort_ui;
+pub mod events;
+pub mod gateway_ui;
 pub mod icons;
 pub mod image_input;
 pub mod links;
@@ -20,3 +22,6 @@ pub mod spinner;
 pub mod splash;
 pub mod theme;
 pub mod tui;
+// Voice input (keep F9 → speech → prompt draft). Opt-in only: no default-build cost.
+#[cfg(feature = "voice")]
+pub mod voice;

@@ -374,6 +374,117 @@ fn dynamic_mcp_tools_appear_only_when_connected() {
     assert!(map.contains("`mcp_postgres_query`"));
 }
 
+// ── 5b. DEFERRED tools: out of the request, reachable through tool_search ────────────────────
+
+/// An MCP-shaped stand-in (the real wrapper needs a live connection).
+struct FakeMcp(&'static str);
+impl crate::agent::tools::Tool for FakeMcp {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "[MCP fake] Query rows from the configured database, read-only"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"sql": {"type": "string"}},
+            "required": ["sql"]
+        })
+    }
+    fn execute(&self, _args: &Value) -> anyhow::Result<String> {
+        Ok("rows".into())
+    }
+}
+
+#[test]
+fn deferred_tools_leave_the_request_but_stay_dispatchable_through_tool_search() {
+    use crate::agent::tool_search::{DeferredEntry, ToolSearch};
+    use std::sync::Arc;
+
+    // Exactly what `default_registry_in` does for a server the deferral plan marked.
+    let mut registry = coder_registry();
+    let mut entries = Vec::new();
+    for name in ["mcp_fake_query", "mcp_fake_insert"] {
+        let arc: Arc<dyn crate::agent::tools::Tool> = Arc::new(FakeMcp(name));
+        registry.register_deferred(arc.clone(), "fake".into());
+        entries.push(DeferredEntry {
+            tool: arc,
+            server: "fake".into(),
+        });
+    }
+    registry.register(Box::new(ToolSearch::new(entries)));
+
+    // The request: no deferred schema, but the discovery door is advertised.
+    let def_names: Vec<String> = registry
+        .defs()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert!(!def_names.iter().any(|n| n.starts_with("mcp_fake_")));
+    assert!(def_names.iter().any(|n| n == "tool_search"));
+
+    // The prompt: the map (advertised names) routes tool_search under the MCP heading and never
+    // names a deferred tool — the note, not the map, is what mentions the deferred surface.
+    let advertised = registry.advertised_names();
+    assert_eq!(def_names, advertised, "map input == request tools, always");
+    let map = tool_routing::routing_map(&advertised).unwrap();
+    assert!(map.contains("`tool_search`"), "{map}");
+    assert!(map.contains("connected integrations"), "{map}");
+    assert!(!map.contains("mcp_fake_"), "{map}");
+
+    // Dispatch: a deferred tool called by exact name still runs (this is what makes a
+    // tool_search result actionable without ever touching the request's tools array).
+    let hidden = registry.get_arc("mcp_fake_query").expect("dispatchable");
+    assert_eq!(
+        hidden.execute(&serde_json::json!({"sql": "x"})).unwrap(),
+        "rows"
+    );
+
+    // Discovery: the search result carries the exact name + the full schema in-band.
+    let search = registry.get("tool_search").unwrap();
+    let out = search
+        .execute(&serde_json::json!({"query": "query database"}))
+        .unwrap();
+    assert!(out.contains("## mcp_fake_query"), "{out}");
+    assert!(out.contains("\"required\":[\"sql\"]"), "{out}");
+
+    // The skills gate sees the WHOLE dispatchable surface (advertised ∪ deferred)…
+    let (names, by_server) = registry.deferred_summary().expect("deferred present");
+    assert_eq!(names.len(), 2);
+    assert_eq!(by_server, vec![("fake".to_string(), 2)]);
+}
+
+#[test]
+fn the_top_level_prompt_carries_the_deferred_note_only_when_something_is_deferred() {
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let names = coder_registry().names();
+    let prior = builtin::swap_active_tools_for_test(Some(names));
+    let prior_deferred = builtin::swap_deferred_tools_for_test(Some((
+        vec!["mcp_gh_create_issue".into(), "mcp_gh_list_repos".into()],
+        vec![("gh".to_string(), 2)],
+    )));
+
+    let top = crate::agent::build_top_level_system_prompt("/w", "linux", "2026-08-26", "m", None);
+    assert!(top.contains("# Deferred tools"), "note present");
+    assert!(top.contains("gh (2)"), "per-server count rendered");
+    assert!(top.contains("`tool_search`"), "the note names the door");
+    assert!(
+        !top.contains("mcp_gh_create_issue"),
+        "deferred tool names stay out of the prompt — the count is the advertisement"
+    );
+
+    // No deferred surface ⇒ the note vanishes entirely (zero bytes for the common case).
+    builtin::swap_deferred_tools_for_test(None);
+    let bare = crate::agent::build_top_level_system_prompt("/w", "linux", "2026-08-26", "m", None);
+    assert!(!bare.contains("# Deferred tools"));
+
+    builtin::swap_deferred_tools_for_test(prior_deferred);
+    builtin::swap_active_tools_for_test(prior);
+}
+
 // ── 6. model-emitted calls: unknown names and bad arguments fail safely ──────────────────────
 
 /// Drive the real loop with a scripted model and hand back the messages it saw on its LAST call —
@@ -393,6 +504,8 @@ async fn run_scripted(registry: &ToolRegistry, turns: Vec<ChatTurn>) -> Vec<Mess
                 tool_calls: Vec::new(),
                 finish_reason: Some("stop".into()),
                 usage: None,
+                empty_wire_note: None,
+                empty_wire_raw: None,
                 eager: Vec::new(),
             });
         std::future::ready(Ok(next))
@@ -427,6 +540,8 @@ fn tool_call(name: &str, args: &str) -> ChatTurn {
         }],
         finish_reason: Some("tool_calls".into()),
         usage: None,
+        empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     }
 }
@@ -479,6 +594,73 @@ async fn invalid_arguments_produce_a_controlled_error_not_a_panic() {
     // Syntactically broken arguments are caught before dispatch.
     let msgs = run_scripted(&registry, vec![tool_call("file_read", "{not json")]).await;
     assert!(last_tool_result(&msgs).starts_with("error: invalid JSON arguments"));
+}
+
+fn scratch_file(name: &str, body: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("aizen-lenient-{}-{name}", std::process::id()));
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_written_as_text_is_recovered_when_tool_calls_is_empty() {
+    // Hermes/Qwen-style `<tool_call>` block with an EMPTY native array: the loop must lift it into
+    // a real call and run the tool — not echo the block back as the final answer.
+    let registry = coder_registry();
+    let path = scratch_file(
+        "hermes.txt",
+        "recovered-marker-7f3a
+",
+    );
+    let block = serde_json::json!({
+        "name": "file_read",
+        "arguments": {"path": path.to_string_lossy()}
+    });
+    let text_turn = ChatTurn {
+        content: Some(format!(
+            "Let me read it.
+<tool_call>
+{block}
+</tool_call>"
+        )),
+        tool_calls: Vec::new(),
+        finish_reason: Some("stop".into()),
+        usage: None,
+        empty_wire_note: None,
+        empty_wire_raw: None,
+        eager: Vec::new(),
+    };
+    let msgs = run_scripted(&registry, vec![text_turn]).await;
+    let result = last_tool_result(&msgs);
+    assert!(
+        result.contains("recovered-marker-7f3a"),
+        "the tool ran on the recovered call: {result}"
+    );
+    let call = msgs
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+        .expect("the assistant turn carries the recovered call");
+    assert!(call.tool_calls[0].id.starts_with("recovered-"));
+    assert_eq!(call.tool_calls[0].function.name, "file_read");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn almost_json_arguments_are_repaired_before_dispatch() {
+    // A trailing comma is the single most common local-model slip; it must not cost a round trip.
+    let registry = coder_registry();
+    let path = scratch_file(
+        "comma.txt",
+        "repaired-marker-9c1d
+",
+    );
+    let quoted = serde_json::to_string(&path.to_string_lossy()).unwrap();
+    let args = format!("{{\"path\": {quoted},}}");
+    let msgs = run_scripted(&registry, vec![tool_call("file_read", &args)]).await;
+    let result = last_tool_result(&msgs);
+    assert!(result.contains("repaired-marker-9c1d"), "{result}");
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -595,7 +777,11 @@ fn prompt_construction_never_embeds_credentials() {
     assert!(!map.contains(SECRET));
     assert!(!map.contains("api_key"));
 
-    // The whole assembled prompt, with a credential live in the environment.
+    // The whole assembled prompt, with a credential live in the environment. Under the shared
+    // env lock: any test resolving an endpoint meanwhile would pick this key up.
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let prior = std::env::var("AIZEN_API_KEY").ok();
     std::env::set_var("AIZEN_API_KEY", SECRET);
     let prompt = crate::agent::build_system_prompt("/w", "linux", "2026-08-17", "m", None);
@@ -612,6 +798,11 @@ fn tool_definitions_never_carry_credential_values() {
     // Descriptions and schemas are model-facing text baked at registration; a tool that interpolated
     // a resolved secret into either would ship it on every request.
     const SECRET: &str = "tvly-test-SHOULDNOTLEAK";
+    // Under the shared env lock: a test that resolves the search key while the fake one is set
+    // would read this value as a configured key.
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let prior = std::env::var("TAVILY_API_KEY").ok();
     std::env::set_var("TAVILY_API_KEY", SECRET);
     let json = serde_json::to_string(&coder_registry().defs()).unwrap();
@@ -620,4 +811,31 @@ fn tool_definitions_never_carry_credential_values() {
         None => std::env::remove_var("TAVILY_API_KEY"),
     }
     assert!(!json.contains(SECRET), "a tool definition leaked a key");
+}
+
+// ── 8. the five search tools end on the same routing sentence ─────────────────────────────
+
+#[test]
+fn the_search_tools_share_one_routing_sentence() {
+    // Each used to name a different subset of its siblings; the model now reads one rule on
+    // whichever tool it is looking at. The LSP pair is checked when the registry carries it.
+    let registry = coder_registry();
+    for name in ["file_glob", "search_files", "codebase_search"] {
+        let t = registry
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} registered"));
+        assert!(
+            t.description().ends_with(crate::search_routing!()),
+            "{name}: {}",
+            t.description()
+        );
+    }
+    for name in ["lsp_workspace_symbol", "read_symbol"] {
+        if let Some(t) = registry.get(name) {
+            assert!(
+                t.description().ends_with(crate::search_routing!()),
+                "{name}"
+            );
+        }
+    }
 }

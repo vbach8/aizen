@@ -12,4 +12,8 @@ pub mod slash;
 pub mod slash_handlers;
 pub mod timemachine;
 pub mod update;
+#[cfg(feature = "voice")]
+pub mod voice_install;
+#[cfg(feature = "voice")]
+pub mod voice_manifest;
 pub mod zones;
