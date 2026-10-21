@@ -67,7 +67,15 @@ jobs:
         run: cargo test --features voice --bin aizen voice_install
 
       - name: Test
-        run: cargo test --bin aizen
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            # The approval integration tests share process-global state; run
+            # the Linux suite serially so they cannot race each other.
+            RUST_TEST_THREADS=1 cargo test --bin aizen
+          else
+            cargo test --bin aizen
+          fi
 
       # What the sandbox can actually enforce on THIS runner, in the job log — the per-platform
       # capability matrix in docs/SANDBOX.md is checked against these outputs at release time.
